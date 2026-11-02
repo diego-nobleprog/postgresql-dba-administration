@@ -1,0 +1,531 @@
+PRÁCTICA 02 - ARQUITECTURA INTERNA DE POSTGRESQL
+PostgreSQL DBA - Administración, Performance, Backup, Replicación y Alta Disponibilidad
+Guía de participantes | PostgreSQL 18 | DaDesktop / PowerShell / Docker
+
+OBJETIVO
+Comprender y verificar experimentalmente los procesos, memoria, WAL, checkpoints, MVCC, estructura física, bases de datos, schemas, tablespaces y estadísticas de PostgreSQL. Ejecutar cada bloque en PowerShell, salvo cuando se indique abrir psql interactivo. Los comandos se presentan en orden progresivo. No borrar ni recrear el clúster de la práctica 01.
+
+REQUISITOS
+- Docker Desktop activo y contenedor postgresql-dba en ejecución.
+- Imagen y clúster preparados en P1; PostgreSQL 18.
+- Terminal PowerShell en DaDesktop.
+- Rol postgres accesible mediante docker exec.
+- Se trabaja con la base postgres, salvo indicación contraria.
+- Los resultados exactos (PID, OID, LSN, tiempos, contadores) variarán.
+
+COMPROBACIÓN INICIAL
+Ejecutar en PowerShell:
+
+docker ps --filter "name=postgresql-dba"
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT version();"
+
+Debe aparecer el contenedor y PostgreSQL 18. No continuar si el contenedor no está disponible.
+
+CONVENCIÓN DE EJECUCIÓN
+Los bloques SQL extensos se envían por stdin desde PowerShell mediante here-string:
+
+@'
+SELECT current_database(), current_user;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+El marcador '@ debe comenzar al inicio de una línea, sin espacios anteriores. No usar el carácter de continuación de PowerShell. Los comandos SQL en sesiones interactivas se ejecutan uno a uno.
+
+====================================================================
+1. ARQUITECTURA Y PROCESOS
+====================================================================
+OBJETIVO: distinguir el proceso principal, procesos auxiliares y backends de clientes.
+
+BEFORE - INSPECCIÓN DESDE EL SISTEMA OPERATIVO
+
+docker top postgresql-dba
+
+Identificar procesos postgres, checkpointer, background writer, WAL writer, autovacuum y backends. La lista puede cambiar entre ejecuciones.
+
+INSPECCIÓN SQL
+
+@'
+SELECT pid, backend_type, state, wait_event_type, wait_event
+FROM pg_stat_activity
+ORDER BY backend_type, pid;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+PRUEBA DE UNA SESIÓN ACTIVA
+Abrir una terminal PowerShell adicional y ejecutar:
+
+docker exec -it postgresql-dba psql -U postgres -d postgres
+
+Dentro de psql, ejecutar:
+SELECT pg_backend_pid();
+SELECT pg_sleep(30);
+
+Mientras duerme, desde otra terminal ejecutar:
+
+@'
+SELECT pid, backend_type, state, wait_event_type, wait_event, query
+FROM pg_stat_activity
+WHERE datname = 'postgres'
+ORDER BY pid;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: identificar el PID de la sesión de prueba. El proceso backend atiende la conexión del cliente; no confundirlo con el proceso principal.
+Cerrar la sesión interactiva con \q cuando termine pg_sleep.
+
+====================================================================
+2. GESTIÓN DE MEMORIA
+====================================================================
+OBJETIVO: distinguir memoria compartida, memoria por operación y estimación de caché del SO.
+
+@'
+SELECT name, setting, unit, context, source
+FROM pg_settings
+WHERE name IN (
+  'shared_buffers', 'work_mem', 'maintenance_work_mem',
+  'effective_cache_size', 'temp_buffers'
+)
+ORDER BY name;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VALORES OBSERVADOS EN EL LABORATORIO: shared_buffers=128MB; work_mem=4MB; maintenance_work_mem=64MB; effective_cache_size=4GB; temp_buffers=8MB. Confirmar los valores reales de su entorno.
+
+CONCEPTO: shared_buffers es memoria compartida del servidor; work_mem es un límite por operación de ordenamiento/hash (pueden existir varias por consulta y sesión); maintenance_work_mem afecta operaciones de mantenimiento; effective_cache_size es una estimación para el planificador, no memoria reservada.
+
+====================================================================
+3. WORK_MEM, MAINTENANCE_WORK_MEM Y SHARED_BUFFERS
+====================================================================
+OBJETIVO: comparar ordenamientos en disco y memoria, construcción de índices y caché.
+
+PREPARACIÓN DE DATOS (ejecutar una sola vez)
+
+@'
+CREATE SCHEMA IF NOT EXISTS lab_p2;
+CREATE TABLE IF NOT EXISTS lab_p2.memory_test (
+  id INTEGER PRIMARY KEY,
+  description TEXT NOT NULL
+);
+INSERT INTO lab_p2.memory_test (id, description)
+SELECT g, repeat(md5(g::text), 10)
+FROM generate_series(1, 100000) AS g
+ON CONFLICT (id) DO NOTHING;
+SELECT COUNT(*) FROM lab_p2.memory_test;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+NOTA: la generación de datos de esta guía es reproducible; si ya existe la tabla de la práctica, no sobrescribirla. La distribución exacta y los tiempos pueden diferir.
+
+3A. WORK_MEM - BEFORE / CHANGE / AFTER / RESTORE
+
+@'
+SHOW work_mem;
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '64kB';
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM lab_p2.memory_test ORDER BY description;
+SET work_mem = '64MB';
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM lab_p2.memory_test ORDER BY description;
+RESET work_mem;
+RESET max_parallel_workers_per_gather;
+SHOW work_mem;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: comparar Sort Method (external merge / Disk frente a quicksort / Memory, cuando el plan use sort) y Execution Time. En la validación del instructor se observaron aproximadamente 234 ms frente a 119 ms; no son valores garantizados. Si existe un índice que satisface ORDER BY, el plan puede evitar el sort: revisar el plan antes de sacar conclusiones.
+
+3B. MAINTENANCE_WORK_MEM - comparar construcción de índice
+
+Para una comparación reproducible, usar el mismo índice, reconstruido en cada escenario. Ejecutar solo en laboratorio; DROP INDEX afecta temporalmente disponibilidad del índice.
+
+@'
+SHOW maintenance_work_mem;
+SET maintenance_work_mem = '1MB';
+DROP INDEX IF EXISTS lab_p2.idx_memory_test_description;
+\timing on
+CREATE INDEX idx_memory_test_description ON lab_p2.memory_test(description);
+DROP INDEX lab_p2.idx_memory_test_description;
+SET maintenance_work_mem = '128MB';
+CREATE INDEX idx_memory_test_description ON lab_p2.memory_test(description);
+\timing off
+RESET maintenance_work_mem;
+SHOW maintenance_work_mem;
+SELECT pg_size_pretty(pg_relation_size('lab_p2.idx_memory_test_description')) AS index_size;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: registrar ambos tiempos y el tamaño del índice. Una sola ejecución no permite inferir una mejora universal. En la ejecución original se observaron ~375 ms y ~302 ms.
+
+3C. SHARED_BUFFERS Y CACHE HIT
+
+@'
+SELECT name, setting, unit, context FROM pg_settings WHERE name = 'shared_buffers';
+SELECT current_setting('block_size') AS block_size_bytes;
+SELECT datname, blks_hit, blks_read,
+  round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS cache_hit_pct
+FROM pg_stat_database WHERE datname = current_database();
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(id) FROM lab_p2.memory_test;
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(id) FROM lab_p2.memory_test;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: comparar shared hit/read en ambos planes. En la práctica original se observaron 3449 hits por escaneo. shared_buffers=128MB equivale a 16384 páginas de 8KB. Cambiar shared_buffers requiere reinicio: aquí solo se inspecciona. El hit ratio no mide por sí solo la calidad de las consultas ni la caché del sistema operativo.
+
+====================================================================
+4. WAL Y CHECKPOINTS
+====================================================================
+OBJETIVO: observar configuración WAL, crecimiento de LSN y efecto de un checkpoint manual.
+
+PREPARACIÓN
+
+@'
+CREATE TABLE IF NOT EXISTS lab_p2.wal_test (
+  id BIGSERIAL PRIMARY KEY,
+  description TEXT NOT NULL
+);
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('wal_level','fsync','synchronous_commit','full_page_writes',
+               'wal_segment_size','max_wal_size','min_wal_size',
+               'checkpoint_timeout','checkpoint_completion_target')
+ORDER BY name;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+BEFORE / CHANGE / AFTER - LSN
+
+@'
+SELECT pg_current_wal_lsn() AS lsn_before \gset
+SELECT :'lsn_before' AS lsn_before;
+INSERT INTO lab_p2.wal_test(description)
+SELECT repeat(md5(g::text), 5) FROM generate_series(1, 10000) AS g;
+SELECT pg_current_wal_lsn() AS lsn_after \gset
+SELECT :'lsn_after' AS lsn_after,
+       pg_wal_lsn_diff(:'lsn_after', :'lsn_before') AS wal_bytes_generated;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: WAL generado > 0. El valor varía según estado del clúster y actividad concurrente.
+
+CHECKPOINT - observar contadores antes y después
+
+@'
+SELECT num_timed, num_requested, num_done, buffers_written
+FROM pg_stat_checkpointer;
+CHECKPOINT;
+SELECT num_timed, num_requested, num_done, buffers_written
+FROM pg_stat_checkpointer;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: num_requested y num_done deberían incrementarse por el checkpoint manual. No ejecutar CHECKPOINT repetidamente en producción solo para experimentar.
+
+====================================================================
+5. BACKGROUND WRITER, WAL WRITER Y CHECKPOINTER
+====================================================================
+OBJETIVO: identificar responsabilidades y observar métricas de I/O por tipo de backend.
+
+@'
+SELECT pid, backend_type
+FROM pg_stat_activity
+WHERE backend_type IN ('background writer', 'walwriter', 'checkpointer')
+ORDER BY backend_type;
+SELECT backend_type, object, context,
+       sum(writes) AS writes, sum(fsyncs) AS fsyncs
+FROM pg_stat_io
+WHERE backend_type IN ('client backend', 'walwriter', 'checkpointer', 'background writer')
+GROUP BY backend_type, object, context
+ORDER BY backend_type, object, context;
+SELECT buffers_clean, maxwritten_clean FROM pg_stat_bgwriter;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+CHANGE - generar actividad y volver a observar
+
+@'
+INSERT INTO lab_p2.wal_test(description)
+SELECT repeat(md5(g::text), 5) FROM generate_series(1, 10000) AS g;
+SELECT backend_type, object, context,
+       sum(writes) AS writes, sum(fsyncs) AS fsyncs
+FROM pg_stat_io
+WHERE backend_type IN ('client backend', 'walwriter', 'checkpointer', 'background writer')
+GROUP BY backend_type, object, context
+ORDER BY backend_type, object, context;
+SELECT buffers_clean, maxwritten_clean FROM pg_stat_bgwriter;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: registrar las diferencias entre mediciones, sin exigir que todos los procesos incrementen contadores. En PostgreSQL 18 las métricas writes/fsyncs por backend están en pg_stat_io; NO buscar columnas wal_write/wal_sync en pg_stat_wal. La actividad depende de la carga y del momento de muestreo.
+
+====================================================================
+6. MVCC: COMMIT, ROLLBACK Y VISIBILIDAD
+====================================================================
+OBJETIVO: observar versiones de filas y aislamiento READ COMMITTED usando dos sesiones.
+
+PREPARACIÓN (PowerShell)
+
+@'
+CREATE TABLE IF NOT EXISTS lab_p2.mvcc_test (
+  id INTEGER PRIMARY KEY,
+  account_name TEXT NOT NULL,
+  balance NUMERIC(12,2) NOT NULL
+);
+INSERT INTO lab_p2.mvcc_test(id, account_name, balance)
+VALUES (1, 'Cuenta Demo', 1000.00)
+ON CONFLICT (id) DO NOTHING;
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+Si la tabla ya fue utilizada, el saldo inicial puede ser 1500.00. Para repetir exactamente el experimento desde 1000.00, restaurar primero con un UPDATE explícito y registrar el nuevo xmin/ctid; no asumir los IDs de transacción del instructor.
+
+SESIÓN A - abrir PowerShell A:
+
+docker exec -it postgresql-dba psql -U postgres -d postgres
+
+Ejecutar cada sentencia por separado:
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+BEGIN;
+UPDATE lab_p2.mvcc_test SET balance = 1500.00 WHERE id = 1;
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+
+Dejar A abierta con prompt postgres=*#; NO ejecutar COMMIT todavía.
+
+SESIÓN B - abrir PowerShell B:
+
+docker exec -it postgresql-dba psql -U postgres -d postgres
+
+Ejecutar:
+SELECT pg_backend_pid();
+SHOW transaction_isolation;
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+
+VERIFY: B ve el saldo confirmado anterior (1000.00 si partimos de ese valor), aunque A ve 1500.00. El xmax de la versión anterior puede reflejar la transacción aún no confirmada.
+
+VOLVER A A:
+COMMIT;
+
+VOLVER A B:
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+
+VERIFY: B ahora ve 1500.00. En READ COMMITTED, cada sentencia obtiene su propia instantánea de datos confirmados.
+
+ROLLBACK - EN A:
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+BEGIN;
+UPDATE lab_p2.mvcc_test SET balance = 2000.00 WHERE id = 1;
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+ROLLBACK;
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+
+VERIFY - EN B:
+SELECT id, balance, xmin, xmax, ctid FROM lab_p2.mvcc_test WHERE id = 1;
+
+VERIFY: ambas sesiones ven 1500.00. xmax puede contener el ID de una transacción abortada; no interpretar xmax sin comprobar el estado de la transacción. Una versión abortada puede permanecer físicamente hasta mantenimiento posterior.
+Cerrar ambas sesiones con \q.
+
+====================================================================
+7. ESTRUCTURA FÍSICA DE POSTGRESQL
+====================================================================
+OBJETIVO: relacionar objetos SQL con PGDATA, OIDs, filenodes, páginas y WAL.
+
+@'
+SHOW data_directory;
+SELECT oid, datname FROM pg_database WHERE datname = current_database();
+SELECT 'lab_p2.memory_test' AS relation,
+       pg_relation_filepath('lab_p2.memory_test') AS physical_path,
+       pg_relation_filenode('lab_p2.memory_test') AS filenode
+UNION ALL
+SELECT 'lab_p2.wal_test', pg_relation_filepath('lab_p2.wal_test'), pg_relation_filenode('lab_p2.wal_test')
+UNION ALL
+SELECT 'lab_p2.mvcc_test', pg_relation_filepath('lab_p2.mvcc_test'), pg_relation_filenode('lab_p2.mvcc_test');
+SELECT c.oid::regclass AS relation,
+       pg_size_pretty(pg_relation_size(c.oid)) AS data_size,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'lab_p2' AND c.relkind = 'r'
+ORDER BY c.relname;
+SHOW block_size;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+INSPECCIÓN DEL CONTENEDOR (SOLO LECTURA)
+
+docker exec postgresql-dba ls -ld /var/lib/pgsql/data/base /var/lib/pgsql/data/global /var/lib/pgsql/data/pg_wal /var/lib/pgsql/data/pg_tblspc
+docker exec postgresql-dba sh -c 'ls -lh /var/lib/pgsql/data/pg_wal | head -n 12'
+docker exec postgresql-dba cat /var/lib/pgsql/data/PG_VERSION
+
+VERIFY: en el laboratorio original PGDATA=/var/lib/pgsql/data, OID de postgres=5, block_size=8192, PG_VERSION=18. Consultar las rutas actuales antes de inspeccionar archivos concretos; los filenodes pueden cambiar tras operaciones de mantenimiento. Nunca editar, mover o borrar manualmente archivos internos de PGDATA.
+
+====================================================================
+8. DATABASES, SCHEMAS Y TABLESPACES
+====================================================================
+OBJETIVO: diferenciar aislamiento lógico, espacios de nombres y ubicación física.
+
+8A. INSPECCIÓN INICIAL
+
+@'
+SELECT oid, datname, pg_get_userbyid(datdba) AS owner, dattablespace, datallowconn
+FROM pg_database ORDER BY datname;
+SELECT nspname AS schema_name, pg_get_userbyid(nspowner) AS owner
+FROM pg_namespace WHERE nspname NOT LIKE 'pg_toast%' ORDER BY nspname;
+SELECT oid, spcname, pg_get_userbyid(spcowner) AS owner,
+       pg_tablespace_location(oid) AS physical_location
+FROM pg_tablespace ORDER BY spcname;
+SHOW search_path;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+8B. CREAR DATABASE, SCHEMA Y TABLA (ejecutar una sola vez)
+
+@'
+CREATE DATABASE dba_p2_catalog_lab;
+\connect dba_p2_catalog_lab
+CREATE SCHEMA training;
+CREATE TABLE training.course_catalog (
+  id INTEGER PRIMARY KEY,
+  course_name TEXT NOT NULL
+);
+INSERT INTO training.course_catalog(id, course_name)
+VALUES (1, 'PostgreSQL DBA'), (2, 'Performance y Alta Disponibilidad');
+SELECT current_database(), pg_relation_filepath('training.course_catalog');
+SELECT * FROM training.course_catalog ORDER BY id;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: CREATE DATABASE, CREATE SCHEMA, CREATE TABLE, INSERT 0 2. La ruta de la tabla comienza con base/<OID de la nueva base>/.
+
+8C. AISLAMIENTO DE CATÁLOGOS
+
+@'
+SELECT current_database(), to_regclass('lab_p2.mvcc_test') AS local_table,
+       to_regclass('training.course_catalog') AS other_database_table;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+@'
+SELECT current_database(), to_regclass('training.course_catalog') AS local_table,
+       to_regclass('lab_p2.mvcc_test') AS other_database_table;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d dba_p2_catalog_lab
+
+VERIFY: la tabla de la otra base aparece NULL en to_regclass(). No es posible consultar directamente otra database usando nombres de tres partes; se requieren conexiones distintas o extensiones apropiadas.
+
+8D. PREPARAR DIRECTORIO PARA TABLESPACE (PowerShell)
+
+ATENCIÓN: esta ruta está dentro del contenedor, sin volumen Docker dedicado. NO es persistente si el contenedor se recrea. No utilizar como configuración productiva.
+
+docker exec -u root postgresql-dba mkdir -p /var/lib/pgsql/tablespaces/p2_lab
+docker exec -u root postgresql-dba chown postgres:postgres /var/lib/pgsql/tablespaces/p2_lab
+docker exec -u root postgresql-dba chmod 700 /var/lib/pgsql/tablespaces/p2_lab
+docker exec postgresql-dba ls -ld /var/lib/pgsql/tablespaces/p2_lab
+docker exec postgresql-dba ls -la /var/lib/pgsql/tablespaces/p2_lab
+
+VERIFY: propietario postgres:postgres, permisos 700 y directorio vacío. Si ya existe contenido, no ejecutar CREATE TABLESPACE de nuevo.
+
+8E. CREAR TABLESPACE (una sola vez)
+
+@'
+CREATE TABLESPACE ts_p2_lab OWNER postgres
+LOCATION '/var/lib/pgsql/tablespaces/p2_lab';
+SELECT oid, spcname, pg_tablespace_location(oid)
+FROM pg_tablespace WHERE spcname = 'ts_p2_lab';
+SELECT pg_size_pretty(pg_tablespace_size('ts_p2_lab'));
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+docker exec postgresql-dba ls -l /var/lib/pgsql/data/pg_tblspc
+
+VERIFY: enlace simbólico pg_tblspc/<OID> hacia la ruta de tablespace. En el laboratorio original el OID fue 16463, pero puede variar.
+
+8F. CREAR TABLA EN TABLESPACE
+
+@'
+CREATE TABLE training.storage_test (
+  id INTEGER PRIMARY KEY,
+  description TEXT NOT NULL
+) TABLESPACE ts_p2_lab;
+INSERT INTO training.storage_test(id, description)
+SELECT g, 'Registro de almacenamiento ' || g
+FROM generate_series(1, 1000) AS g;
+SELECT c.oid::regclass AS relation, t.spcname AS tablespace,
+       pg_relation_filepath(c.oid) AS physical_path,
+       pg_size_pretty(pg_relation_size(c.oid)) AS data_size
+FROM pg_class c JOIN pg_tablespace t ON t.oid = c.reltablespace
+WHERE c.oid = 'training.storage_test'::regclass;
+SELECT pg_size_pretty(pg_tablespace_size('ts_p2_lab')) AS tablespace_size;
+SELECT count(*) AS total_records FROM training.storage_test;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d dba_p2_catalog_lab
+
+docker exec postgresql-dba sh -c 'find /var/lib/pgsql/tablespaces/p2_lab -maxdepth 3 -type f -exec ls -lh {} \;'
+
+VERIFY: 1000 filas y ruta pg_tblspc/<OID>/PG_18_.../<OID_database>/<filenode>. En el laboratorio original: 72KB de tabla, 108KB de tablespace, ruta pg_tblspc/16463/PG_18_202506291/16452/16464. El índice de clave primaria puede residir en un tablespace distinto si no se especifica explícitamente.
+
+====================================================================
+9. CATÁLOGOS, ESTADÍSTICAS Y ANALYZE
+====================================================================
+OBJETIVO: diferenciar metadatos del catálogo y contadores de actividad, y actualizar estimaciones del planificador.
+
+9A. CONSULTAS DE DIAGNÓSTICO
+
+@'
+SELECT n.nspname AS schema_name, c.relname AS table_name,
+       c.oid AS relation_oid, c.reltuples AS estimated_rows,
+       c.relpages AS estimated_pages
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'lab_p2' AND c.relkind = 'r'
+ORDER BY c.relname;
+SELECT schemaname, relname, seq_scan, idx_scan,
+       n_tup_ins, n_tup_upd, n_tup_del, n_dead_tup
+FROM pg_stat_user_tables
+WHERE schemaname = 'lab_p2' ORDER BY relname;
+SELECT schemaname, relname, indexrelname,
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE schemaname = 'lab_p2' ORDER BY relname, indexrelname;
+SELECT datname, numbackends, xact_commit, xact_rollback,
+       blks_read, blks_hit, temp_files, deadlocks
+FROM pg_stat_database WHERE datname = current_database();
+SELECT pid, usename, datname, state, wait_event_type, wait_event
+FROM pg_stat_activity WHERE datname = current_database() ORDER BY pid;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+INTERPRETACIÓN:
+- pg_class.reltuples/relpages: estimaciones, no recuentos exactos.
+- pg_stat_user_tables: contadores de operaciones y estimaciones de tuplas muertas.
+- pg_stat_user_indexes: actividad de índices, no equivale directamente a cantidad de sentencias SQL.
+- pg_stat_database: métricas acumuladas por base de datos.
+- Cache hit ratio = 100 * blks_hit / (blks_hit + blks_read); no mide caché del SO ni garantiza buen rendimiento.
+
+9B. BEFORE / CHANGE / AFTER / VERIFY CON ANALYZE
+
+@'
+SELECT oid::regclass AS relation, reltuples AS estimated_rows,
+       relpages AS estimated_pages
+FROM pg_class WHERE oid = 'lab_p2.mvcc_test'::regclass;
+ANALYZE lab_p2.mvcc_test;
+SELECT oid::regclass AS relation, reltuples AS estimated_rows,
+       relpages AS estimated_pages
+FROM pg_class WHERE oid = 'lab_p2.mvcc_test'::regclass;
+SELECT schemaname, relname, last_analyze, analyze_count,
+       n_live_tup, n_dead_tup
+FROM pg_stat_user_tables
+WHERE schemaname = 'lab_p2' AND relname = 'mvcc_test';
+SELECT count(*) AS actual_rows FROM lab_p2.mvcc_test;
+'@ | docker exec -i postgresql-dba psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+VERIFY: en la ejecución original reltuples pasó de -1 a 1 y relpages de 0 a 1; analyze_count llegó a 1; n_live_tup=1, n_dead_tup=2, count(*)=1. Si ya se ejecutó ANALYZE, el BEFORE puede ser 1/1 y analyze_count mayor. ANALYZE actualiza estadísticas, NO elimina tuplas muertas; VACUUM cumple otra función.
+
+====================================================================
+DESAFÍOS INDEPENDIENTES (OPCIONALES)
+====================================================================
+1. Explicar por qué work_mem=64MB no significa que toda la instancia solo pueda usar 64MB para ordenamientos.
+2. Comparar dos EXPLAIN (ANALYZE, BUFFERS) y distinguir lecturas físicas de hits en shared buffers.
+3. Explicar por qué un CHECKPOINT no sustituye un backup y por qué WAL es esencial para recuperación.
+4. Identificar una versión de fila con xmin/xmax/ctid y justificar por qué xmax distinto de cero no implica invisibilidad.
+5. Obtener pg_relation_filepath() de un índice y contrastar su ubicación con la tabla.
+6. Consultar el OID y ubicación de ts_p2_lab; explicar por qué el enlace en pg_tblspc es importante.
+7. Calcular el cache hit ratio con los contadores actuales y explicar dos limitaciones de esa métrica.
+8. Comparar reltuples con COUNT(*) antes y después de ANALYZE en una tabla pequeña.
+
+CIERRE Y CRITERIOS DE ÉXITO
+[ ] Identifiqué procesos y sesiones backend.
+[ ] Diferencié shared_buffers, work_mem, maintenance_work_mem y effective_cache_size.
+[ ] Observé ordenamientos y construcción de índices.
+[ ] Medí WAL y revisé checkpoints.
+[ ] Consulté pg_stat_io para roles de escritura.
+[ ] Demostré visibilidad MVCC con dos sesiones, COMMIT y ROLLBACK.
+[ ] Relacioné OIDs y filenodes con archivos de PGDATA.
+[ ] Creé una database, schema y tablespace de laboratorio.
+[ ] Consulté catálogos y estadísticas, y ejecuté ANALYZE.
+
+SEGURIDAD Y OPERACIÓN
+- No borrar ni recrear el volumen de datos del contenedor.
+- No editar ni eliminar archivos de PGDATA directamente.
+- No ejecutar pruebas destructivas ni cambios de configuración en producción.
+- El tablespace de demostración NO tiene volumen persistente independiente.
+- Ejecutar CREATE DATABASE / CREATE TABLESPACE una sola vez; para repetir, verificar primero si existen.
+- Los resultados de rendimiento no son garantías: dependen de hardware, caché, carga y configuración.
+
+FIN DE LA PRÁCTICA 02
