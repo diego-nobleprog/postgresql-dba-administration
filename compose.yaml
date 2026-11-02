@@ -1,0 +1,29 @@
+# Declara los servicios que Docker Compose administrara.
+services:
+  # Define el servicio principal de base de datos PostgreSQL.
+  postgres:
+    # Selecciona la imagen personalizada que construiremos durante la practica.
+    image: postgresql-dba:18-p1
+    # Asigna un nombre fijo al contenedor para facilitar los comandos docker exec.
+    container_name: postgresql-dba
+    # Define el nombre de host interno del contenedor.
+    hostname: postgresql-dba
+    # Ejecuta el proceso del servidor con el usuario postgres, no como root.
+    user: postgres
+    # Inicia PostgreSQL e indica la ubicacion del directorio de datos.
+    command: ["postgres", "-D", "/var/lib/pgsql/data"]
+    # Declara los puertos que se publicaran desde el contenedor hacia el equipo.
+    ports:
+      # Publica el puerto 5432 solo en localhost del equipo anfitrion.
+      - "127.0.0.1:5432:5432"
+    # Declara los volumenes que se montaran dentro del contenedor.
+    volumes:
+      # Monta un volumen persistente sobre el directorio de datos de PostgreSQL.
+      - postgres_data:/var/lib/pgsql/data
+    # Reinicia el contenedor salvo que se haya detenido explicitamente.
+    restart: unless-stopped
+
+# Declara los volumenes administrados por Docker Compose.
+volumes:
+  # Crea el volumen persistente donde se conservaran bases de datos y configuracion.
+  postgres_data:

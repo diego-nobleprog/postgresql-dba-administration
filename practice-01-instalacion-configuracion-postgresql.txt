@@ -1,0 +1,351 @@
+PRACTICA 01 - INSTALACION Y CONFIGURACION DE POSTGRESQL DBA
+Curso: PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
+Plataforma de destino: DaDesktop Windows con Docker Desktop
+Servidor de laboratorio: PostgreSQL 18 sobre Oracle Linux 9
+
+====================================================================
+1. OBJETIVO
+====================================================================
+Construir una imagen Docker con Oracle Linux 9 y PostgreSQL 18; iniciar
+un contenedor con volumen persistente; inicializar manualmente un
+cluster PostgreSQL; revisar y cambiar parametros de configuracion;
+crear un rol DBA de laboratorio; habilitar y probar autenticacion TCP;
+y verificar que datos y configuracion persisten al recrear el contenedor.
+
+IMPORTANTE
+- Estos comandos se ejecutan en una terminal PowerShell de Windows,
+  salvo cuando se indique expresamente que se entra a psql.
+- Los comandos Docker son portables; no se requieren rutas.
+- La imagen se construye a partir del Dockerfile del repositorio.
+- El cluster NO viene preinicializado. El alumno ejecutara initdb.
+- NO ejecutar 'docker compose down -v': borraria el volumen de datos.
+- La contrasena de este ejercicio es publica y SOLO para laboratorio.
+- La regla de pg_hba.conf usa una prueba TCP interna que no depende de la IP del host.
+  Para conectividad desde Windows a traves del puerto publicado, la regla de red debe revisarse de acuerdo con el entorno real.
+
+====================================================================
+2. PRERREQUISITOS
+====================================================================
+- Docker Desktop instalado y ejecutandose.
+- Git disponible.
+- Acceso a internet para clonar el repositorio y construir la imagen.
+- Puerto TCP 5432 libre en localhost.
+- Repositorio: https://github.com/diego-nobleprog/postgresql-dba-administration
+
+====================================================================
+3. OBTENER LOS ARCHIVOS DE LA PRACTICA
+====================================================================
+COMANDO:
+git clone https://github.com/diego-nobleprog/postgresql-dba-administration.git
+
+PARA QUE SIRVE:
+Descarga los archivos de laboratorio del repositorio.
+
+COMANDO:
+cd postgresql-dba-administration
+
+PARA QUE SIRVE:
+Entra al directorio que contiene Dockerfile y compose.yaml.
+
+COMANDO:
+git switch p1
+
+PARA QUE SIRVE:
+Selecciona la rama que contiene la primera practica. Debe estar
+publicada previamente por el instructor.
+
+COMANDO:
+Get-Content Dockerfile
+Get-Content compose.yaml
+
+PARA QUE SIRVE:
+Permite revisar y explicar linea por linea la imagen y el servicio.
+
+====================================================================
+4. CONSTRUIR LA IMAGEN
+====================================================================
+COMANDO:
+docker build -t postgresql-dba:18-p1 .
+
+PARA QUE SIRVE:
+Construye una imagen local con Oracle Linux 9, los paquetes de
+PostgreSQL 18 y el directorio de sockets necesario.
+
+COMANDO:
+docker images postgresql-dba
+
+PARA QUE SIRVE:
+Comprueba que existe la imagen con la etiqueta 18-p1.
+
+====================================================================
+5. CREAR EL VOLUMEN E INICIALIZAR EL CLUSTER
+====================================================================
+NOTA: compose.yaml inicia directamente 'postgres'. Como el volumen
+nuevo aun no tiene un cluster, primero debemos inicializarlo.
+
+COMANDO:
+docker compose create
+
+PARA QUE SIRVE:
+Crea el contenedor y el volumen declarado por Compose, sin arrancar
+el proceso PostgreSQL. Asi podemos ejecutar initdb antes del servidor.
+
+COMANDO:
+docker compose ps -a
+
+PARA QUE SIRVE:
+Verifica que el contenedor se creo, aunque todavia no este ejecutandose.
+
+COMANDO:
+docker compose run --rm --no-deps --entrypoint initdb postgres -D /var/lib/pgsql/data --encoding=UTF8 --locale=C --auth-local=peer --auth-host=scram-sha-256
+
+PARA QUE SIRVE:
+Inicializa el cluster sobre el volumen persistente, crea las bases
+de datos y catalogos iniciales y genera postgresql.conf y pg_hba.conf.
+La autenticacion local usa peer; las conexiones TCP usan SCRAM-SHA-256.
+Se ejecuta una sola vez sobre un directorio de datos vacio.
+
+COMANDO:
+docker compose up -d
+
+PARA QUE SIRVE:
+Inicia el servidor PostgreSQL en segundo plano usando el volumen
+ya inicializado.
+
+COMANDO:
+docker compose ps
+
+PARA QUE SIRVE:
+Comprueba que el contenedor esta en estado Up.
+
+COMANDO:
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+PARA QUE SIRVE:
+Pregunta al servidor si esta listo para aceptar conexiones TCP.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT version();"
+
+PARA QUE SIRVE:
+Confirma la version de PostgreSQL instalada y el acceso administrativo
+local por socket Unix.
+
+
+====================================================================
+6. EXPLORAR LA CONFIGURACION
+====================================================================
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW data_directory;"
+
+PARA QUE SIRVE:
+Identifica el directorio fisico donde reside el cluster.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW config_file;"
+
+PARA QUE SIRVE:
+Identifica el archivo postgresql.conf activo.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW hba_file;"
+
+PARA QUE SIRVE:
+Identifica el archivo pg_hba.conf que controla las reglas de acceso.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, context FROM pg_settings WHERE name IN ('listen_addresses','shared_buffers','max_connections','log_min_duration_statement','logging_collector','password_encryption') ORDER BY name;"
+
+PARA QUE SIRVE:
+Muestra los valores efectivos, sus unidades, su procedencia y si el
+cambio requiere recarga o reinicio del servidor.
+
+====================================================================
+7. MODIFICAR PARAMETROS DEL SERVIDOR
+====================================================================
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET log_min_duration_statement = '500ms';"
+
+PARA QUE SIRVE:
+Establece un umbral para registrar consultas que tarden al menos
+500 milisegundos. ALTER SYSTEM escribe en postgresql.auto.conf.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+PARA QUE SIRVE:
+Solicita que PostgreSQL relea la configuracion sin reiniciar el proceso.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW log_min_duration_statement;"
+
+PARA QUE SIRVE:
+Verifica que el parametro efectivo sea 500ms.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, source, sourcefile FROM pg_settings WHERE name = 'log_min_duration_statement';"
+
+PARA QUE SIRVE:
+Permite distinguir el valor efectivo de la fuente de configuracion.
+
+NOTA:
+En la preparacion del laboratorio se configuro listen_addresses='*'
+y logging_collector=on. Son parametros que requieren reinicio. En
+una instalacion limpia pueden aplicarse con ALTER SYSTEM y luego
+reiniciar el servicio. Los siguientes comandos hacen esa configuracion.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET listen_addresses = '*';"
+
+PARA QUE SIRVE:
+Indica que el servidor escuche en todas las interfaces internas del
+contenedor; no cambia por si solo la publicacion del puerto del host.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET logging_collector = 'on';"
+
+PARA QUE SIRVE:
+Activa el proceso recolector de registros de PostgreSQL.
+
+COMANDO:
+docker compose restart postgres
+
+PARA QUE SIRVE:
+Reinicia PostgreSQL para aplicar los parametros que no bastan con reload.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit FROM pg_settings WHERE name IN ('listen_addresses','log_min_duration_statement','logging_collector','password_encryption') ORDER BY name;"
+
+PARA QUE SIRVE:
+Verifica los valores finales del servidor.
+
+====================================================================
+8. CREAR UN ROL DBA DE LABORATORIO
+====================================================================
+COMANDO:
+docker exec -it postgresql-dba psql -U postgres -d postgres
+
+PARA QUE SIRVE:
+Abre una sesion interactiva de psql como superusuario local.
+
+DENTRO DE psql, EJECUTAR:
+CREATE ROLE dba_lab WITH LOGIN CREATEDB CREATEROLE NOSUPERUSER;
+
+PARA QUE SIRVE:
+Crea una cuenta que puede iniciar sesion, crear bases de datos y
+administrar determinados roles, pero que NO es superusuario.
+
+DENTRO DE psql, EJECUTAR:
+\password dba_lab
+
+PARA QUE SIRVE:
+Asigna la contrasena de manera interactiva, sin dejarla escrita en
+el historial SQL. Contrasena de laboratorio: DbaLab2026!
+
+DENTRO DE psql, EJECUTAR:
+SELECT rolname, rolcanlogin, rolcreatedb, rolcreaterole, rolsuper FROM pg_roles WHERE rolname = 'dba_lab';
+
+PARA QUE SIRVE:
+Confirma que los atributos esperados sean t, t, t y f.
+
+DENTRO DE psql, EJECUTAR:
+\q
+
+PARA QUE SIRVE:
+Sale de la consola interactiva.
+
+====================================================================
+9. REVISAR AUTENTICACION Y PROBAR TCP
+====================================================================
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number;"
+
+PARA QUE SIRVE:
+Muestra las reglas de autenticacion y cualquier error de sintaxis.
+
+NOTA:
+La inicializacion con --auth-host=scram-sha-256 configura reglas TCP
+para loopback dentro del contenedor. Para esta prueba no es necesario
+agregar una IP de gateway ni una subred Docker que pueda cambiar entre
+Mac y DaDesktop Windows.
+
+COMANDO:
+docker run --rm -it --network container:postgresql-dba --entrypoint psql postgresql-dba:18-p1 -h 127.0.0.1 -p 5432 -U dba_lab -d postgres -W -c "SELECT current_user, current_database(), inet_client_addr(), inet_server_addr(), inet_server_port();"
+
+PARA QUE SIRVE:
+Lanza un cliente psql temporal que comparte la red del contenedor
+servidor. Se conecta mediante TCP a loopback y solicita contrasena.
+Se espera current_user=dba_lab y puerto=5432. Esta prueba no demuestra
+conectividad desde Windows por el puerto publicado, sino autenticacion
+TCP dentro del espacio de red compartido.
+
+====================================================================
+10. COMPROBAR PERSISTENCIA
+====================================================================
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "CREATE TABLE IF NOT EXISTS public.persistence_test (id INTEGER PRIMARY KEY, description TEXT NOT NULL);"
+
+PARA QUE SIRVE:
+Crea una tabla sencilla para comprobar persistencia de datos.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "INSERT INTO public.persistence_test (id, description) VALUES (1, 'PostgreSQL persistent storage verified') ON CONFLICT (id) DO UPDATE SET description = EXCLUDED.description;"
+
+PARA QUE SIRVE:
+Inserta un registro verificable y permite repetir el comando sin
+provocar error por clave primaria duplicada.
+
+COMANDO:
+docker compose up -d --force-recreate
+
+PARA QUE SIRVE:
+Recrea el contenedor, pero conserva el volumen nombrado. Es distinto
+de eliminar el volumen y crear un cluster nuevo.
+
+COMANDO:
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+PARA QUE SIRVE:
+Comprueba que el servidor haya terminado de iniciar.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT * FROM public.persistence_test;"
+
+PARA QUE SIRVE:
+Verifica que el registro siga existiendo tras la recreacion.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT rolname, rolcanlogin, rolcreatedb, rolcreaterole, rolsuper FROM pg_roles WHERE rolname = 'dba_lab';"
+
+PARA QUE SIRVE:
+Comprueba que el rol y sus privilegios tambien persisten.
+
+COMANDO:
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit FROM pg_settings WHERE name IN ('listen_addresses','log_min_duration_statement','logging_collector','password_encryption') ORDER BY name;"
+
+PARA QUE SIRVE:
+Verifica que se conservaron los parametros de configuracion.
+
+COMANDO:
+docker run --rm -it --network container:postgresql-dba --entrypoint psql postgresql-dba:18-p1 -h 127.0.0.1 -p 5432 -U dba_lab -d postgres -W -c "SELECT current_user, current_database(), inet_client_addr(), inet_server_addr(), inet_server_port();"
+
+PARA QUE SIRVE:
+Repite la autenticacion TCP con dba_lab despues de recrear el servidor.
+
+====================================================================
+11. RETO OPCIONAL INDIVIDUAL
+====================================================================
+SIN SEGUIR UNA SOLUCION PASO A PASO:
+1. Cambiar log_min_duration_statement de 500ms a 750ms.
+2. Aplicar la configuracion sin recrear el contenedor.
+3. Consultar el valor efectivo y la fuente del parametro.
+4. Explicar si el cambio requiere reload o restart y por que.
+5. Restaurar el valor de 500ms al terminar.
+
+CRITERIOS DE VALIDACION:
+- El alumno demuestra el valor 750ms en pg_settings.
+- Identifica postgresql.auto.conf como fuente del ALTER SYSTEM.
+- Explica correctamente el efecto de pg_reload_conf().
+- Restaura 500ms y verifica el resultado.
+
+FIN DE PRACTICA 01
