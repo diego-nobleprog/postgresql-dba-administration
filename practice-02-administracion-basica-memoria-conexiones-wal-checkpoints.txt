@@ -1,0 +1,257 @@
+﻿================================================================================
+ESCENARIO 4 - ADMINISTRAR MEMORIA, CONEXIONES, WAL Y CHECKPOINTS
+================================================================================
+
+TEMA DEL TEMARIO:
+5. Configuracion de memoria, conexiones, WAL y checkpoints.
+
+SITUACION:
+Un DBA recibe una instancia PostgreSQL y necesita revisar sus recursos.
+Antes de realizar ajustes, debe conocer los valores activos, identificar
+que parametros requieren reinicio y comprobar el efecto de cambios
+controlados sin comprometer la disponibilidad del servidor.
+
+OBJETIVO:
+Consultar parametros de memoria, conexiones, WAL y checkpoints;
+modificar temporalmente configuraciones recargables; observar sus
+efectos y restaurar los valores originales.
+
+IMPORTANTE:
+No cambiaremos shared_buffers ni max_connections durante el experimento,
+porque requieren reiniciar PostgreSQL.
+
+Los cambios temporales se realizaran mediante ALTER SYSTEM y se
+revertiran al finalizar.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR LA CONFIGURACION ACTUAL
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Consultaremos los principales parametros relacionados con memoria,
+conexiones, WAL y checkpoints.
+
+¿PARA QUE SIRVE?
+Permite conocer la configuracion efectiva antes de decidir si es
+necesario modificar algun recurso.
+
+COMANDOS:
+
+# Consultar parametros de memoria y conexiones.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, source FROM pg_settings WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'max_connections') ORDER BY name;"
+
+RESULTADO: PostgreSQL utiliza 128MB de shared_buffers, 4MB de work_mem y 64MB de maintenance_work_mem. El limite es de 100 conexiones. shared_buffers y max_connections requieren reinicio para cambiarse.
+
+# Consultar parametros de WAL y checkpoints.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, source FROM pg_settings WHERE name IN ('wal_level', 'max_wal_size', 'min_wal_size', 'checkpoint_timeout', 'checkpoint_completion_target') ORDER BY name;"
+
+RESULTADO: wal_level esta configurado como replica, max_wal_size es 1GB y min_wal_size es 80MB. El intervalo de checkpoints es de 5 minutos y checkpoint_completion_target es 0.9. Solo wal_level requiere reinicio.
+
+CONCEPTOS:
+shared_buffers: Memoria compartida utilizada para almacenar paginas de datos.
+work_mem: Memoria disponible por operacion de ordenamiento o hash.
+maintenance_work_mem: Memoria para operaciones de mantenimiento.
+max_connections: Limite de conexiones simultaneas.
+wal_level: Nivel de informacion registrada en WAL.
+max_wal_size: Tamano objetivo maximo de WAL entre checkpoints.
+min_wal_size: Espacio minimo de WAL que PostgreSQL procura conservar.
+checkpoint_timeout: Intervalo maximo entre checkpoints automaticos.
+checkpoint_completion_target: Fraccion del intervalo durante la cual
+PostgreSQL procura distribuir la escritura de un checkpoint.
+
+La columna context indica como puede aplicarse un cambio.
+postmaster requiere reinicio.
+sighup permite aplicar cambios mediante recarga.
+user permite ajustar el parametro a nivel de sesion.
+
+--------------------------------------------------------------------------------
+PASO 2 - BEFORE: OBSERVAR MEMORIA Y CONEXIONES
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Comprobaremos los valores actuales de work_mem y max_connections.
+Tambien consultaremos cuantas conexiones existen.
+
+¿PARA QUE SIRVE?
+Establece una referencia para comparar el comportamiento del servidor
+antes y despues de realizar cambios.
+
+COMANDOS:
+
+# Consultar el valor actual de work_mem.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW work_mem;"
+
+RESULTADO: work_mem tiene un valor de 4MB. Esta memoria puede utilizarse por cada operacion de ordenamiento o hash, no como un limite global para todas las consultas.
+
+# Consultar el limite de conexiones configurado.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW max_connections;"
+
+RESULTADO: max_connections permite hasta 100 conexiones simultaneas, aunque algunas pueden estar reservadas para administracion. Cambiar este limite requiere reiniciar PostgreSQL.
+
+# Contar las conexiones registradas actualmente en PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT count(*) AS conexiones_actuales FROM pg_stat_activity;"
+
+RESULTADO: pg_stat_activity registra 9 procesos de conexion o actividad. No significa que las 9 conexiones esten ejecutando consultas; tambien pueden existir sesiones inactivas y procesos internos.
+
+--------------------------------------------------------------------------------
+PASO 3 - ACCION: MODIFICAR WORK_MEM EN UNA SESION
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Cambiaremos temporalmente work_mem a 8MB dentro de una transaccion.
+
+¿PARA QUE SIRVE?
+Demuestra que ciertos parametros pueden modificarse para una operacion
+sin afectar a las demas conexiones ni cambiar archivos del servidor.
+
+COMANDOS:
+
+# Modificar work_mem dentro de una transaccion y observar su valor.
+docker exec postgresql-dba psql -U postgres -d postgres -c "BEGIN; SET LOCAL work_mem = '8MB'; SHOW work_mem; COMMIT;"
+
+RESULTADO: SET LOCAL cambio work_mem de 4MB a 8MB durante la transaccion. COMMIT finalizo ese alcance temporal sin modificar la configuracion general del servidor.
+
+# Comprobar que una nueva sesion conserva el valor general.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW work_mem;"
+
+RESULTADO: Una nueva sesion muestra nuevamente 4MB. Esto confirma que SET LOCAL no modifica permanentemente el parametro ni afecta a otras conexiones.
+
+INTERPRETACION:
+SET LOCAL aplica el cambio solamente durante la transaccion actual.
+Al finalizar, el parametro recupera su valor anterior.
+
+--------------------------------------------------------------------------------
+PASO 4 - BEFORE: REVISAR WAL Y CHECKPOINTS
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Consultaremos los valores actuales de checkpoint_timeout y
+max_wal_size, junto con las estadisticas de checkpoints.
+
+¿PARA QUE SIRVE?
+Permite conocer la configuracion de recuperacion y la actividad
+relacionada con checkpoints antes de modificar un parametro.
+
+COMANDOS:
+
+# Consultar el intervalo maximo entre checkpoints.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW checkpoint_timeout;"
+
+RESULTADO: checkpoint_timeout es de 5 minutos. PostgreSQL puede iniciar checkpoints automaticos por tiempo, aunque tambien puede realizarlos por otras causas.
+
+# Consultar el tamano objetivo maximo de WAL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW max_wal_size;"
+
+RESULTADO: max_wal_size es de 1GB. Este valor representa un objetivo de crecimiento de WAL entre checkpoints, no un limite estricto de espacio en disco.
+
+# Consultar las estadisticas actuales del proceso checkpointer.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT num_timed, num_requested, num_done, buffers_written FROM pg_stat_checkpointer;"
+
+RESULTADO: Se registran 33 checkpoints por tiempo, 3 solicitados y 5 completados en las estadisticas actuales. Los 5291 buffers escritos representan actividad acumulada del checkpointer.
+
+--------------------------------------------------------------------------------
+PASO 5 - ACCION: MODIFICAR TEMPORALMENTE CHECKPOINT_TIMEOUT
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Guardaremos automaticamente la configuracion original de
+checkpoint_timeout, aplicaremos un valor temporal de 10 minutos
+y comprobaremos que PostgreSQL utiliza el nuevo valor.
+
+¿PARA QUE SIRVE?
+Permite demostrar un cambio de configuracion mediante ALTER SYSTEM
+sin perder los valores originales del servidor.
+
+COMANDOS:
+
+# Guardar una copia temporal del archivo de configuracion automatica.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-backup"
+
+RESULTADO: Se creo una copia de postgresql.auto.conf para conservar los valores originales antes del cambio. El comando termino sin errores.
+
+# Consultar la configuracion original de checkpoint_timeout.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'checkpoint_timeout';"
+
+RESULTADO: checkpoint_timeout tenia un valor original de 300 segundos (5 minutos), proveniente de la configuracion predeterminada y sin archivo de origen.
+
+# Establecer temporalmente checkpoint_timeout en 10 minutos.
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET checkpoint_timeout = '10min';"
+
+RESULTADO: ALTER SYSTEM guardo correctamente checkpoint_timeout=10min en postgresql.auto.conf. El cambio requiere una recarga para aplicarse.
+
+# Recargar la configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: pg_reload_conf devolvio t, indicando que PostgreSQL acepto la solicitud de recarga de configuracion.
+
+# Comprobar el valor aplicado y su procedencia.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'checkpoint_timeout';"
+
+RESULTADO: El valor efectivo cambio a 600 segundos (10 minutos). Su origen ahora es postgresql.auto.conf, lo que confirma que ALTER SYSTEM modifico la configuracion del servidor.
+
+# Consultar el nuevo valor mediante SHOW.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW checkpoint_timeout;"
+
+RESULTADO: SHOW confirma que checkpoint_timeout esta configurado en 10 minutos. El nuevo valor quedo disponible sin reiniciar PostgreSQL.
+
+--------------------------------------------------------------------------------
+PASO 6 - RESTAURACION: RECUPERAR LA CONFIGURACION ORIGINAL
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Restauraremos la copia original de postgresql.auto.conf y
+recargaremos la configuracion.
+
+¿PARA QUE SIRVE?
+Permite recuperar los valores originales, incluso cuando
+checkpoint_timeout tenia una definicion previa.
+
+COMANDOS:
+
+# Restaurar el archivo original de configuracion automatica.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-backup /var/lib/pgsql/data/postgresql.auto.conf"
+
+RESULTADO: Se restauro la copia original de postgresql.auto.conf. Esto recupera las definiciones que existian antes del experimento.
+
+# Recargar la configuracion restaurada.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: PostgreSQL acepto la solicitud de recarga despues de restaurar el archivo original.
+
+# Confirmar el valor original de checkpoint_timeout.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'checkpoint_timeout';"
+
+RESULTADO: checkpoint_timeout regreso a 300 segundos (5 minutos) y su origen vuelve a ser default. Se recupero correctamente el valor inicial.
+
+# Eliminar la copia temporal despues de restaurar la configuracion.
+docker exec -u postgres postgresql-dba rm /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-backup
+
+RESULTADO: Se elimino la copia temporal de seguridad despues de confirmar la restauracion de la configuracion.
+
+--------------------------------------------------------------------------------
+PASO 7 - VERIFICACION FINAL: REVISAR EL ESTADO DEL SERVIDOR
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Comprobaremos que PostgreSQL sigue disponible y que no existen
+errores de configuracion.
+
+¿PARA QUE SIRVE?
+Confirma que el experimento finalizo sin afectar la disponibilidad.
+
+COMANDOS:
+
+# Comprobar que PostgreSQL sigue aceptando conexiones.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO: PostgreSQL responde accepting connections en el puerto 5432. El servidor permanece disponible despues del experimento.
+
+# Consultar los errores detectados en los archivos de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, sourceline, name, error FROM pg_file_settings WHERE error IS NOT NULL;"
+
+RESULTADO: La consulta devolvio cero filas. PostgreSQL no reporta errores en los archivos de configuracion.
+
+================================================================================
+FIN DEL ESCENARIO 4
+================================================================================
+
