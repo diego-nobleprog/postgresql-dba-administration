@@ -1,0 +1,183 @@
+﻿================================================================================
+ESCENARIO 2 - CONTROLAR EL ACCESO CON PG_HBA.CONF
+================================================================================
+
+TEMA DEL TEMARIO:
+3. pg_hba.conf.
+
+SITUACION:
+Un DBA necesita comprobar que un usuario puede conectarse a PostgreSQL
+y demostrar como una regla de autenticacion puede bloquear su acceso.
+
+OBJETIVO:
+Identificar pg_hba.conf, revisar las reglas existentes, bloquear
+temporalmente una conexion y restaurar el acceso.
+
+IMPORTANTE:
+El experimento utiliza el usuario dba_lab y conexiones TCP desde
+127.0.0.1 dentro del entorno Docker.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR LAS REGLAS DE AUTENTICACION
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Localizaremos pg_hba.conf y consultaremos las reglas de autenticacion.
+
+¿PARA QUE SIRVE?
+Permite conocer que usuarios pueden conectarse, desde donde y mediante
+que metodo de autenticacion.
+
+COMANDOS:
+
+# Identificar la ubicacion del archivo de autenticacion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW hba_file;"
+
+RESULTADO: El archivo de autenticacion se encuentra en /var/lib/pgsql/data/pg_hba.conf.
+
+# Consultar las reglas de autenticacion reconocidas por PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number;"
+
+RESULTADO: Se encontraron seis reglas. Las conexiones locales usan peer y las conexiones TCP usan scram-sha-256.
+
+CONCEPTOS:
+type: Tipo de conexion, por ejemplo local o host.
+database: Bases de datos a las que aplica la regla.
+user_name: Usuarios afectados.
+address: Direccion de origen permitida o restringida.
+auth_method: Metodo de autenticacion, como peer, scram-sha-256 o reject.
+
+--------------------------------------------------------------------------------
+PASO 2 - BEFORE: COMPROBAR UNA CONEXION PERMITIDA
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Intentaremos conectarnos con el usuario dba_lab utilizando una
+conexion TCP desde otro proceso Docker que comparte la red del servidor.
+
+¿PARA QUE SIRVE?
+Nos permite establecer el comportamiento original antes de modificar
+las reglas de autenticacion.
+
+COMANDO:
+
+# Comprobar que dba_lab puede autenticarse mediante TCP.
+docker run --rm -it --network container:postgresql-dba --entrypoint psql postgresql-dba:18-p1 -h 127.0.0.1 -p 5432 -U dba_lab -d postgres -W -c "SELECT current_user, current_database();"
+
+RESULTADO: dba_lab se conecto correctamente a la base postgres.
+
+NOTA:
+PostgreSQL solicitara la contrasena del usuario dba_lab.
+La contrasena no se mostrara mientras se escribe.
+
+--------------------------------------------------------------------------------
+PASO 3 - ACCION: BLOQUEAR TEMPORALMENTE EL ACCESO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Agregaremos al inicio de pg_hba.conf una regla que rechaza las
+conexiones TCP de dba_lab desde 127.0.0.1 hacia la base postgres.
+
+¿PARA QUE SIRVE?
+Demuestra que PostgreSQL evalua las reglas en orden y utiliza
+la primera regla que coincide con la conexion.
+
+IMPORTANTE:
+La regla solo afecta a dba_lab en la conexion indicada.
+No bloquea las conexiones locales de administracion del usuario postgres.
+
+COMANDOS:
+
+# Verificar que no exista previamente la regla temporal del experimento.
+docker exec postgresql-dba sh -c "grep -n 'nobleprog_p2_hba_demo' /var/lib/pgsql/data/pg_hba.conf || true"
+
+RESULTADO: No existia ninguna marca temporal del experimento.
+
+# Insertar una regla temporal de rechazo al inicio del archivo de autenticacion.
+docker exec -u postgres postgresql-dba sed -i '1i# nobleprog_p2_hba_demo\nhost postgres dba_lab 127.0.0.1/32 reject' /var/lib/pgsql/data/pg_hba.conf
+
+RESULTADO: Se agrego la regla reject para dba_lab desde 127.0.0.1.
+
+# Recargar las reglas de autenticacion sin reiniciar PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: La solicitud de recarga fue aceptada (t).
+
+# Confirmar que PostgreSQL reconoce la nueva regla de rechazo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number LIMIT 5;"
+
+RESULTADO: La nueva regla aparece en la linea 2, antes de las reglas generales.
+
+--------------------------------------------------------------------------------
+PASO 4 - AFTER: COMPROBAR EL ACCESO RECHAZADO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Repetiremos la conexion del usuario dba_lab.
+
+¿PARA QUE SIRVE?
+Permite observar que la nueva regla impide la conexion aunque el
+usuario exista y su contrasena sea correcta.
+
+COMANDO:
+
+# Intentar nuevamente la conexion TCP que ahora debe ser rechazada.
+docker run --rm -it --network container:postgresql-dba --entrypoint psql postgresql-dba:18-p1 -h 127.0.0.1 -p 5432 -U dba_lab -d postgres -W -c "SELECT current_user, current_database();"
+
+RESULTADO: PostgreSQL rechazo la conexion de dba_lab mediante pg_hba.conf, como esperabamos.
+
+NOTA:
+En este paso esperamos un error de conexion. Es el comportamiento
+que queremos demostrar, no una falla del laboratorio.
+
+--------------------------------------------------------------------------------
+PASO 5 - RESTAURACION: RECUPERAR EL ACCESO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Eliminaremos la regla temporal y recargaremos pg_hba.conf.
+
+¿PARA QUE SIRVE?
+Demuestra como revertir una restriccion de acceso sin reiniciar
+el servidor.
+
+COMANDOS:
+
+# Eliminar exclusivamente la regla temporal y su comentario identificador.
+docker exec -u postgres postgresql-dba sed -i '/^# nobleprog_p2_hba_demo$/d; /^host postgres dba_lab 127\.0\.0\.1\/32 reject$/d' /var/lib/pgsql/data/pg_hba.conf
+
+RESULTADO: Se eliminaron la regla temporal y su comentario.
+
+# Recargar las reglas originales de autenticacion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: La solicitud de recarga fue aceptada (t).
+
+# Comprobar que la regla temporal ya no aparece en el archivo.
+docker exec postgresql-dba sh -c "grep -n 'nobleprog_p2_hba_demo' /var/lib/pgsql/data/pg_hba.conf || true"
+
+RESULTADO: La marca temporal ya no aparece en el archivo.
+
+# Verificar que no existan errores de sintaxis en las reglas.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;"
+
+RESULTADO: Cero filas. No se detectaron errores de sintaxis.
+
+--------------------------------------------------------------------------------
+PASO 6 - VERIFICACION FINAL: COMPROBAR EL ACCESO RESTAURADO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Repetiremos la conexion original para confirmar que el usuario
+puede autenticarse nuevamente.
+
+COMANDO:
+
+# Confirmar que dba_lab puede conectarse despues de restaurar pg_hba.conf.
+docker run --rm -it --network container:postgresql-dba --entrypoint psql postgresql-dba:18-p1 -h 127.0.0.1 -p 5432 -U dba_lab -d postgres -W -c "SELECT current_user, current_database();"
+
+RESULTADO: dba_lab pudo conectarse nuevamente a la base postgres.
+
+================================================================================
+FIN DEL ESCENARIO 2
+================================================================================
