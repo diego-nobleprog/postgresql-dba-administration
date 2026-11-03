@@ -1,0 +1,206 @@
+﻿================================================================================
+ESCENARIO 3 - CONFIGURAR MAPEO DE IDENTIDADES CON PG_IDENT.CONF
+================================================================================
+
+TEMA DEL TEMARIO:
+4. pg_ident.conf.
+
+SITUACION:
+Un DBA necesita permitir que una cuenta del sistema operativo se autentique
+en PostgreSQL utilizando un rol cuyo nombre es diferente.
+
+OBJETIVO:
+Identificar pg_ident.conf, crear un mapeo de identidades, comprobar su
+funcionamiento y restaurar la configuracion original.
+
+IMPORTANTE:
+El experimento utilizara el usuario Linux postgres y el rol dba_lab.
+La conexion sera local mediante un socket Unix y autenticacion peer.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR EL ARCHIVO DE MAPEO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Localizaremos pg_ident.conf y revisaremos los mapeos existentes.
+
+¿PARA QUE SIRVE?
+Permite conocer las equivalencias configuradas entre usuarios del
+sistema operativo y roles de PostgreSQL.
+
+COMANDOS:
+
+# Identificar la ubicacion del archivo de mapeo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW ident_file;"
+
+RESULTADO: El archivo de mapeo se encuentra en /var/lib/pgsql/data/pg_ident.conf.
+
+# Consultar los mapeos reconocidos por PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, map_name, sys_name, pg_username, error FROM pg_ident_file_mappings ORDER BY line_number;"
+
+RESULTADO: Cero filas. No habia mapeos de identidad configurados.
+
+CONCEPTOS:
+map_name: Nombre del mapeo.
+sys_name: Usuario del sistema operativo.
+pg_username: Rol de PostgreSQL al que se permite acceder.
+error: Problema detectado en la definicion del mapeo.
+
+--------------------------------------------------------------------------------
+PASO 2 - BEFORE: COMPROBAR EL COMPORTAMIENTO ORIGINAL
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Intentaremos conectarnos como dba_lab desde el usuario Linux postgres
+sin proporcionar contrasena.
+
+¿PARA QUE SIRVE?
+Demuestra que la autenticacion peer normalmente exige que el usuario
+del sistema operativo coincida con el rol solicitado, salvo que exista
+un mapeo autorizado.
+
+COMANDO:
+
+# Intentar conectarse como dba_lab desde el usuario Linux postgres.
+docker exec -u postgres postgresql-dba psql -h /var/run/postgresql -U dba_lab -d postgres -c "SELECT current_user, current_database();"
+
+RESULTADO: La conexion fue rechazada porque el usuario Linux postgres no coincidia con el rol dba_lab.
+
+NOTA:
+Esperamos un error de autenticacion peer porque los nombres no coinciden.
+Es el comportamiento que queremos observar antes del cambio.
+
+--------------------------------------------------------------------------------
+PASO 3 - ACCION: CREAR UN MAPEO DE IDENTIDADES
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Agregaremos un mapeo temporal que autoriza al usuario Linux postgres
+a autenticarse como el rol PostgreSQL dba_lab.
+
+Tambien agregaremos una regla temporal al inicio de pg_hba.conf para
+utilizar ese mapeo mediante autenticacion peer.
+
+¿PARA QUE SIRVE?
+Demuestra que pg_ident.conf define equivalencias de identidad, mientras
+que pg_hba.conf determina cuando se utiliza cada mapeo.
+
+COMANDOS:
+
+# Verificar que no exista previamente el mapeo temporal.
+docker exec postgresql-dba sh -c "grep -n 'nobleprog_p2_ident_demo' /var/lib/pgsql/data/pg_ident.conf || true"
+
+RESULTADO: No existia previamente el mapeo temporal.
+
+# Verificar que no exista previamente la regla temporal de autenticacion.
+docker exec postgresql-dba sh -c "grep -n 'nobleprog_p2_ident_demo' /var/lib/pgsql/data/pg_hba.conf || true"
+
+RESULTADO: No existia previamente la regla temporal de autenticacion.
+
+# Agregar el mapeo temporal entre el usuario Linux postgres y el rol dba_lab.
+docker exec -u postgres postgresql-dba sh -c "printf '\n# nobleprog_p2_ident_demo\nnobleprog_p2_ident_demo postgres dba_lab\n' >> /var/lib/pgsql/data/pg_ident.conf"
+
+RESULTADO: Se agrego el mapeo entre el usuario Linux postgres y el rol dba_lab.
+
+# Agregar una regla local que utilice el mapeo temporal.
+docker exec -u postgres postgresql-dba sed -i '1i# nobleprog_p2_ident_demo\nlocal postgres dba_lab peer map=nobleprog_p2_ident_demo' /var/lib/pgsql/data/pg_hba.conf
+
+RESULTADO: Se agrego una regla local de autenticacion peer que utiliza el mapeo.
+
+# Recargar los archivos de configuracion sin reiniciar PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: t confirma que PostgreSQL acepto la solicitud de recarga.
+
+# Confirmar que PostgreSQL reconoce el nuevo mapeo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, map_name, sys_name, pg_username, error FROM pg_ident_file_mappings WHERE map_name = 'nobleprog_p2_ident_demo';"
+
+RESULTADO: PostgreSQL reconoce el mapeo en la linea 75 de pg_ident.conf, sin errores.
+
+# Confirmar que la regla de autenticacion utiliza el mapeo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, type, database, user_name, auth_method, options, error FROM pg_hba_file_rules WHERE options::text LIKE '%nobleprog_p2_ident_demo%';"
+
+RESULTADO: La regla de la linea 2 de pg_hba.conf utiliza el mapeo configurado.
+
+--------------------------------------------------------------------------------
+PASO 4 - AFTER: COMPROBAR EL MAPEO
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Repetiremos la conexion original utilizando el rol dba_lab desde el
+usuario Linux postgres.
+
+¿PARA QUE SIRVE?
+Permite comprobar que PostgreSQL acepta la identidad del sistema
+operativo mediante el mapeo configurado.
+
+COMANDO:
+
+# Conectarse como dba_lab utilizando el mapeo de identidad.
+docker exec -u postgres postgresql-dba psql -h /var/run/postgresql -U dba_lab -d postgres -c "SELECT current_user, current_database();"
+
+RESULTADO: La conexion fue exitosa. El usuario Linux postgres pudo autenticarse como dba_lab.
+
+--------------------------------------------------------------------------------
+PASO 5 - RESTAURACION: ELIMINAR EL MAPEO TEMPORAL
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Eliminaremos el mapeo temporal de pg_ident.conf y la regla temporal
+de pg_hba.conf.
+
+¿PARA QUE SIRVE?
+Permite devolver la autenticacion a su comportamiento original.
+
+COMANDOS:
+
+# Eliminar el mapeo temporal y su comentario de pg_ident.conf.
+docker exec -u postgres postgresql-dba sed -i '/^# nobleprog_p2_ident_demo$/d; /^nobleprog_p2_ident_demo postgres dba_lab$/d' /var/lib/pgsql/data/pg_ident.conf
+
+RESULTADO: Se elimino el mapeo temporal de pg_ident.conf.
+
+# Eliminar la regla temporal y su comentario de pg_hba.conf.
+docker exec -u postgres postgresql-dba sed -i '/^# nobleprog_p2_ident_demo$/d; /^local postgres dba_lab peer map=nobleprog_p2_ident_demo$/d' /var/lib/pgsql/data/pg_hba.conf
+
+RESULTADO: Se elimino la regla temporal de pg_hba.conf.
+
+# Recargar la configuracion original.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: t confirma que PostgreSQL acepto la solicitud de recarga.
+
+# Confirmar que el mapeo temporal ya no aparece.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT line_number, map_name, sys_name, pg_username FROM pg_ident_file_mappings WHERE map_name = 'nobleprog_p2_ident_demo';"
+
+RESULTADO: Cero filas. El mapeo temporal ya no existe.
+
+# Comprobar que no existen errores en los archivos de autenticacion y mapeo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT 'pg_hba.conf' AS archivo, error FROM pg_hba_file_rules WHERE error IS NOT NULL UNION ALL SELECT 'pg_ident.conf', error FROM pg_ident_file_mappings WHERE error IS NOT NULL;"
+
+RESULTADO: Cero filas. No hay errores en los archivos de autenticacion y mapeo.
+
+--------------------------------------------------------------------------------
+PASO 6 - VERIFICACION FINAL: COMPROBAR LA RESTAURACION
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Intentaremos nuevamente conectarnos como dba_lab desde el usuario
+Linux postgres, ahora sin el mapeo temporal.
+
+¿PARA QUE SIRVE?
+Demuestra que el acceso vuelve a depender de las reglas originales.
+
+COMANDO:
+
+# Confirmar que la conexion vuelve a ser rechazada por autenticacion peer.
+docker exec -u postgres postgresql-dba psql -h /var/run/postgresql -U dba_lab -d postgres -c "SELECT current_user, current_database();"
+
+RESULTADO: La conexion vuelve a ser rechazada por peer. Se restauro el comportamiento original.
+
+NOTA:
+El error de autenticacion esperado confirma que el mapeo temporal
+ya no autoriza esta conexion.
+
+================================================================================
+FIN DEL ESCENARIO 3
+================================================================================
