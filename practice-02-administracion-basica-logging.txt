@@ -1,0 +1,150 @@
+﻿================================================================================
+ESCENARIO 5 - CONFIGURAR Y VERIFICAR EL LOGGING DE POSTGRESQL
+================================================================================
+
+TEMA DEL TEMARIO:
+6. Logging.
+
+SITUACION:
+Un DBA necesita identificar consultas lentas, verificar su registro y modificar temporalmente el umbral de logging sin afectar la configuracion permanente.
+
+OBJETIVO:
+Inspeccionar el logging, generar consultas registrables, localizar sus evidencias y restaurar los valores originales.
+
+AMBIENTE:
+Windows PowerShell, Docker y PostgreSQL 18.6 en el contenedor postgresql-dba.
+Los comandos se ejecutan desde PowerShell en DaDesktop.
+
+--------------------------------------------------------------------------------
+PASO 1 - INSPECCIONAR LA CONFIGURACION DE LOGGING
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Identificaremos donde PostgreSQL escribe sus registros y que eventos captura. Esto permite establecer una referencia antes de cambiar el umbral de consultas lentas.
+
+# Consultar los parametros principales de logging.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, source FROM pg_settings WHERE name IN ('logging_collector', 'log_destination', 'log_directory', 'log_filename', 'log_min_duration_statement', 'log_statement') ORDER BY name;"
+
+RESULTADO:
+Se encontraron seis parametros. logging_collector estaba activo, el destino era stderr y los archivos se guardaban en log con nombres por dia de la semana. El umbral de consultas lentas era de 500 ms y log_statement estaba en none.
+
+# Identificar el archivo de log activo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_current_logfile();"
+
+RESULTADO:
+PostgreSQL devolvio log/postgresql-Tue.log. Esta funcion permite localizar el archivo activo sin depender de una ruta calculada manualmente.
+
+# Consultar el origen del umbral de consultas lentas.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'log_min_duration_statement';"
+
+RESULTADO:
+El valor original era 500 ms y provenia de postgresql.auto.conf. Es importante conocer este origen para restaurar exactamente la configuracion previa.
+
+--------------------------------------------------------------------------------
+PASO 2 - ACTIVAR EL REGISTRO TEMPORAL DE CONSULTAS LENTAS
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Reduciremos el umbral a 100 ms, recargaremos la configuracion y ejecutaremos una consulta suficientemente lenta para generar evidencia.
+
+# Respaldar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-logging-backup"
+
+RESULTADO:
+El comando termino sin errores. Se conservo una copia del archivo original para recuperar sus definiciones al finalizar el experimento.
+
+# Configurar el umbral temporal en 100 ms.
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET log_min_duration_statement = '100ms';"
+
+RESULTADO:
+ALTER SYSTEM se ejecuto correctamente. La nueva definicion quedo escrita en postgresql.auto.conf, pendiente de aplicarse mediante recarga.
+
+# Recargar la configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+La funcion devolvio t, indicando que se envio correctamente la solicitud de recarga. La comprobacion posterior confirma que el parametro fue aplicado.
+
+# Verificar el umbral activo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW log_min_duration_statement;"
+
+RESULTADO:
+SHOW devolvio 100ms. PostgreSQL ya registraria las sentencias cuya duracion alcanzara o superara ese umbral.
+
+# Ejecutar una consulta de aproximadamente 300 ms.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_sleep(0.3);"
+
+RESULTADO:
+La consulta termino correctamente. La evidencia posterior del log muestra una duracion real de 302.778 ms, superior al umbral configurado.
+
+--------------------------------------------------------------------------------
+PASO 3 - RESTAURAR LA CONFIGURACION ORIGINAL
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Recuperaremos el archivo original y verificaremos que el registro de consultas lentas vuelva a su umbral anterior.
+
+# Restaurar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-logging-backup /var/lib/pgsql/data/postgresql.auto.conf"
+
+RESULTADO:
+La copia original fue restaurada sin errores. De esta manera se recuperan las definiciones anteriores y no solamente el parametro modificado.
+
+# Recargar la configuracion restaurada.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+PostgreSQL devolvio t. La recarga permite recuperar los valores originales sin reiniciar el servidor.
+
+# Verificar el origen y valor restaurados.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'log_min_duration_statement';"
+
+RESULTADO:
+El umbral regreso a 500 ms y su origen volvio a ser postgresql.auto.conf. Esto confirma que la restauracion fue efectiva.
+
+# Eliminar el respaldo temporal.
+docker exec -u postgres postgresql-dba rm /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-logging-backup
+
+RESULTADO:
+El archivo temporal fue eliminado despues de restaurar la configuracion.
+
+# Verificar disponibilidad.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO:
+PostgreSQL respondio accepting connections. El experimento no interrumpio la disponibilidad del servidor.
+
+--------------------------------------------------------------------------------
+PASO 4 - COMPROBAR LAS EVIDENCIAS EN EL LOG
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Leeremos el archivo de registro desde el contenedor y comprobaremos que ambas consultas lentas quedaron registradas. Tambien confirmaremos el umbral restaurado.
+
+# Consultar el archivo activo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_current_logfile();"
+
+RESULTADO:
+El archivo activo seguia siendo log/postgresql-Tue.log, correspondiente al registro utilizado durante el experimento.
+
+# Ejecutar una consulta de aproximadamente 700 ms con el umbral original.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_sleep(0.7);"
+
+RESULTADO:
+La consulta se completo correctamente. Su duracion real fue de 702.821 ms, suficiente para superar el umbral restaurado de 500 ms.
+
+# Leer las ultimas lineas del log.
+docker exec -u postgres postgresql-dba tail -n 40 /var/lib/pgsql/data/log/postgresql-Tue.log
+
+RESULTADO:
+El log confirmo ambos casos: duration: 302.778 ms statement: SELECT pg_sleep(0.3), cuando el umbral era 100 ms; y duration: 702.821 ms statement: SELECT pg_sleep(0.7), con el umbral original de 500 ms. Tambien registro las recargas y cambios de configuracion.
+
+# Confirmar el umbral final.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW log_min_duration_statement;"
+
+RESULTADO:
+El valor final fue 500ms. El servidor quedo con su configuracion original y con evidencia de ambas consultas en el log.
+
+================================================================================
+FIN DEL ESCENARIO 5
+================================================================================

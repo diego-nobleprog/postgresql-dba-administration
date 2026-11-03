@@ -1,0 +1,125 @@
+﻿================================================================================
+ESCENARIO 8 - INSTALAR, UTILIZAR Y ELIMINAR EXTENSIONES
+================================================================================
+
+TEMA DEL TEMARIO:
+9. Extensiones.
+
+SITUACION:
+Un DBA necesita evaluar una extension, comprobar sus funciones y evitar instalar componentes innecesarios en las bases de datos existentes.
+
+OBJETIVO:
+Identificar extensiones disponibles, instalar pgcrypto en una base temporal, ejecutar una funcion y eliminar todos los objetos del experimento.
+
+AMBIENTE:
+Windows PowerShell, Docker y PostgreSQL 18.6 en el contenedor postgresql-dba.
+Los comandos se ejecutan desde PowerShell en DaDesktop.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR EXTENSIONES INSTALADAS Y DISPONIBLES
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Consultaremos las extensiones que ya existen en la base de datos y las que estan disponibles para instalarse.
+
+# Consultar extensiones instaladas.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT extname, extversion, extnamespace::regnamespace AS schema FROM pg_extension ORDER BY extname;"
+
+RESULTADO:
+La base de datos postgres tenia instalada plpgsql version 1.0 en pg_catalog. Las extensiones se administran por base de datos, no se habilitan automaticamente en todas las bases del servidor.
+
+# Consultar extensiones disponibles.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('pgcrypto', 'hstore', 'uuid-ossp') ORDER BY name;"
+
+RESULTADO:
+El servidor tenia disponibles hstore 1.8, pgcrypto 1.4 y uuid-ossp 1.1. Ninguna aparecia instalada en la base de datos consultada.
+
+# Verificar si pgcrypto estaba instalada.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pgcrypto';"
+
+RESULTADO:
+La consulta devolvio cero filas. pgcrypto no estaba instalada en la base de datos postgres.
+
+--------------------------------------------------------------------------------
+PASO 2 - CREAR UNA BASE AISLADA E INSTALAR PGCRYPTO
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Crearemos una base de datos temporal para instalar y probar una extension sin modificar la base de datos postgres.
+
+# Crear la base de datos temporal.
+docker exec postgresql-dba psql -U postgres -d postgres -c "CREATE DATABASE nobleprog_p2_extensions;"
+
+RESULTADO:
+CREATE DATABASE confirmo la creacion de una base independiente para el experimento.
+
+# Consultar sus extensiones iniciales.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+
+RESULTADO:
+La nueva base de datos contenia inicialmente plpgsql 1.0. Esto establecio una referencia antes de instalar pgcrypto.
+
+# Instalar pgcrypto.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "CREATE EXTENSION pgcrypto;"
+
+RESULTADO:
+CREATE EXTENSION se ejecuto correctamente. pgcrypto quedo habilitada en la base de datos temporal.
+
+# Verificar la instalacion.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "SELECT extname, extversion, extnamespace::regnamespace AS schema FROM pg_extension ORDER BY extname;"
+
+RESULTADO:
+Aparecieron pgcrypto 1.4 en public y plpgsql 1.0 en pg_catalog. La consulta confirma la instalacion y el esquema asociado.
+
+# Ejecutar una funcion de pgcrypto.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "SELECT encode(digest('NobleProg PostgreSQL DBA', 'sha256'), 'hex') AS hash_sha256;"
+
+RESULTADO:
+La funcion digest calculo correctamente un hash SHA-256 del texto. Esto demuestra que la extension no solo estaba registrada, sino que sus funciones podian ejecutarse.
+
+# Comprobar el aislamiento respecto de postgres.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT extname FROM pg_extension WHERE extname = 'pgcrypto';"
+
+RESULTADO:
+La consulta devolvio cero filas. Instalar pgcrypto en nobleprog_p2_extensions no la instalo automaticamente en postgres.
+
+--------------------------------------------------------------------------------
+PASO 3 - ELIMINAR LA EXTENSION Y RESTAURAR EL ENTORNO
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Retiraremos la extension y la base de datos temporal, comprobando que no queden objetos del laboratorio.
+
+# Eliminar pgcrypto.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "DROP EXTENSION pgcrypto;"
+
+RESULTADO:
+DROP EXTENSION confirmo la eliminacion de pgcrypto en la base temporal.
+
+# Comprobar que pgcrypto ya no esta instalada.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_extensions -c "SELECT extname FROM pg_extension WHERE extname = 'pgcrypto';"
+
+RESULTADO:
+La consulta devolvio cero filas, confirmando que la extension fue retirada.
+
+# Eliminar la base de datos temporal.
+docker exec postgresql-dba psql -U postgres -d postgres -c "DROP DATABASE nobleprog_p2_extensions;"
+
+RESULTADO:
+DROP DATABASE elimino correctamente la base de datos utilizada para la practica.
+
+# Verificar la eliminacion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname = 'nobleprog_p2_extensions';"
+
+RESULTADO:
+La consulta devolvio cero filas. La base de datos temporal ya no existe.
+
+# Verificar disponibilidad.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO:
+PostgreSQL respondio accepting connections. El experimento finalizo sin afectar la disponibilidad del servidor.
+
+================================================================================
+FIN DEL ESCENARIO 8
+================================================================================

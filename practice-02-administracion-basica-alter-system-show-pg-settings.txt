@@ -1,0 +1,132 @@
+﻿================================================================================
+ESCENARIO 7 - ADMINISTRAR PARAMETROS CON ALTER SYSTEM, SHOW Y PG_SETTINGS
+================================================================================
+
+TEMA DEL TEMARIO:
+8. ALTER SYSTEM, SHOW y pg_settings.
+
+SITUACION:
+Un DBA necesita modificar parametros del servidor, consultar sus valores efectivos y distinguir entre configuracion global y ajustes de sesion.
+
+OBJETIVO:
+Utilizar ALTER SYSTEM, SHOW, pg_settings, SET y RESET; verificar los cambios y restaurar la configuracion original.
+
+AMBIENTE:
+Windows PowerShell, Docker y PostgreSQL 18.6 en el contenedor postgresql-dba.
+Los comandos se ejecutan desde PowerShell en DaDesktop.
+
+--------------------------------------------------------------------------------
+PASO 1 - CONSULTAR EL VALOR ORIGINAL
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Utilizaremos SHOW para consultar un parametro y pg_settings para conocer sus metadatos, contexto y origen.
+
+# Consultar work_mem.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW work_mem;"
+
+RESULTADO:
+El valor inicial era 4MB. work_mem controla la memoria disponible para determinadas operaciones de consulta, como ordenamientos y tablas hash.
+
+# Consultar los metadatos de work_mem.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, source, sourcefile FROM pg_settings WHERE name = 'work_mem';"
+
+RESULTADO:
+pg_settings mostro 4096 kB, contexto user y origen default. Esto indica que el valor podia modificarse por sesion y que no provenia de un archivo de configuracion explicito.
+
+--------------------------------------------------------------------------------
+PASO 2 - MODIFICAR WORK_MEM A NIVEL DE SERVIDOR
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Aplicaremos un valor temporal de 8MB mediante ALTER SYSTEM. Despues verificaremos el archivo de origen y el valor efectivo.
+
+# Respaldar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-alter-system-backup"
+
+RESULTADO:
+La copia de seguridad se creo sin errores, conservando las definiciones originales.
+
+# Configurar work_mem en 8MB.
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET work_mem = '8MB';"
+
+RESULTADO:
+ALTER SYSTEM finalizo correctamente y registro el nuevo valor en postgresql.auto.conf.
+
+# Consultar la definicion escrita.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, name, setting, applied, error FROM pg_file_settings WHERE name = 'work_mem';"
+
+RESULTADO:
+El archivo postgresql.auto.conf contenia work_mem=8MB, con applied=t y sin errores. Esto confirma que PostgreSQL reconocia la nueva definicion.
+
+# Recargar PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+La funcion devolvio t. La recarga permitio aplicar el parametro sin reiniciar el servidor.
+
+# Consultar el valor efectivo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW work_mem;"
+
+RESULTADO:
+SHOW devolvio 8MB, confirmando que el valor temporal estaba activo.
+
+# Consultar el origen del valor.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, source, sourcefile FROM pg_settings WHERE name = 'work_mem';"
+
+RESULTADO:
+pg_settings mostro 8192 kB y source=configuration file, con origen en postgresql.auto.conf. El cambio ya era efectivo para las nuevas sesiones.
+
+--------------------------------------------------------------------------------
+PASO 3 - SOBRESCRIBIR EL VALOR EN UNA SESION
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Demostraremos la diferencia entre una configuracion general del servidor y un cambio particular de sesion.
+
+# Cambiar work_mem a 16MB y restaurarlo en la sesion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SET work_mem = '16MB'; SHOW work_mem; RESET work_mem; SHOW work_mem;"
+
+RESULTADO:
+SET cambio work_mem a 16MB dentro de la sesion. RESET recupero 8MB, el valor general vigente en el servidor. Esto demuestra que un ajuste de sesion puede sobrescribir temporalmente la configuracion global.
+
+--------------------------------------------------------------------------------
+PASO 4 - RESTAURAR Y COMPROBAR
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Recuperaremos la configuracion original y comprobaremos que no quedan errores.
+
+# Restaurar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-alter-system-backup /var/lib/pgsql/data/postgresql.auto.conf"
+
+RESULTADO:
+Se recupero el archivo original sin errores, retirando la definicion temporal de work_mem.
+
+# Recargar la configuracion restaurada.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+La funcion devolvio t y solicito aplicar nuevamente la configuracion original.
+
+# Verificar el valor y origen originales.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name = 'work_mem';"
+
+RESULTADO:
+work_mem regreso a 4096 kB, equivalentes a 4MB, con source=default. Se recuperaron tanto el valor como su procedencia inicial.
+
+# Eliminar la copia temporal.
+docker exec -u postgres postgresql-dba rm /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-alter-system-backup
+
+RESULTADO:
+La copia de seguridad temporal se elimino despues de verificar la restauracion.
+
+# Consultar errores de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, sourceline, name, error FROM pg_file_settings WHERE error IS NOT NULL;"
+
+RESULTADO:
+La consulta devolvio cero filas. PostgreSQL no reporto errores en los archivos de configuracion.
+
+================================================================================
+FIN DEL ESCENARIO 7
+================================================================================

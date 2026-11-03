@@ -1,0 +1,119 @@
+﻿================================================================================
+ESCENARIO 6 - PARAMETROS DINAMICOS, RELOAD Y REINICIO
+================================================================================
+
+TEMA DEL TEMARIO:
+7. Parametros dinamicos y reinicio/reload.
+
+SITUACION:
+Un DBA necesita distinguir que ajustes se aplican inmediatamente, cuales requieren recarga y cuales exigen reiniciar el servidor.
+
+OBJETIVO:
+Identificar los contextos de configuracion, aplicar una definicion temporal, verificar su origen y restaurar el estado inicial.
+
+AMBIENTE:
+Windows PowerShell, Docker y PostgreSQL 18.6 en el contenedor postgresql-dba.
+Los comandos se ejecutan desde PowerShell en DaDesktop.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR LOS CONTEXTOS DE CONFIGURACION
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Compararemos parametros que pueden recargarse con otros que necesitan reiniciar PostgreSQL. El campo context determina como se aplica cada configuracion.
+
+# Consultar los parametros y sus contextos.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, context, pending_restart FROM pg_settings WHERE name IN ('log_min_messages', 'checkpoint_timeout', 'shared_buffers', 'max_connections') ORDER BY name;"
+
+RESULTADO:
+checkpoint_timeout aparecio con contexto sighup; max_connections y shared_buffers con postmaster; y log_min_messages con superuser. Todos mostraron pending_restart=f, por lo que no existian cambios pendientes de reinicio.
+
+# Consultar el valor original de log_min_messages.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW log_min_messages;"
+
+RESULTADO:
+El valor original era warning. Este dato es importante porque el experimento aplicara el mismo valor mediante ALTER SYSTEM, cambiando su origen pero no su comportamiento.
+
+--------------------------------------------------------------------------------
+PASO 2 - APLICAR UNA CONFIGURACION MEDIANTE RELOAD
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Escribiremos temporalmente log_min_messages en postgresql.auto.conf y recargaremos PostgreSQL. El objetivo es observar el cambio de procedencia sin reiniciar.
+
+# Respaldar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-reload-backup"
+
+RESULTADO:
+El respaldo se creo sin errores y permitio conservar la configuracion anterior.
+
+# Registrar temporalmente log_min_messages.
+docker exec postgresql-dba psql -U postgres -d postgres -c "ALTER SYSTEM SET log_min_messages = 'warning';"
+
+RESULTADO:
+ALTER SYSTEM se ejecuto correctamente. El valor warning ya estaba activo, por lo que esta operacion no cambio el nivel de mensajes; creo una definicion explicita en el archivo de configuracion automatica.
+
+# Consultar la definicion del archivo.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, name, setting, applied, error FROM pg_file_settings WHERE name = 'log_min_messages';"
+
+RESULTADO:
+pg_file_settings mostro log_min_messages=warning en postgresql.auto.conf, con applied=t y sin errores. Esto demuestra que PostgreSQL reconoce la definicion del archivo.
+
+# Solicitar la recarga.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+La funcion devolvio t. PostgreSQL recibio la solicitud de recarga sin necesidad de reiniciar el contenedor.
+
+# Comprobar el valor y su origen.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, context, source, pending_restart FROM pg_settings WHERE name = 'log_min_messages';"
+
+RESULTADO:
+El valor seguia siendo warning, pero source cambio a configuration file. pending_restart=f confirma que no habia un reinicio pendiente para este parametro.
+
+# Identificar parametros que requieren reinicio.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, context, pending_restart FROM pg_settings WHERE name IN ('shared_buffers', 'max_connections', 'wal_level') ORDER BY name;"
+
+RESULTADO:
+max_connections=100, shared_buffers=128MB y wal_level=replica tienen contexto postmaster. Estos parametros requieren reinicio cuando se modifican; no se alteraron durante el laboratorio.
+
+--------------------------------------------------------------------------------
+PASO 3 - RESTAURAR Y VALIDAR
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Recuperaremos el archivo original y verificaremos que log_min_messages vuelva a obtener su valor desde la configuracion predeterminada.
+
+# Restaurar postgresql.auto.conf.
+docker exec -u postgres postgresql-dba sh -c "cp /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-reload-backup /var/lib/pgsql/data/postgresql.auto.conf"
+
+RESULTADO:
+El archivo original se recupero sin errores, eliminando la definicion temporal introducida durante el experimento.
+
+# Recargar la configuracion original.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO:
+La recarga devolvio t. PostgreSQL pudo volver a utilizar la configuracion original sin reinicio.
+
+# Verificar el valor restaurado.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, context, source, pending_restart FROM pg_settings WHERE name = 'log_min_messages';"
+
+RESULTADO:
+log_min_messages continuo en warning, pero source regreso a default y pending_restart permanecio en f. Se restauro correctamente el origen original.
+
+# Eliminar el respaldo temporal.
+docker exec -u postgres postgresql-dba rm /var/lib/pgsql/data/postgresql.auto.conf.nobleprog-p2-reload-backup
+
+RESULTADO:
+La copia temporal fue eliminada despues de comprobar la restauracion.
+
+# Comprobar disponibilidad.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO:
+El servidor respondio accepting connections. La practica demostro recargas sin interrupcion del servicio.
+
+================================================================================
+FIN DEL ESCENARIO 6
+================================================================================

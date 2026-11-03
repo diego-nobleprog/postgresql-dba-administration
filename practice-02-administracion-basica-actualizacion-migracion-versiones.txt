@@ -1,0 +1,194 @@
+﻿================================================================================
+ESCENARIO 9 - INSPECCIONAR VERSIONES Y EJECUTAR UNA MIGRACION LOGICA
+================================================================================
+
+TEMA DEL TEMARIO:
+10. Actualizacion y migracion de versiones.
+
+SITUACION:
+Un DBA necesita inventariar una instancia antes de una actualizacion y comprobar un procedimiento de exportacion y restauracion de datos.
+
+OBJETIVO:
+Consultar versiones y extensiones, generar un respaldo logico con pg_dump, restaurarlo en otra base de datos y verificar la integridad de los datos.
+
+AMBIENTE:
+Windows PowerShell, Docker y PostgreSQL 18.6 en el contenedor postgresql-dba.
+Los comandos se ejecutan desde PowerShell en DaDesktop.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR VERSIONES Y OBJETOS EXISTENTES
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Antes de planear una actualizacion o migracion, un DBA debe conocer la version del servidor, la version del cliente, las bases de datos y las extensiones instaladas.
+
+# Consultar la version del servidor.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT version();"
+
+RESULTADO:
+El servidor ejecutaba PostgreSQL 18.6 sobre Linux x86_64, compilado con GCC 11.5.0. Esta informacion es relevante para planear compatibilidad y procedimientos de migracion.
+
+# Consultar la version numerica.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW server_version_num;"
+
+RESULTADO:
+El valor fue 180006, correspondiente a PostgreSQL 18.6. Esta representacion numerica resulta util para verificaciones automatizadas de compatibilidad.
+
+# Consultar la version del cliente.
+docker exec postgresql-dba psql --version
+
+RESULTADO:
+El cliente psql tambien era version 18.6. En este laboratorio, cliente y servidor utilizaban la misma version.
+
+# Consultar las bases de datos existentes.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT datname, pg_get_userbyid(datdba) AS owner, pg_encoding_to_char(encoding) AS encoding FROM pg_database ORDER BY datname;"
+
+RESULTADO:
+Se encontraron postgres, template0 y template1, todas con propietario postgres y codificacion UTF8. La inspeccion del inventario ayuda a determinar el alcance de una migracion.
+
+# Consultar extensiones instaladas.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+
+RESULTADO:
+La base de datos postgres tenia instalada plpgsql 1.0. Las extensiones deben considerarse al planear cambios de version porque pueden requerir compatibilidad o actualizacion.
+
+# Consultar versiones disponibles de plpgsql.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, version, installed, superuser FROM pg_available_extension_versions WHERE name = 'plpgsql' ORDER BY version;"
+
+RESULTADO:
+Solo aparecio plpgsql 1.0, marcada como instalada. No se observo una version alternativa disponible para actualizar esta extension.
+
+--------------------------------------------------------------------------------
+PASO 2 - PREPARAR DATOS PARA UNA MIGRACION LOGICA
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Crearemos una base de datos de origen con una tabla sencilla. Estos objetos permitiran comprobar que el respaldo y la restauracion conservan los datos.
+
+# Crear la base de datos de origen.
+docker exec postgresql-dba psql -U postgres -d postgres -c "CREATE DATABASE nobleprog_p2_migration;"
+
+RESULTADO:
+CREATE DATABASE confirmo la creacion de la base de datos temporal de origen.
+
+# Crear la tabla e insertar registros.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_migration -c "CREATE TABLE clientes (id integer PRIMARY KEY, nombre text NOT NULL); INSERT INTO clientes (id, nombre) VALUES (1, 'Ana'), (2, 'Luis'), (3, 'Maria');"
+
+RESULTADO:
+PostgreSQL devolvio CREATE TABLE e INSERT 0 3. Se creo la tabla clientes y se insertaron tres registros de ejemplo.
+
+# Consultar los registros originales.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_migration -c "SELECT * FROM clientes ORDER BY id;"
+
+RESULTADO:
+La tabla contenia los registros 1-Ana, 2-Luis y 3-Maria. Estos datos servirian como referencia para verificar la restauracion.
+
+--------------------------------------------------------------------------------
+PASO 3 - GENERAR UN RESPALDO LOGICO CON PG_DUMP
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Exportaremos la tabla a un archivo SQL. Un respaldo logico permite reconstruir objetos y datos en otra base compatible.
+
+# Generar el respaldo de clientes.
+docker exec -u postgres postgresql-dba sh -c "pg_dump -U postgres -d nobleprog_p2_migration -t public.clientes -f /tmp/nobleprog_p2_clientes.sql"
+
+RESULTADO:
+pg_dump termino sin errores y genero un respaldo logico de la tabla public.clientes.
+
+# Verificar el archivo generado.
+docker exec postgresql-dba sh -c "ls -lh /tmp/nobleprog_p2_clientes.sql"
+
+RESULTADO:
+El archivo existia, pertenecia al usuario postgres y tenia un tamano aproximado de 1.3 KB. Esto confirma que se genero un artefacto de respaldo.
+
+# Inspeccionar el encabezado del respaldo.
+docker exec postgresql-dba sh -c "head -n 25 /tmp/nobleprog_p2_clientes.sql"
+
+RESULTADO:
+El encabezado identifico un respaldo de PostgreSQL generado desde y mediante la version 18.6. Tambien contenia instrucciones SET para preparar el entorno de restauracion.
+
+--------------------------------------------------------------------------------
+PASO 4 - RESTAURAR EN UNA BASE DE DATOS DE DESTINO
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Crearemos una base independiente y restauraremos el archivo SQL. La comparacion posterior permitira validar que los datos llegaron correctamente.
+
+# Crear la base de destino.
+docker exec postgresql-dba psql -U postgres -d postgres -c "CREATE DATABASE nobleprog_p2_migration_dest;"
+
+RESULTADO:
+CREATE DATABASE confirmo la creacion de la base de datos de destino.
+
+# Restaurar el respaldo SQL.
+docker exec -u postgres postgresql-dba sh -c "psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_p2_migration_dest -f /tmp/nobleprog_p2_clientes.sql"
+
+RESULTADO:
+La restauracion ejecuto las instrucciones del respaldo, incluyendo CREATE TABLE, COPY 3 y ALTER TABLE. No se reportaron errores, por lo que la tabla y sus registros fueron recuperados.
+
+# Consultar los datos restaurados.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_migration_dest -c "SELECT * FROM clientes ORDER BY id;"
+
+RESULTADO:
+La base de destino contenia los mismos tres registros: 1-Ana, 2-Luis y 3-Maria. La comparacion confirma que los datos de ejemplo fueron restaurados correctamente.
+
+# Contar los registros de origen.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_migration -c "SELECT count(*) AS registros_origen FROM clientes;"
+
+RESULTADO:
+La base de origen contenia tres registros. Esta cantidad sirve como referencia para una validacion basica de integridad.
+
+# Contar los registros de destino.
+docker exec postgresql-dba psql -U postgres -d nobleprog_p2_migration_dest -c "SELECT count(*) AS registros_destino FROM clientes;"
+
+RESULTADO:
+La base de destino tambien contenia tres registros. El conteo coincide con el origen y la consulta anterior confirmo que los valores eran iguales.
+
+--------------------------------------------------------------------------------
+PASO 5 - LIMPIAR EL ENTORNO Y CONFIRMAR LA DISPONIBILIDAD
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Eliminaremos los objetos temporales y comprobaremos que el servidor continua funcionando.
+
+# Eliminar la base de destino.
+docker exec postgresql-dba psql -U postgres -d postgres -c "DROP DATABASE nobleprog_p2_migration_dest;"
+
+RESULTADO:
+DROP DATABASE confirmo que la base temporal de destino fue eliminada.
+
+# Eliminar la base de origen.
+docker exec postgresql-dba psql -U postgres -d postgres -c "DROP DATABASE nobleprog_p2_migration;"
+
+RESULTADO:
+DROP DATABASE confirmo que la base temporal de origen fue eliminada.
+
+# Eliminar el archivo SQL temporal.
+docker exec -u postgres postgresql-dba rm /tmp/nobleprog_p2_clientes.sql
+
+RESULTADO:
+El respaldo temporal fue eliminado despues de completar la validacion.
+
+# Verificar que no existen las bases temporales.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname IN ('nobleprog_p2_migration', 'nobleprog_p2_migration_dest');"
+
+RESULTADO:
+La consulta devolvio cero filas. Ambas bases de datos temporales fueron eliminadas correctamente.
+
+# Comprobar disponibilidad final.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO:
+PostgreSQL respondio accepting connections. El servidor permanecio disponible despues de la migracion logica y la limpieza.
+
+--------------------------------------------------------------------------------
+PASO 6 - DISTINGUIR MIGRACION LOGICA DE ACTUALIZACION DE VERSION
+--------------------------------------------------------------------------------
+
+EXPLICACION:
+Este laboratorio utilizo PostgreSQL 18.6 tanto en origen como en destino. Por lo tanto, demostro una migracion logica, no una actualizacion entre versiones mayores. Una actualizacion real requiere planear compatibilidad, extensiones, respaldo, procedimiento de cambio y validaciones posteriores.
+
+================================================================================
+FIN DEL ESCENARIO 9
+================================================================================
