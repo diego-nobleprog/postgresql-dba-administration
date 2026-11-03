@@ -1,0 +1,202 @@
+﻿================================================================================
+PRACTICA 02 - ESCENARIOS DE ADMINISTRACION DE POSTGRESQL 18
+================================================================================
+
+CURSO:
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
+
+OBJETIVO GENERAL:
+Resolver situaciones sencillas de administracion de PostgreSQL 18 mediante
+experimentos que permitan observar, comprender y validar su comportamiento.
+
+AMBIENTE:
+- Windows 11 Pro (DaDesktop)
+- PowerShell
+- Docker Desktop / WSL 2
+- Oracle Linux 9
+- PostgreSQL 18
+- Contenedor: postgresql-dba
+- Rama Git: p2
+
+METODOLOGIA:
+Cada escenario plantea una necesidad real de administracion.
+Los participantes ejecutaran los comandos, observaran los resultados y
+comprenderan por que ocurre cada comportamiento.
+
+Cuando corresponda, los experimentos utilizaran:
+BEFORE -> ACCION -> AFTER -> RESTAURACION -> VERIFICACION FINAL.
+
+Los cambios temporales se revertiran al finalizar cada escenario.
+
+================================================================================
+ESCENARIO 1 - INSPECCIONAR Y VALIDAR POSTGRESQL.CONF
+================================================================================
+
+TEMA DEL TEMARIO:
+2. postgresql.conf.
+
+SITUACION:
+Un DBA recibe un servidor PostgreSQL en funcionamiento y necesita revisar
+su configuracion. Ademas, quiere aprender a identificar errores antes de
+realizar modificaciones importantes.
+
+OBJETIVO:
+Localizar postgresql.conf, identificar los parametros configurados,
+distinguir sus valores efectivos y detectar errores de configuracion.
+
+--------------------------------------------------------------------------------
+PASO 1 - IDENTIFICAR EL ARCHIVO PRINCIPAL
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Consultaremos la ubicacion del archivo principal de configuracion.
+
+¿COMO FUNCIONA?
+SHOW config_file solicita a PostgreSQL la ruta del archivo utilizado
+por la instancia actual.
+
+¿PARA QUE SIRVE?
+Evita modificar un archivo equivocado cuando existen varias instancias.
+
+COMANDO:
+
+# Identificar el archivo principal de configuracion utilizado por PostgreSQL.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SHOW config_file;"
+
+RESULTADO: El archivo principal se encuentra en /var/lib/pgsql/data/postgresql.conf.
+
+--------------------------------------------------------------------------------
+PASO 2 - COMPARAR EL ARCHIVO CON LOS VALORES ACTIVOS
+--------------------------------------------------------------------------------
+
+¿QUE HAREMOS?
+Revisaremos cuatro parametros:
+- shared_buffers: memoria compartida para almacenar paginas de datos.
+- max_connections: numero maximo de conexiones simultaneas.
+- logging_collector: habilita la recoleccion de logs en archivos.
+- listen_addresses: interfaces de red en las que escucha PostgreSQL.
+
+¿COMO FUNCIONA?
+Primero buscaremos los parametros declarados directamente en
+postgresql.conf. Despues consultaremos sus valores efectivos y el archivo
+del que provienen.
+
+¿PARA QUE SIRVE?
+Permite identificar diferencias entre el archivo principal y la
+configuracion que PostgreSQL realmente utiliza.
+
+COMANDOS:
+
+# Buscar los cuatro parametros declarados directamente en postgresql.conf.
+docker exec postgresql-dba sh -c "grep -nE '^[[:space:]]*(shared_buffers|max_connections|logging_collector|listen_addresses)[[:space:]]*=' /var/lib/pgsql/data/postgresql.conf"
+
+RESULTADO: Encontramos max_connections=100, shared_buffers=128MB y logging_collector=on. listen_addresses no esta definido directamente en este archivo.
+
+# Consultar el valor efectivo, su unidad, origen y archivo de procedencia.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, unit, source, sourcefile FROM pg_settings WHERE name IN ('shared_buffers', 'max_connections', 'logging_collector', 'listen_addresses') ORDER BY name;"
+
+RESULTADO: Los cuatro parametros estan activos. listen_addresses=* y logging_collector=on provienen de postgresql.auto.conf. shared_buffers equivale a 128MB.
+
+# Consultar las definiciones encontradas en los archivos de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT name, setting, sourcefile, sourceline, applied, error FROM pg_file_settings WHERE name IN ('shared_buffers', 'max_connections', 'logging_collector', 'listen_addresses') ORDER BY name, sourcefile, sourceline;"
+
+RESULTADO: Hay cinco definiciones para cuatro parametros. logging_collector aparece dos veces; prevalece la de postgresql.auto.conf. applied=f indica que la otra definicion fue reemplazada.
+
+INTERPRETACION:
+Si un parametro no aparece en el primer comando, puede estar comentado,
+utilizar un valor predeterminado o estar definido en otro archivo.
+
+pg_settings permite conocer el valor efectivo y su origen.
+
+pg_file_settings permite localizar las definiciones presentes en los
+archivos, incluyendo postgresql.auto.conf, que puede contener valores
+establecidos mediante ALTER SYSTEM.
+
+--------------------------------------------------------------------------------
+PASO 3 - EXPERIMENTO: DETECTAR UN ERROR DE CONFIGURACION
+--------------------------------------------------------------------------------
+
+SITUACION:
+Un administrador introduce accidentalmente un parametro inexistente.
+Necesitamos comprobar como detectarlo y corregirlo.
+
+OBJETIVO:
+Provocar un error controlado, identificarlo y restaurar la configuracion.
+
+IMPORTANTE:
+El experimento agregara temporalmente una linea invalida al final de
+postgresql.conf. No modificaremos parametros de memoria ni conexiones.
+El servidor continuara funcionando con su configuracion valida anterior.
+
+BEFORE - COMPROBAR EL ESTADO ORIGINAL
+
+# Verificar que no existen errores reportados en los archivos de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, sourceline, name, error FROM pg_file_settings WHERE error IS NOT NULL;"
+RESULTADO: 0 filas. No habia errores antes del experimento.
+
+# Comprobar si ya existe la marca temporal que utilizaremos en el experimento.
+docker exec postgresql-dba sh -c "grep -n 'nobleprog_p2_error_demo' /var/lib/pgsql/data/postgresql.conf || true"
+
+RESULTADO: Antes del experimento no existia la marca temporal. Despues de agregarla, aparecio en la linea 891.
+
+ACCION - INTRODUCIR UN ERROR CONTROLADO
+
+¿QUE HAREMOS?
+Agregaremos un parametro inexistente con una marca unica para poder
+identificarlo y eliminarlo posteriormente.
+
+# Agregar temporalmente un parametro inexistente al archivo de configuracion.
+docker exec -u postgres postgresql-dba sh -c "printf '\n# nobleprog_p2_error_demo\nnobleprog_p2_parametro_inexistente = 1\n' >> /var/lib/pgsql/data/postgresql.conf"
+
+RESULTADO: Se agrego temporalmente un parametro inexistente al final de postgresql.conf.
+
+# Solicitar a PostgreSQL que vuelva a leer sus archivos de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: t indica que PostgreSQL acepto la solicitud de recarga.
+
+AFTER - IDENTIFICAR EL ERROR
+
+¿QUE HAREMOS?
+Consultaremos nuevamente pg_file_settings para localizar el parametro
+inexistente y conocer el error reportado.
+
+# Consultar los errores detectados despues de introducir el parametro invalido.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, sourceline, name, error FROM pg_file_settings WHERE error IS NOT NULL;"
+RESULTADO: PostgreSQL detecto el parametro inexistente en la linea 892.
+
+# Mostrar las lineas agregadas al final de postgresql.conf.
+docker exec postgresql-dba sh -c "tail -n 5 /var/lib/pgsql/data/postgresql.conf"
+
+RESULTADO: Las ultimas lineas del archivo muestran la marca temporal y el parametro invalido.
+
+RESTAURACION - ELIMINAR EL ERROR
+
+¿QUE HAREMOS?
+Eliminaremos exclusivamente las dos lineas introducidas por el
+experimento, conservando el resto de la configuracion.
+
+# Eliminar la marca temporal y el parametro invalido del archivo.
+docker exec -u postgres postgresql-dba sed -i '/^# nobleprog_p2_error_demo$/d; /^nobleprog_p2_parametro_inexistente = 1$/d' /var/lib/pgsql/data/postgresql.conf
+
+RESULTADO: Se eliminaron las dos lineas temporales sin modificar los demas parametros.
+
+# Recargar nuevamente la configuracion corregida.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT pg_reload_conf();"
+
+RESULTADO: t indica que PostgreSQL acepto la solicitud de recarga.
+
+VERIFICACION FINAL - COMPROBAR LA RESTAURACION
+
+# Confirmar que PostgreSQL ya no reporta errores de configuracion.
+docker exec postgresql-dba psql -U postgres -d postgres -c "SELECT sourcefile, sourceline, name, error FROM pg_file_settings WHERE error IS NOT NULL;"
+RESULTADO: 0 filas. El error desaparecio despues de restaurar el archivo.
+
+# Confirmar que el servidor permanece disponible.
+docker exec postgresql-dba pg_isready -h 127.0.0.1 -p 5432
+
+RESULTADO: accepting connections confirma que PostgreSQL sigue disponible.
+
+================================================================================
+FIN DEL ESCENARIO 1
+================================================================================
