@@ -1,0 +1,680 @@
+﻿====================================================================
+PRACTICA 03.04 - ALMACENAMIENTO, WAL Y CHECKPOINTS
+====================================================================
+
+PREGUNTA CENTRAL:
+Donde se almacenan los datos y que procesos participan
+en su escritura y persistencia?
+
+OBJETIVO:
+Relacionar databases, schemas, tablespaces, archivos fisicos,
+WAL, checkpointer, background writer y vistas de estadisticas.
+
+--------------------------------------------------------------------
+1. SITUACION EMPRESARIAL
+--------------------------------------------------------------------
+
+La empresa registra miles de pedidos nuevos y actualiza
+el inventario.
+
+El DBA necesita investigar:
+
+- En que archivos se almacenan las tablas?
+- Como se relacionan schemas y tablespaces?
+- Que ocurre cuando una transaccion modifica datos?
+- Por que existen WAL y checkpoints?
+- Que procesos realizan escrituras?
+- Como comprobar la actividad sin adivinar?
+
+--------------------------------------------------------------------
+2. FUNDAMENTOS TEORICOS
+--------------------------------------------------------------------
+
+CLUSTER POSTGRESQL:
+Conjunto de bases administradas por una instancia PostgreSQL
+sobre un directorio de datos.
+
+DATABASE:
+Unidad logica que contiene esquemas y objetos.
+
+SCHEMA:
+Espacio de nombres que organiza tablas, vistas y otros objetos.
+
+TABLESPACE:
+Permite asociar objetos con ubicaciones de almacenamiento
+administradas por PostgreSQL.
+
+PGDATA:
+Directorio principal de datos de la instancia.
+
+pg_wal:
+Directorio de archivos del Write-Ahead Log.
+
+CHECKPOINT:
+Punto de control que coordina la escritura de paginas
+modificadas y establece informacion de recuperacion.
+
+CHECKPOINTER:
+Proceso responsable de ejecutar checkpoints.
+
+BACKGROUND WRITER:
+Proceso que escribe anticipadamente algunas paginas sucias.
+
+WAL WRITER:
+Proceso que contribuye a escribir WAL.
+
+Una transaccion puede confirmar antes de que todas sus
+paginas de datos se escriban a sus archivos definitivos.
+WAL es fundamental para la recuperacion ante fallos.
+
+--------------------------------------------------------------------
+3. CONECTAR Y CONSULTAR PGDATA
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_scenarios
+
+En psql:
+
+SHOW data_directory;
+
+RESULTADO REAL:
+
+/var/lib/pgsql/data
+
+INTERPRETACION:
+
+Es el directorio de datos dentro del contenedor Linux.
+No debe confundirse con una ruta Windows.
+
+--------------------------------------------------------------------
+4. DATABASES, SCHEMAS Y TABLESPACES
+--------------------------------------------------------------------
+
+SELECT oid,datname,dattablespace
+FROM pg_database
+ORDER BY datname;
+
+RESULTADO REAL PARCIAL:
+
+nobleprog_architecture_lab       | 16389 | 1663
+nobleprog_architecture_scenarios | 16447 | 1663
+postgres                         |     5 | 1663
+
+INTERPRETACION:
+
+oid:
+Identificador interno de la base.
+
+dattablespace:
+OID del tablespace predeterminado.
+
+En el ambiente observado, 1663 corresponde a pg_default.
+
+Consultar schemas:
+
+SELECT nspname
+FROM pg_namespace
+ORDER BY nspname;
+
+RESULTADO REAL:
+
+information_schema
+operaciones
+pg_catalog
+pg_toast
+public
+
+INTERPRETACION:
+
+operaciones:
+Esquema empresarial creado para el laboratorio.
+
+pg_catalog:
+Contiene catalogos del sistema.
+
+information_schema:
+Expone vistas estandarizadas de metadatos.
+
+pg_toast:
+Esquema relacionado con almacenamiento de valores grandes.
+
+Consultar tablespaces:
+
+SELECT
+    oid,
+    spcname,
+    pg_tablespace_location(oid) AS location
+FROM pg_tablespace
+ORDER BY spcname;
+
+RESULTADO REAL:
+
+1663 | pg_default |
+1664 | pg_global  |
+
+INTERPRETACION:
+
+pg_default:
+Tablespace predeterminado para objetos de bases de datos.
+
+pg_global:
+Contiene determinados catalogos compartidos.
+
+Una ubicacion vacia en pg_tablespace_location para estos
+tablespaces integrados es normal.
+
+--------------------------------------------------------------------
+5. IDENTIFICAR ARCHIVOS FISICOS
+--------------------------------------------------------------------
+
+SELECT
+    c.relname,
+    c.relkind,
+    pg_relation_filepath(c.oid) AS physical_path,
+    pg_size_pretty(pg_relation_size(c.oid)) AS relation_size,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+FROM pg_class c
+JOIN pg_namespace n
+    ON n.oid=c.relnamespace
+WHERE n.nspname='operaciones'
+ORDER BY c.relname;
+
+RESULTADO REAL PARCIAL:
+
+pedidos   | r | base/16447/16461 | 2944 kB | 4456 kB
+productos | r | base/16447/16449 |   64 kB | 136 kB
+mvcc_demo | r | base/16447/16477 | 8192 B  | 32 kB
+
+INTERPRETACION:
+
+relname:
+Nombre del objeto.
+
+relkind:
+Tipo de relacion. r representa una tabla ordinaria,
+i un indice y S una secuencia.
+
+physical_path:
+Ruta relativa a PGDATA.
+
+relation_size:
+Tamano de la relacion principal.
+
+total_size:
+Incluye almacenamiento adicional asociado al objeto,
+como indices y TOAST cuando corresponde.
+
+Los numeros de las rutas pueden cambiar si se recrean objetos.
+
+--------------------------------------------------------------------
+6. EXPLORAR EL DIRECTORIO DE DATOS
+--------------------------------------------------------------------
+
+En una segunda consola PowerShell:
+
+docker exec -it -u postgres postgresql-dba bash
+
+Dentro del contenedor:
+
+pwd
+
+ls -la /var/lib/pgsql/data
+
+ls -la /var/lib/pgsql/data/base
+
+ls -la /var/lib/pgsql/data/pg_wal
+
+INTERPRETACION:
+
+base:
+Contiene directorios de bases almacenadas en pg_default.
+
+global:
+Contiene catalogos compartidos y otros archivos globales.
+
+pg_wal:
+Contiene segmentos WAL.
+
+pg_xact:
+Contiene informacion sobre estados de transacciones.
+
+pg_tblspc:
+Contiene enlaces a tablespaces definidos por el usuario.
+
+postgresql.conf:
+Archivo principal de configuracion, si reside en PGDATA.
+
+No modificar ni eliminar manualmente archivos de PGDATA.
+
+Salir del shell Linux:
+
+exit
+
+--------------------------------------------------------------------
+7. BEFORE: ESTADISTICAS DE CHECKPOINT
+--------------------------------------------------------------------
+
+Regresar a psql.
+
+SELECT
+    num_timed,
+    num_requested,
+    num_done,
+    buffers_written
+FROM pg_stat_checkpointer;
+
+RESULTADO REAL ANTES:
+
+num_timed       = 139
+num_requested   = 2
+num_done        = 6
+buffers_written = 1847
+
+INTERPRETACION:
+
+num_timed:
+Checkpoints solicitados por el temporizador.
+
+num_requested:
+Checkpoints solicitados por otros motivos.
+
+num_done:
+Checkpoints completados.
+
+buffers_written:
+Buffers escritos por el checkpointer.
+
+Son contadores acumulados de la instancia.
+
+Consultar background writer:
+
+SELECT
+    buffers_clean,
+    maxwritten_clean,
+    buffers_alloc
+FROM pg_stat_bgwriter;
+
+RESULTADO REAL:
+
+buffers_clean     = 0
+maxwritten_clean  = 0
+buffers_alloc     = 5376
+
+INTERPRETACION:
+
+buffers_clean:
+Buffers escritos por background writer.
+
+Un valor cero no demuestra un fallo.
+Puede no haber sido necesario que escribiera buffers.
+
+Consultar WAL:
+
+SELECT wal_records,wal_fpi,wal_bytes
+FROM pg_stat_wal;
+
+RESULTADO REAL ANTES:
+
+wal_records = 375646
+wal_fpi     = 2979
+wal_bytes   = 45306097
+
+--------------------------------------------------------------------
+8. CONSULTAR PARAMETROS DE CHECKPOINT
+--------------------------------------------------------------------
+
+SELECT
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN (
+    'checkpoint_timeout',
+    'checkpoint_completion_target',
+    'max_wal_size',
+    'min_wal_size'
+)
+ORDER BY name;
+
+RESULTADO REAL:
+
+checkpoint_completion_target | 0.9
+checkpoint_timeout           | 300  | s
+max_wal_size                 | 1024 | MB
+min_wal_size                 | 80   | MB
+
+INTERPRETACION:
+
+checkpoint_timeout:
+Intervalo maximo objetivo entre checkpoints automaticos.
+
+checkpoint_completion_target:
+Influye en la distribucion del trabajo de escritura.
+
+max_wal_size:
+Limite flexible que influye en la frecuencia de checkpoints.
+
+min_wal_size:
+Cantidad minima de WAL que PostgreSQL intenta conservar
+para reutilizacion.
+
+En este escenario solo consultaremos parametros.
+No se requieren cambios de configuracion.
+
+--------------------------------------------------------------------
+9. GENERAR ACTIVIDAD DE ESCRITURA
+--------------------------------------------------------------------
+
+ANTES:
+
+SELECT count(*) FROM operaciones.pedidos;
+
+SELECT sum(inventario) FROM operaciones.productos;
+
+CAMBIOS:
+
+UPDATE operaciones.productos
+SET inventario=inventario-1
+WHERE id BETWEEN 1 AND 500;
+
+INSERT INTO operaciones.pedidos (
+    producto_id,cantidad,total
+)
+SELECT
+    (g % 1000)+1,
+    2,
+    125.50
+FROM generate_series(1,10000) AS g;
+
+DELETE FROM operaciones.pedidos
+WHERE id BETWEEN 1 AND 1000;
+
+RESULTADOS REALES:
+
+UPDATE 500
+INSERT 0 10000
+DELETE 1000
+
+INTERPRETACION:
+
+UPDATE:
+Modifica 500 registros de inventario.
+
+INSERT:
+Agrega 10000 pedidos.
+
+DELETE:
+Elimina 1000 pedidos.
+
+Estas operaciones generan cambios en tablas, indices
+y WAL. Tambien pueden producir versiones obsoletas.
+
+DESPUES:
+
+SELECT count(*) FROM operaciones.pedidos;
+
+Esperado: 59000 pedidos.
+
+Consultar:
+
+SELECT pg_current_wal_lsn();
+
+RESULTADO REAL:
+
+0/3E23968
+
+--------------------------------------------------------------------
+10. EJECUTAR CHECKPOINT CONTROLADO
+--------------------------------------------------------------------
+
+IMPORTANTE:
+
+CHECKPOINT afecta a toda la instancia.
+Realizarlo exclusivamente en este laboratorio aislado.
+
+En psql, conectado como postgres:
+
+CHECKPOINT;
+
+RESULTADO REAL:
+
+CHECKPOINT
+
+INTERPRETACION:
+
+El comando solicita y espera la realizacion de un checkpoint.
+
+No significa que todas las operaciones de escritura del sistema
+hayan terminado para siempre.
+
+No significa que WAL deje de ser necesario.
+
+No debe utilizarse indiscriminadamente como una tecnica
+de optimizacion de rendimiento.
+
+--------------------------------------------------------------------
+11. AFTER: VERIFICAR LAS ESTADISTICAS
+--------------------------------------------------------------------
+
+SELECT
+    num_timed,
+    num_requested,
+    num_done,
+    buffers_written
+FROM pg_stat_checkpointer;
+
+RESULTADO REAL DESPUES:
+
+num_timed       = 139
+num_requested   = 3
+num_done        = 7
+buffers_written = 3531
+
+COMPARACION:
+
+num_requested:
+2 -> 3, aumento de 1.
+
+num_done:
+6 -> 7, aumento de 1.
+
+buffers_written:
+1847 -> 3531, aumento de 1684.
+
+INTERPRETACION:
+
+El checkpoint solicitado quedo reflejado en los contadores.
+
+Las cifras son acumuladas; pueden incluir actividad
+concurrente de otros procesos de la instancia.
+
+Consultar:
+
+SELECT
+    buffers_clean,
+    maxwritten_clean,
+    buffers_alloc
+FROM pg_stat_bgwriter;
+
+RESULTADO REAL DESPUES:
+
+buffers_clean     = 0
+maxwritten_clean  = 0
+buffers_alloc     = 5569
+
+INTERPRETACION:
+
+No hubo aumento en buffers_clean durante la observacion.
+Esto no invalida el checkpoint.
+
+Los procesos cumplen responsabilidades distintas.
+
+--------------------------------------------------------------------
+12. OBSERVAR ESTADISTICAS DE TABLAS
+--------------------------------------------------------------------
+
+SELECT
+    relname,
+    seq_scan,
+    idx_scan,
+    n_tup_ins,
+    n_tup_upd,
+    n_tup_del,
+    n_live_tup,
+    n_dead_tup
+FROM pg_stat_user_tables
+WHERE schemaname='operaciones'
+ORDER BY relname;
+
+RESULTADO REAL PARCIAL:
+
+pedidos:
+n_tup_ins  = 60000
+n_tup_del  = 1000
+n_live_tup = 59000
+n_dead_tup = 1000
+
+productos:
+n_tup_ins  = 1000
+n_tup_upd  = 500
+n_dead_tup = 500
+
+INTERPRETACION:
+
+n_tup_ins:
+Inserciones acumuladas.
+
+n_tup_upd:
+Actualizaciones acumuladas.
+
+n_tup_del:
+Eliminaciones acumuladas.
+
+n_live_tup y n_dead_tup:
+Estimaciones de tuplas vivas y muertas.
+
+No son contadores exactos en tiempo real.
+
+Las versiones muertas son relevantes para VACUUM
+y para la administracion del almacenamiento.
+
+--------------------------------------------------------------------
+13. INVESTIGAR ESTADISTICAS DE E/S
+--------------------------------------------------------------------
+
+SELECT
+    backend_type,
+    object,
+    context,
+    reads,
+    writes,
+    writebacks,
+    extends,
+    fsyncs
+FROM pg_stat_io
+ORDER BY backend_type,object,context
+LIMIT 40;
+
+RESULTADO REAL PARCIAL:
+
+checkpointer | relation | normal | writes=3531
+checkpointer | relation | normal | writebacks=3531
+checkpointer | relation | normal | fsyncs=667
+
+INTERPRETACION:
+
+backend_type:
+Proceso que realiza la actividad.
+
+object:
+Tipo de objeto de E/S.
+
+context:
+Contexto de la operacion.
+
+writes:
+Operaciones de escritura contabilizadas.
+
+writebacks:
+Solicitudes de escritura diferida contabilizadas.
+
+fsyncs:
+Operaciones de sincronizacion contabilizadas.
+
+pg_stat_io es especialmente util para relacionar
+tipos de procesos con patrones de E/S.
+
+--------------------------------------------------------------------
+14. RESTAURACION
+--------------------------------------------------------------------
+
+Cerrar psql con \q.
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\03-reset-performance.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+Verificar:
+
+SELECT count(*) FROM operaciones.pedidos;
+
+Esperado: 50000.
+
+SELECT count(*) FROM operaciones.productos
+WHERE inventario=1000;
+
+Esperado: 1000.
+
+No se restaura el LSN anterior.
+No se eliminan registros WAL historicos manualmente.
+No se reinician estadisticas globales.
+
+--------------------------------------------------------------------
+15. COMPARACION CON ORACLE
+--------------------------------------------------------------------
+
+PostgreSQL database:
+No equivale directamente a una instancia Oracle.
+
+PostgreSQL schema:
+Similar como agrupacion logica, pero con reglas diferentes.
+
+PostgreSQL tablespace:
+Comparable conceptualmente a Oracle Tablespace,
+con implementacion y gestion fisica distintas.
+
+PostgreSQL checkpointer:
+Comparable en responsabilidad general con CKPT,
+pero no son implementaciones equivalentes.
+
+PostgreSQL background writer:
+Relacionable con responsabilidades de DBWn,
+sin equivalencia exacta.
+
+PostgreSQL WAL:
+Comparable conceptualmente con Oracle Redo.
+
+PostgreSQL pg_catalog y pg_stat_*:
+Comparables en finalidad con el diccionario de datos
+y vistas dinamicas de Oracle.
+
+--------------------------------------------------------------------
+16. CONCLUSION DBA
+--------------------------------------------------------------------
+
+Los objetos logicos tienen representacion fisica.
+
+WAL protege la recuperacion de cambios.
+Los checkpoints coordinan la escritura de paginas modificadas.
+
+Background writer y checkpointer tienen funciones diferentes.
+
+Las vistas pg_stat_* permiten investigar lo que ocurre
+en el motor mediante evidencia.
+
+La administracion efectiva requiere relacionar procesos,
+memoria, transacciones, archivos y estadisticas.
+
+FIN DE LA PRACTICA 03.04

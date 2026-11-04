@@ -1,0 +1,361 @@
+﻿====================================================================
+PRACTICA 03.01 - PROCESOS, CONEXIONES Y ARQUITECTURA
+====================================================================
+
+PREGUNTA CENTRAL:
+Que sucede internamente cuando varios usuarios se conectan?
+
+OBJETIVO:
+Relacionar el proceso principal de PostgreSQL, los procesos
+auxiliares, las conexiones cliente, la memoria y las vistas
+de observabilidad.
+
+REQUISITO:
+Haber completado practice-03-00-preparacion-y-limpieza.txt.
+
+--------------------------------------------------------------------
+1. SITUACION EMPRESARIAL
+--------------------------------------------------------------------
+
+La empresa comienza a recibir quejas sobre lentitud.
+
+El equipo de aplicaciones informa que existen varias conexiones
+simultaneas, pero no sabe si cada conexion consume recursos
+independientes ni que procesos utiliza PostgreSQL.
+
+Como DBA necesitamos responder:
+
+- Que procesos existen aunque nadie consulte datos?
+- Que sucede cuando una aplicacion abre una conexion?
+- Como identificar conexiones activas y en espera?
+- Donde se administra la memoria compartida?
+- Como se relaciona esta arquitectura con Oracle?
+
+--------------------------------------------------------------------
+2. FUNDAMENTOS TEORICOS
+--------------------------------------------------------------------
+
+PostgreSQL utiliza una arquitectura basada principalmente en
+procesos.
+
+El proceso principal administra la aceptacion de conexiones
+y la creacion de procesos backend.
+
+Un backend atiende una conexion cliente y ejecuta sus consultas.
+
+Ademas existen procesos auxiliares, como:
+
+checkpointer:
+Coordina la escritura de paginas modificadas durante checkpoints.
+
+background writer:
+Escribe anticipadamente algunas paginas sucias para reducir
+trabajo de escritura posterior.
+
+walwriter:
+Ayuda a escribir registros WAL desde buffers WAL.
+
+autovacuum launcher:
+Coordina procesos de mantenimiento automatico.
+
+logical replication launcher:
+Coordina trabajadores relacionados con replicacion logica.
+
+io worker:
+En PostgreSQL 18 pueden existir trabajadores de E/S asincrona.
+
+La memoria compartida contiene estructuras accesibles por
+multiples procesos, incluidos shared_buffers y controles internos.
+
+Cada backend tambien utiliza memoria privada para ejecutar
+consultas, ordenamientos y otras operaciones.
+
+--------------------------------------------------------------------
+3. CONECTAR AL LABORATORIO
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_scenarios
+
+En psql:
+
+SELECT current_database();
+
+SELECT pg_backend_pid();
+
+INTERPRETACION:
+
+pg_backend_pid() devuelve el identificador del proceso servidor
+que atiende ESTA conexion.
+
+No devuelve el PID de PowerShell ni el del cliente psql.
+
+--------------------------------------------------------------------
+4. IDENTIFICAR LOS PROCESOS DEL SERVIDOR
+--------------------------------------------------------------------
+
+Abrir una SEGUNDA consola PowerShell.
+
+Ejecutar:
+
+docker exec postgresql-dba ps -eo pid,ppid,user,stat,comm,args
+
+SALIDA REAL DE VALIDACION, RESUMIDA:
+
+PID 1  postgres: proceso principal
+PID 12 postgres: checkpointer
+PID 13 postgres: background writer
+PID 15 postgres: walwriter
+PID 16 postgres: autovacuum launcher
+PID 17 postgres: logical replication launcher
+
+Tambien aparecieron tres io workers.
+
+INTERPRETACION:
+
+PID:
+Identificador del proceso dentro del contenedor.
+
+PPID:
+Identificador del proceso padre.
+
+COMMAND:
+Nombre o comando asociado al proceso.
+
+El proceso principal permanece activo aun sin consultas.
+
+Los procesos auxiliares realizan funciones diferentes.
+No todos atienden directamente conexiones cliente.
+
+Los PID pueden cambiar entre ejecuciones.
+
+--------------------------------------------------------------------
+5. INVESTIGAR LA ACTIVIDAD DESDE SQL
+--------------------------------------------------------------------
+
+Regresar a psql.
+
+Ejecutar:
+
+SELECT
+    pid,
+    backend_type,
+    state,
+    wait_event_type,
+    wait_event
+FROM pg_stat_activity
+ORDER BY backend_type,pid;
+
+SALIDA REAL, RESUMIDA:
+
+autovacuum launcher | Activity | AutovacuumMain
+background writer   | Activity | BgwriterHibernate
+checkpointer        | Activity | CheckpointerMain
+client backend      | active   |
+io worker           | Activity | IoWorkerMain
+walwriter           | Activity | WalWriterMain
+
+INTERPRETACION:
+
+backend_type:
+Tipo de proceso observado.
+
+state:
+Estado de una sesion cliente cuando corresponde.
+
+wait_event_type:
+Categoria del evento de espera.
+
+wait_event:
+Evento especifico.
+
+Un proceso con estado de espera no esta necesariamente fallando.
+Muchos procesos auxiliares esperan trabajo de manera normal.
+
+--------------------------------------------------------------------
+6. EXPERIMENTO DE CONEXIONES SIMULTANEAS
+--------------------------------------------------------------------
+
+Necesitamos tres consolas.
+
+CONSOLA A - psql:
+
+SELECT pg_backend_pid() AS backend_a;
+
+SELECT pg_sleep(20);
+
+Mientras duerme, continuar inmediatamente con la consola B.
+
+CONSOLA B - psql:
+
+SELECT pg_backend_pid() AS backend_b;
+
+SELECT pg_sleep(20);
+
+CONSOLA C - psql:
+
+SELECT
+    pid,
+    usename,
+    datname,
+    state,
+    wait_event_type,
+    wait_event,
+    query
+FROM pg_stat_activity
+WHERE datname=current_database()
+ORDER BY pid;
+
+SALIDA REAL DE VALIDACION:
+
+PID 2040 | active | Timeout | PgSleep
+PID 2047 | active | Timeout | PgSleep
+PID 2054 | active |         | consulta de monitoreo
+
+INTERPRETACION:
+
+2040 y 2047 eran backends independientes.
+2054 era la conexion que consultaba pg_stat_activity.
+
+PgSleep indica que los procesos estaban esperando el tiempo
+solicitado por pg_sleep().
+
+El estado active no significa necesariamente uso intensivo de CPU.
+
+Los valores de PID seran diferentes en cada ejecucion.
+
+DESPUES:
+Esperar a que terminen los dos pg_sleep().
+
+Repetir la consulta de pg_stat_activity.
+
+Comprobar que las sesiones ya no estan ejecutando pg_sleep().
+Si se cierran A y B con \q, sus conexiones desaparecen.
+
+--------------------------------------------------------------------
+7. INVESTIGAR LA MEMORIA
+--------------------------------------------------------------------
+
+En psql:
+
+SELECT
+    name,
+    setting,
+    unit,
+    context
+FROM pg_settings
+WHERE name IN (
+    'shared_buffers',
+    'work_mem',
+    'maintenance_work_mem',
+    'max_connections',
+    'effective_cache_size'
+)
+ORDER BY name;
+
+VALORES REALES OBSERVADOS:
+
+shared_buffers       | 16384  | 8kB
+work_mem             | 4096   | kB
+maintenance_work_mem | 65536  | kB
+max_connections      | 100    |
+effective_cache_size | 524288 | 8kB
+
+INTERPRETACION:
+
+shared_buffers:
+16384 bloques de 8 kB = 128 MiB de buffer cache compartido.
+
+work_mem:
+4096 kB = 4 MiB como limite base por operacion de memoria
+elegible, no por servidor completo.
+
+maintenance_work_mem:
+65536 kB = 64 MiB para determinadas operaciones de
+mantenimiento.
+
+max_connections:
+Limite configurado de conexiones concurrentes, sujeto a
+reservas y restricciones del servidor.
+
+effective_cache_size:
+Estimacion utilizada por el optimizador. No es una reserva
+real de memoria.
+
+context:
+Indica en que contexto puede modificarse un parametro.
+postmaster normalmente requiere reiniciar el servidor.
+user permite cambios por sesion, segun privilegios.
+
+Consultar tambien:
+
+SELECT
+    name,
+    size,
+    allocated_size
+FROM pg_shmem_allocations
+ORDER BY allocated_size DESC
+LIMIT 10;
+
+SALIDA REAL PARCIAL:
+
+Buffer Blocks       | 134221824
+XLOG Ctl            |   4208200
+Buffer Descriptors  |   1048576
+Checkpointer Data   |    524344
+
+INTERPRETACION:
+
+Buffer Blocks representa la memoria asignada a los bloques
+del buffer cache compartido.
+
+XLOG Ctl contiene estructuras de control relacionadas con WAL.
+
+No toda la memoria compartida corresponde a shared_buffers.
+
+--------------------------------------------------------------------
+8. COMPARACION CON ORACLE
+--------------------------------------------------------------------
+
+PostgreSQL shared_buffers:
+Comparable conceptualmente al database buffer cache de Oracle.
+
+PostgreSQL memoria compartida:
+Tiene similitudes generales con la SGA, pero no equivalencia 1:1.
+
+PostgreSQL memoria privada del backend:
+Comparable en algunos aspectos con la PGA.
+
+pg_stat_activity:
+Comparable en proposito con V$SESSION.
+
+Procesos auxiliares:
+Cumplen funciones relacionadas con procesos de fondo de Oracle,
+pero no existe una correspondencia exacta para todos.
+
+PostgreSQL no debe interpretarse como Oracle RAC.
+
+--------------------------------------------------------------------
+9. CONCLUSION DBA
+--------------------------------------------------------------------
+
+Una conexion PostgreSQL normalmente tiene un backend servidor.
+
+La cantidad de conexiones importa porque implica recursos
+adicionales, no solamente una entrada en una tabla de sesiones.
+
+pg_stat_activity permite relacionar procesos con su actividad.
+
+La memoria compartida y la memoria privada cumplen funciones
+diferentes.
+
+Un DBA debe distinguir procesos normales en espera de
+conexiones realmente bloqueadas o consultas costosas.
+
+RESTAURACION:
+No se modificaron configuraciones ni datos.
+
+Cerrar las sesiones adicionales con \q.
+
+FIN DE LA PRACTICA 03.01

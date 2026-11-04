@@ -1,0 +1,398 @@
+﻿====================================================================
+PRACTICA 03.03 - MVCC, CONCURRENCIA Y WAL
+====================================================================
+
+PREGUNTA CENTRAL:
+Por que dos sesiones pueden observar versiones distintas
+del mismo registro?
+
+OBJETIVO:
+Comprender MVCC mediante dos sesiones reales, identificar
+versiones de filas y relacionar las modificaciones con WAL.
+
+--------------------------------------------------------------------
+1. SITUACION EMPRESARIAL
+--------------------------------------------------------------------
+
+Dos empleados trabajan sobre el mismo pedido.
+
+El empleado A comienza una modificacion, pero todavia no
+confirma su transaccion.
+
+El empleado B consulta el registro durante ese intervalo.
+
+Necesitamos explicar por que B puede seguir viendo el valor
+anterior aunque A ya ejecuto un UPDATE.
+
+Este comportamiento es esencial para investigar concurrencia,
+consistencia y bloqueos en PostgreSQL.
+
+--------------------------------------------------------------------
+2. FUNDAMENTOS TEORICOS
+--------------------------------------------------------------------
+
+MVCC significa Multi-Version Concurrency Control.
+
+PostgreSQL utiliza versiones de filas para permitir que las
+consultas observen datos consistentes segun su snapshot.
+
+Una actualizacion normalmente crea una nueva version de fila
+en lugar de sobrescribir inmediatamente la anterior.
+
+xmin:
+Identificador de la transaccion que creo una version.
+
+xmax:
+Campo relacionado con la transaccion que elimino, actualizo
+o bloqueo una version. No debe interpretarse siempre como
+una eliminacion confirmada.
+
+ctid:
+Ubicacion fisica de la version de fila.
+Puede cambiar despues de un UPDATE.
+
+COMMIT:
+Confirma una transaccion y hace visibles sus cambios para
+snapshots posteriores, de acuerdo con el aislamiento.
+
+ROLLBACK:
+Revierte los efectos logicos de la transaccion.
+
+WAL:
+Write-Ahead Log. Registra cambios necesarios para recuperacion
+y durabilidad, siguiendo reglas de escritura anticipada.
+
+LSN:
+Log Sequence Number. Identifica posiciones en el flujo WAL.
+
+MVCC y WAL resuelven problemas diferentes:
+MVCC se relaciona con visibilidad y concurrencia.
+WAL se relaciona con recuperacion y durabilidad.
+
+--------------------------------------------------------------------
+3. PREPARAR EL REGISTRO
+--------------------------------------------------------------------
+
+Desde PowerShell, con todas las sesiones de prueba cerradas:
+
+Get-Content -Raw ".\practices\p3\scripts\02-reset-mvcc.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+Abrir DOS terminales PowerShell.
+
+En cada una ejecutar:
+
+docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_scenarios
+
+Denominarlas SESION A y SESION B.
+
+--------------------------------------------------------------------
+4. BEFORE: ESTADO INICIAL
+--------------------------------------------------------------------
+
+SESION A:
+
+SELECT
+    id,
+    estado,
+    xmin,
+    xmax,
+    ctid
+FROM operaciones.mvcc_demo;
+
+SALIDA REAL DE LA VALIDACION ORIGINAL:
+
+id | estado   | xmin | xmax | ctid
+---+----------+------+------+------
+1  | ORIGINAL | 798  | 0    | (0,1)
+
+INTERPRETACION:
+
+ORIGINAL:
+Valor de negocio antes de modificar el registro.
+
+xmin=798:
+Transaccion que creo la version visible en aquella ejecucion.
+
+xmax=0:
+No habia una transaccion marcada en ese campo.
+
+ctid=(0,1):
+Version ubicada en el bloque 0, posicion 1.
+
+Estos valores internos pueden variar.
+
+Consultar la posicion WAL:
+
+SELECT pg_current_wal_lsn() AS lsn_before;
+
+RESULTADO REAL:
+
+0/3B96F00
+
+Consultar contadores WAL:
+
+SELECT wal_records,wal_fpi,wal_bytes
+FROM pg_stat_wal;
+
+RESULTADO REAL:
+
+wal_records = 375644
+wal_fpi     = 2979
+wal_bytes   = 45305984
+
+Son contadores acumulados de la instancia.
+
+--------------------------------------------------------------------
+5. SESION A: MODIFICAR SIN CONFIRMAR
+--------------------------------------------------------------------
+
+SESION A:
+
+BEGIN;
+
+UPDATE operaciones.mvcc_demo
+SET estado='MODIFICADO'
+WHERE id=1;
+
+SELECT id,estado,xmin,xmax,ctid
+FROM operaciones.mvcc_demo;
+
+NO EJECUTAR COMMIT TODAVIA.
+
+INTERPRETACION:
+
+BEGIN:
+Abre una transaccion explicita.
+
+UPDATE:
+Genera una nueva version de la fila.
+
+La propia sesion A puede observar su modificacion
+aunque todavia no haya confirmado.
+
+La transaccion permanece abierta.
+
+--------------------------------------------------------------------
+6. SESION B: LEER DURANTE LA TRANSACCION
+--------------------------------------------------------------------
+
+SESION B:
+
+SHOW transaction_isolation;
+
+SELECT id,estado,xmin,xmax,ctid
+FROM operaciones.mvcc_demo;
+
+RESULTADO REAL OBSERVADO DURANTE LA VALIDACION:
+
+id | estado   | xmin | xmax | ctid
+---+----------+------+------+------
+1  | ORIGINAL | 798  | 801  | (0,1)
+
+INTERPRETACION:
+
+La sesion B sigue viendo ORIGINAL.
+
+La version antigua continua siendo visible para esta
+consulta porque el UPDATE de A no ha confirmado.
+
+xmax=801 muestra una marca de transaccion sobre la
+version antigua, pero NO demuestra que el cambio ya
+sea visible para otras sesiones.
+
+La version antigua sigue en (0,1).
+
+La sesion B no necesita esperar a que A termine para
+realizar esta lectura ordinaria.
+
+Esto demuestra una propiedad importante de MVCC:
+las lecturas normales pueden continuar mientras otra
+transaccion modifica el registro.
+
+--------------------------------------------------------------------
+7. INVESTIGAR LAS SESIONES
+--------------------------------------------------------------------
+
+SESION B:
+
+SELECT
+    pid,
+    state,
+    wait_event_type,
+    wait_event,
+    query
+FROM pg_stat_activity
+WHERE datname=current_database()
+ORDER BY pid;
+
+INTERPRETACION:
+
+La sesion A puede aparecer como idle in transaction,
+porque ya ejecuto UPDATE y esta esperando otra orden.
+
+Este estado es diferente de una transaccion confirmada.
+
+Una transaccion abierta durante mucho tiempo puede
+interferir con la limpieza de versiones antiguas.
+
+No debe confundirse una lectura MVCC normal con
+una consulta bloqueada.
+
+--------------------------------------------------------------------
+8. SESION A: CONFIRMAR EL CAMBIO
+--------------------------------------------------------------------
+
+SESION A:
+
+COMMIT;
+
+SELECT id,estado,xmin,xmax,ctid
+FROM operaciones.mvcc_demo;
+
+RESULTADO REAL:
+
+id | estado     | xmin | xmax | ctid
+---+------------+------+------+------
+1  | MODIFICADO | 801  | 0    | (0,2)
+
+INTERPRETACION:
+
+COMMIT confirma la modificacion.
+
+La version nueva fue creada por la transaccion 801.
+
+La ubicacion fisica de la version visible cambio
+de (0,1) a (0,2).
+
+El cambio de ctid es evidencia de una nueva version.
+
+--------------------------------------------------------------------
+9. SESION B: LEER DESPUES DEL COMMIT
+--------------------------------------------------------------------
+
+SESION B:
+
+SELECT id,estado,xmin,xmax,ctid
+FROM operaciones.mvcc_demo;
+
+RESULTADO REAL:
+
+id | estado     | xmin | xmax | ctid
+---+------------+------+------+------
+1  | MODIFICADO | 801  | 0    | (0,2)
+
+INTERPRETACION:
+
+B ahora ve MODIFICADO.
+
+Con el aislamiento READ COMMITTED, cada sentencia obtiene
+un snapshot apropiado al comenzar su ejecucion.
+
+Por eso dos SELECT consecutivos pueden observar valores
+diferentes si otra transaccion confirma entre ambos.
+
+En REPEATABLE READ el comportamiento seria distinto
+dentro de una misma transaccion lectora.
+
+--------------------------------------------------------------------
+10. RELACIONAR EL CAMBIO CON WAL
+--------------------------------------------------------------------
+
+SESION B:
+
+SELECT pg_current_wal_lsn() AS lsn_after;
+
+RESULTADO REAL:
+
+0/3B96F78
+
+Comparar con:
+
+0/3B96F00
+
+La posicion WAL avanzo.
+
+Consultar:
+
+SELECT wal_records,wal_fpi,wal_bytes
+FROM pg_stat_wal;
+
+RESULTADO REAL POSTERIOR:
+
+wal_records = 375646
+wal_fpi     = 2979
+wal_bytes   = 45306097
+
+INTERPRETACION:
+
+El numero de registros WAL aumento.
+Tambien aumento el volumen acumulado de bytes WAL.
+
+No debemos atribuir todos los cambios de contadores
+exclusivamente a nuestro UPDATE, porque son globales.
+
+El avance del LSN es compatible con la actividad de WAL
+generada durante el experimento.
+
+--------------------------------------------------------------------
+11. RESTAURACION Y VERIFICACION FINAL
+--------------------------------------------------------------------
+
+Cerrar ambas sesiones con \q.
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\02-reset-mvcc.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+Verificar:
+
+SELECT id,estado
+FROM operaciones.mvcc_demo;
+
+Esperado:
+
+1 | ORIGINAL
+
+La restauracion genera nuevas transacciones y WAL.
+No devuelve los contadores historicos a valores anteriores.
+
+--------------------------------------------------------------------
+12. COMPARACION CON ORACLE
+--------------------------------------------------------------------
+
+PostgreSQL MVCC:
+Comparable conceptualmente con la consistencia de lectura
+de Oracle, aunque la implementacion es diferente.
+
+Oracle:
+Utiliza informacion Undo para reconstruir versiones anteriores.
+
+PostgreSQL:
+Mantiene versiones de tuplas en el almacenamiento de tablas.
+
+PostgreSQL WAL:
+Comparable en finalidad de recuperacion con Oracle Redo.
+
+PostgreSQL xmin/xmax:
+No equivalen directamente a columnas empresariales ni
+a identificadores expuestos por Oracle.
+
+PostgreSQL VACUUM:
+Participa en la limpieza de versiones obsoletas.
+No es un equivalente directo de Oracle Undo.
+
+--------------------------------------------------------------------
+13. CONCLUSION DBA
+--------------------------------------------------------------------
+
+Una modificacion sin COMMIT no se vuelve visible
+automaticamente para otras transacciones.
+
+MVCC permite mantener consistencia durante concurrencia.
+
+Los metadatos xmin, xmax y ctid ayudan a investigar
+versiones, pero deben interpretarse correctamente.
+
+WAL y MVCC se complementan, pero no son lo mismo.
+
+FIN DE LA PRACTICA 03.03

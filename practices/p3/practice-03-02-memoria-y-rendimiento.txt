@@ -1,0 +1,385 @@
+﻿====================================================================
+PRACTICA 03.02 - MEMORIA, ORDENAMIENTOS E INDICES
+====================================================================
+
+PREGUNTA CENTRAL:
+Por que un reporte utiliza disco aunque PostgreSQL tenga memoria?
+
+OBJETIVO:
+Investigar el efecto de work_mem, interpretar EXPLAIN ANALYZE,
+distinguir memoria de consulta y mantenimiento, y verificar
+el efecto de un indice.
+
+--------------------------------------------------------------------
+1. SITUACION EMPRESARIAL
+--------------------------------------------------------------------
+
+El area comercial necesita un reporte de pedidos ordenado
+por importe y fecha.
+
+El reporte funciona, pero el DBA observa operaciones
+temporales en disco.
+
+La pregunta no es simplemente "cuanta RAM tiene el servidor".
+
+Necesitamos investigar:
+
+- Que operador del plan requiere memoria?
+- Cuanta memoria puede utilizar?
+- Que sucede cuando no es suficiente?
+- Como cambia el comportamiento con otra configuracion?
+- Que papel cumplen los indices?
+
+--------------------------------------------------------------------
+2. FUNDAMENTOS
+--------------------------------------------------------------------
+
+shared_buffers:
+Cache compartido de bloques de datos e indices.
+
+work_mem:
+Memoria base disponible para operaciones como ordenamientos
+y tablas hash, con matices segun el operador y parametros
+como hash_mem_multiplier.
+
+Una consulta puede tener multiples operaciones consumidoras
+de work_mem y varias consultas pueden ejecutarse en paralelo.
+
+Por tanto, work_mem NO es un limite global de RAM.
+
+maintenance_work_mem:
+Memoria destinada a determinadas operaciones de mantenimiento,
+como CREATE INDEX y VACUUM, con reglas particulares.
+
+EXPLAIN:
+Muestra el plan elegido por el optimizador.
+
+EXPLAIN ANALYZE:
+Ejecuta realmente la consulta y muestra mediciones.
+No debe utilizarse descuidadamente sobre DML productivo.
+
+BUFFERS:
+Muestra actividad de buffers y bloques temporales.
+
+--------------------------------------------------------------------
+3. CONECTAR Y VERIFICAR DATOS
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_scenarios
+
+En psql:
+
+SELECT count(*) FROM operaciones.pedidos;
+
+Esperado: 50000 registros.
+
+Si existen 59000 registros de la validacion anterior,
+restaurar primero mediante 03-reset-performance.sql.
+
+--------------------------------------------------------------------
+4. BEFORE: CONSULTAR CONFIGURACION
+--------------------------------------------------------------------
+
+SHOW work_mem;
+
+SHOW maintenance_work_mem;
+
+VALORES OBSERVADOS:
+
+work_mem             = 4MB
+maintenance_work_mem = 64MB
+
+Estos son valores del ambiente validado, no valores universales.
+
+Consultar el acumulado de archivos temporales:
+
+SELECT
+    datname,
+    temp_files,
+    temp_bytes
+FROM pg_stat_database
+WHERE datname=current_database();
+
+ANTES DE LA VALIDACION ORIGINAL:
+
+temp_files = 0
+temp_bytes = 0
+
+En ejecuciones posteriores estos contadores pueden ser mayores.
+Son acumulados, no corresponden exclusivamente a esta practica.
+
+--------------------------------------------------------------------
+5. EXPERIMENTO A: MEMORIA REDUCIDA
+--------------------------------------------------------------------
+
+BEGIN;
+
+SET LOCAL work_mem='64kB';
+
+SHOW work_mem;
+
+EXPLAIN (ANALYZE,BUFFERS,VERBOSE)
+SELECT *
+FROM operaciones.pedidos
+ORDER BY total DESC,creado_en DESC;
+
+COMMIT;
+
+SHOW work_mem;
+
+SALIDA REAL DE VALIDACION, FRAGMENTO:
+
+Sort
+  Sort Key: pedidos.total DESC, pedidos.creado_en DESC
+  Sort Method: external merge  Disk: 2096kB
+  Buffers: shared hit=374, temp read=775 written=833
+  -> Seq Scan on operaciones.pedidos
+Execution Time: 2223.739 ms
+
+INTERPRETACION PASO A PASO:
+
+Seq Scan:
+PostgreSQL recorrio la tabla pedidos.
+
+Sort:
+El motor ordeno las filas por importe y fecha.
+
+Sort Key:
+Columnas y direccion del ordenamiento.
+
+external merge:
+El ordenamiento utilizo archivos temporales porque la
+memoria disponible para esa operacion era insuficiente.
+
+Disk: 2096kB:
+Espacio temporal reportado para el ordenamiento.
+
+temp read y temp written:
+Bloques temporales leidos y escritos durante la operacion.
+No deben confundirse con lecturas fisicas directas de disco.
+
+Execution Time:
+Tiempo de esta ejecucion especifica.
+No representa una garantia de rendimiento futuro.
+
+SET LOCAL:
+Modifica el parametro solo durante la transaccion actual.
+
+COMMIT:
+Finaliza la transaccion y restaura el valor anterior de work_mem.
+
+AFTER:
+SHOW work_mem debe mostrar el valor inicial, 4MB en
+nuestro ambiente de validacion.
+
+--------------------------------------------------------------------
+6. EXPERIMENTO B: MAS MEMORIA PARA EL MISMO REPORTE
+--------------------------------------------------------------------
+
+BEGIN;
+
+SET LOCAL work_mem='16MB';
+
+SHOW work_mem;
+
+EXPLAIN (ANALYZE,BUFFERS,VERBOSE)
+SELECT *
+FROM operaciones.pedidos
+ORDER BY total DESC,creado_en DESC;
+
+COMMIT;
+
+SHOW work_mem;
+
+SALIDA REAL:
+
+Sort Method: quicksort  Memory: 3880kB
+Buffers: shared hit=374
+Execution Time: 2213.313 ms
+
+INTERPRETACION:
+
+quicksort:
+El ordenamiento pudo realizarse en memoria.
+
+Memory: 3880kB:
+Memoria utilizada por el operador Sort.
+
+No aparecieron lecturas ni escrituras temporales en ese
+operador durante esta ejecucion.
+
+COMPARACION:
+
+64kB:
+external merge, Disk 2096kB.
+
+16MB:
+quicksort, Memory 3880kB.
+
+Los tiempos fueron aproximadamente 2224 ms y 2213 ms.
+
+CONCLUSION IMPORTANTE:
+
+Demostramos un cambio de estrategia y consumo de recursos.
+NO demostramos una mejora significativa de tiempo.
+
+No se debe recomendar aumentar work_mem globalmente
+sin evaluar concurrencia, consultas y memoria disponible.
+
+--------------------------------------------------------------------
+7. OBSERVAR ESTADISTICAS TEMPORALES
+--------------------------------------------------------------------
+
+SELECT
+    datname,
+    temp_files,
+    temp_bytes
+FROM pg_stat_database
+WHERE datname=current_database();
+
+SALIDA REAL POSTERIOR:
+
+temp_files = 1
+temp_bytes = 2146304
+
+INTERPRETACION:
+
+Se registro un archivo temporal de aproximadamente 2 MiB.
+
+Las estadisticas son acumuladas y pueden tener retrasos
+de actualizacion.
+
+--------------------------------------------------------------------
+8. MEMORIA DE MANTENIMIENTO E INDICES
+--------------------------------------------------------------------
+
+ANTES:
+
+SHOW maintenance_work_mem;
+
+SELECT indexname
+FROM pg_indexes
+WHERE schemaname='operaciones'
+AND tablename='pedidos';
+
+CAMBIO TEMPORAL Y CREACION DE INDICE:
+
+BEGIN;
+
+SET LOCAL maintenance_work_mem='16MB';
+
+SHOW maintenance_work_mem;
+
+CREATE INDEX idx_pedidos_producto
+ON operaciones.pedidos(producto_id);
+
+COMMIT;
+
+SHOW maintenance_work_mem;
+
+RESULTADO REAL:
+
+CREATE INDEX
+maintenance_work_mem restaurado a 64MB.
+
+IMPORTANTE:
+
+El cambio de memoria fue temporal.
+El indice creado es persistente y requiere limpieza explicita.
+
+El experimento demuestra el contexto de uso del parametro,
+pero NO mide el consumo exacto de memoria durante CREATE INDEX.
+
+--------------------------------------------------------------------
+9. VERIFICAR EL PLAN CON INDICE
+--------------------------------------------------------------------
+
+EXPLAIN (ANALYZE,BUFFERS)
+SELECT *
+FROM operaciones.pedidos
+WHERE producto_id=42;
+
+SALIDA REAL:
+
+Bitmap Heap Scan on pedidos
+  Recheck Cond: (producto_id = 42)
+  Heap Blocks: exact=50
+  -> Bitmap Index Scan on idx_pedidos_producto
+       Index Cond: (producto_id = 42)
+       Index Searches: 1
+Execution Time: 1.501 ms
+
+INTERPRETACION:
+
+Bitmap Index Scan:
+Consulta el indice para localizar las filas candidatas.
+
+Bitmap Heap Scan:
+Visita los bloques de tabla que contienen esas filas.
+
+Recheck Cond:
+Verifica la condicion en el acceso a la tabla.
+
+Heap Blocks: exact=50:
+Se consultaron 50 bloques identificados exactamente
+por el bitmap.
+
+No todos los predicados requieren un indice ni el optimizador
+siempre debe utilizarlo.
+
+--------------------------------------------------------------------
+10. RESTAURACION
+--------------------------------------------------------------------
+
+En psql:
+
+DROP INDEX IF EXISTS operaciones.idx_pedidos_producto;
+
+SHOW work_mem;
+
+SHOW maintenance_work_mem;
+
+Verificar que los parametros tienen sus valores iniciales.
+
+Para restaurar tambien la poblacion completa de pedidos,
+ejecutar desde PowerShell el script:
+
+practices\p3\scripts\03-reset-performance.sql
+
+--------------------------------------------------------------------
+11. COMPARACION CON ORACLE
+--------------------------------------------------------------------
+
+shared_buffers:
+Comparable al buffer cache de Oracle.
+
+work_mem:
+Comparable conceptualmente con memoria para operaciones SQL
+en la PGA, pero no equivale a PGA_AGGREGATE_TARGET.
+
+Archivos temporales:
+Comparables en proposito con operaciones que usan TEMP.
+
+EXPLAIN ANALYZE:
+Cumple un proposito relacionado con observar planes reales,
+similar en algunos aspectos a DBMS_XPLAN.DISPLAY_CURSOR.
+
+CREATE INDEX:
+Existe en ambos motores, pero la gestion de memoria y
+los mecanismos internos difieren.
+
+--------------------------------------------------------------------
+12. CONCLUSION DBA
+--------------------------------------------------------------------
+
+No toda operacion en disco es un problema de falta de RAM global.
+
+Primero se identifica el operador del plan que genera el costo.
+
+Despues se verifica memoria, concurrencia, indices y volumen.
+
+Los cambios de configuracion deben medirse y restaurarse.
+
+FIN DE LA PRACTICA 03.02

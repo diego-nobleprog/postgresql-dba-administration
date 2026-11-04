@@ -1,0 +1,254 @@
+﻿====================================================================
+PRACTICA 03.00 - PREPARACION, RESTAURACION Y LIMPIEZA DEL LABORATORIO
+====================================================================
+
+CURSO:
+PostgreSQL DBA - Administracion, Performance, Backup,
+Replicacion y Alta Disponibilidad.
+
+MODULO:
+02 - Arquitectura interna de PostgreSQL.
+
+OBJETIVO:
+Preparar un ambiente reproducible para investigar procesos,
+memoria, transacciones, WAL, almacenamiento y checkpoints.
+
+ENTORNO VALIDADO:
+Windows 11, PowerShell 5.1, Docker y PostgreSQL 18.6.
+
+IMPORTANTE:
+Este laboratorio utiliza una base de datos independiente.
+No modificar nobleprog_architecture_lab.
+No ejecutar las cargas en ambientes productivos.
+
+--------------------------------------------------------------------
+1. HISTORIA EMPRESARIAL
+--------------------------------------------------------------------
+
+Una empresa comercial administra un catalogo de productos y
+registra pedidos de sus clientes.
+
+El equipo DBA necesita investigar cuatro situaciones:
+
+A. Una aplicacion abre varias conexiones simultaneas.
+B. Un reporte de ventas necesita ordenar miles de pedidos.
+C. Dos usuarios consultan y modifican un mismo registro.
+D. Se realizan operaciones y necesitamos conocer su
+   almacenamiento y persistencia.
+
+En lugar de construir cuatro ambientes diferentes, utilizaremos
+la misma base y relacionaremos los resultados.
+
+--------------------------------------------------------------------
+2. COMPONENTES DEL AMBIENTE
+--------------------------------------------------------------------
+
+Contenedor: postgresql-dba
+Version: PostgreSQL 18.6
+Base: nobleprog_architecture_scenarios
+Esquema: operaciones
+
+Tablas:
+productos  - catalogo de 1000 productos.
+pedidos    - 50000 pedidos iniciales.
+mvcc_demo  - registro para observar concurrencia.
+
+Las practicas pueden generar cambios adicionales. Por eso existen
+scripts de restauracion y limpieza.
+
+--------------------------------------------------------------------
+3. ANTES DE COMENZAR: VERIFICAR EL CONTENEDOR
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+docker ps --filter "name=postgresql-dba"
+
+docker exec -u postgres postgresql-dba postgres --version
+
+docker exec -u postgres postgresql-dba pg_isready -U postgres
+
+INTERPRETACION:
+
+El contenedor debe estar en estado Up.
+La version esperada es PostgreSQL 18.6.
+pg_isready debe indicar accepting connections.
+
+Si alguna comprobacion falla, no continuar con la carga.
+
+--------------------------------------------------------------------
+4. CREAR LA BASE DE DATOS
+--------------------------------------------------------------------
+
+Desde PowerShell, en la raiz del repositorio:
+
+Get-Content -Raw ".\practices\p3\scripts\00-create-database.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+QUE HACE:
+
+1. Consulta si existe la base del laboratorio.
+2. Crea la base si no existe.
+3. Verifica su presencia en pg_database.
+
+No elimina bases existentes.
+
+--------------------------------------------------------------------
+5. CARGAR LA INFORMACION INICIAL
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\01-load-data.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+ADVERTENCIA:
+
+El script recrea las tablas del esquema operaciones.
+No debe ejecutarse mientras existan sesiones trabajando sobre
+esas tablas.
+
+La carga utiliza generate_series(), funcion de PostgreSQL que
+genera secuencias de valores sin requerir archivos CSV externos.
+
+Se ejecuta ANALYZE para actualizar estadisticas del optimizador.
+
+RESULTADO ESPERADO:
+
+productos | pedidos | mvcc
+----------+---------+-----
+1000      | 50000   | 1
+
+--------------------------------------------------------------------
+6. ENTRAR A POSTGRESQL INTERACTIVAMENTE
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_scenarios
+
+A partir de aqui, los comandos SQL se ejecutan directamente en psql.
+
+Verificar:
+
+SELECT current_database();
+
+SELECT current_schema();
+
+SELECT count(*) FROM operaciones.productos;
+
+SELECT count(*) FROM operaciones.pedidos;
+
+SELECT * FROM operaciones.mvcc_demo;
+
+INTERPRETACION:
+
+current_database() identifica la base de la conexion.
+current_schema() puede mostrar public; eso es normal.
+Las tablas del ejercicio se consultan con operaciones.nombre.
+
+SALIR DE PSQL:
+
+\q
+
+--------------------------------------------------------------------
+7. COMO EJECUTAR LOS SCRIPTS DESDE PSQL
+--------------------------------------------------------------------
+
+En una sesion psql, se puede ejecutar un script mediante \i.
+
+El archivo SQL reside en Windows y psql se ejecuta dentro del
+contenedor. Por tanto, la ruta Windows NO es visible directamente
+desde esa sesion.
+
+Para evitar confusiones, ejecutaremos los scripts SQL desde
+PowerShell utilizando Get-Content y docker exec -i.
+
+Las consultas de investigacion se ejecutaran desde psql
+interactivo.
+
+--------------------------------------------------------------------
+8. RESTAURAR EL ESCENARIO MVCC
+--------------------------------------------------------------------
+
+Cerrar primero las sesiones A y B de la practica 03.3.
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\02-reset-mvcc.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+Verificacion:
+
+SELECT id,estado FROM operaciones.mvcc_demo;
+
+Esperado:
+
+1 | ORIGINAL
+
+IMPORTANTE:
+xmin, xmax y ctid pueden cambiar. No representan identificadores
+empresariales estables.
+
+--------------------------------------------------------------------
+9. RESTAURAR PRODUCTOS Y PEDIDOS
+--------------------------------------------------------------------
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\03-reset-performance.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d nobleprog_architecture_scenarios
+
+El script:
+- Recrea pedidos con 50000 registros.
+- Restaura inventario a 1000.
+- Elimina el indice adicional de la practica de rendimiento.
+- Actualiza estadisticas.
+
+No restaura contadores historicos ni WAL ya generado.
+
+--------------------------------------------------------------------
+10. LIMPIEZA COMPLETA AL FINALIZAR EL MODULO
+--------------------------------------------------------------------
+
+ANTES:
+Verificar que no hay trabajo pendiente y que la base del
+laboratorio puede eliminarse.
+
+Cerrar todas las sesiones psql del laboratorio con \q.
+
+Desde PowerShell:
+
+Get-Content -Raw ".\practices\p3\scripts\99-cleanup.sql" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+El script termina conexiones restantes a la base del laboratorio
+y elimina exclusivamente nobleprog_architecture_scenarios.
+
+DESPUES:
+Verificar que la consulta final devuelve 0.
+
+IMPORTANTE:
+La limpieza no revierte estadisticas globales, WAL historico ni
+contadores de checkpoint. Esos elementos pertenecen a la instancia.
+
+--------------------------------------------------------------------
+11. COMPARACION CON ORACLE
+--------------------------------------------------------------------
+
+PostgreSQL database:
+No equivale directamente a una instancia Oracle.
+
+PostgreSQL schema:
+Agrupa objetos mediante un namespace. En Oracle, los esquemas
+estan vinculados a usuarios.
+
+generate_series():
+Permite generar filas. En Oracle, un ejemplo comparable utiliza
+CONNECT BY LEVEL o una consulta recursiva.
+
+ANALYZE:
+Actualiza estadisticas del optimizador. En Oracle se utilizan
+mecanismos como DBMS_STATS.
+
+La preparacion es parte del trabajo DBA: un experimento solo
+es util si conocemos su estado inicial y podemos repetirlo.
+
+FIN DE LA PRACTICA 03.00
