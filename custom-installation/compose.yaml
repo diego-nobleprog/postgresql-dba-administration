@@ -1,0 +1,36 @@
+﻿services:
+  postgres-custom:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: postgresql-dba:18-custom
+
+    container_name: postgresql-dba-custom
+    hostname: postgresql-dba-custom
+
+    user: postgres
+
+    environment:
+      PGDATA: /data/nobleprog/instance01
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          initdb -D "$$PGDATA" -U postgres -A trust
+        fi
+        exec postgres -D "$$PGDATA" -c listen_addresses='*'
+
+    ports:
+      - "127.0.0.1:5433:5432"
+
+    volumes:
+      - postgres_custom_data:/data/nobleprog/instance01
+
+    restart: unless-stopped
+
+volumes:
+  postgres_custom_data:
+    name: postgresql-dba-custom-data

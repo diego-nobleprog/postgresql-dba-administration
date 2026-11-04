@@ -1,0 +1,521 @@
+﻿================================================================================
+PRACTICA 02 - INSTALACION PERSONALIZADA DE POSTGRESQL 18.6
+================================================================================
+
+CURSO
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
+
+MODULO
+Instalacion y configuracion de PostgreSQL
+
+ESCENARIO
+Instalacion personalizada desde codigo fuente en Oracle Linux 9,
+utilizando Docker Desktop y Docker Compose.
+
+DURACION
+Aproximadamente 45-60 minutos, dependiendo del equipo y la descarga.
+
+================================================================================
+1. OBJETIVO
+================================================================================
+
+Construir una instalacion independiente de PostgreSQL 18.6 desde codigo
+fuente, configurando manualmente el directorio de instalacion de los
+ejecutables y el directorio de datos de la instancia.
+
+Al finalizar, los participantes podran:
+
+1. Identificar la diferencia entre PG_HOME y PGDATA.
+2. Comprender el parametro --prefix del proceso de compilacion.
+3. Construir PostgreSQL desde codigo fuente.
+4. Inicializar un cluster mediante initdb.
+5. Ejecutar PostgreSQL con un usuario sin privilegios de root.
+6. Configurar almacenamiento persistente mediante un volumen Docker.
+7. Verificar la version, los binarios y el directorio de datos.
+8. Ejecutar dos instancias independientes de PostgreSQL.
+9. Eliminar exclusivamente los recursos de la instalacion personalizada.
+
+================================================================================
+2. ARQUITECTURA DEL LABORATORIO
+================================================================================
+
+INSTANCIA ORIGINAL
+
+Contenedor:  postgresql-dba
+Imagen:     postgresql-dba:18-p1
+Puerto host: 5432
+PGDATA:     /var/lib/pgsql/data
+
+INSTANCIA PERSONALIZADA
+
+Contenedor:  postgresql-dba-custom
+Imagen:     postgresql-dba:18-custom
+Sistema:    Oracle Linux 9
+Version:    PostgreSQL 18.6
+Puerto host: 5433
+Puerto interno: 5432
+
+PG_HOME:
+  /opt/nobleprog/postgresql/18
+
+PGDATA:
+  /data/nobleprog/instance01
+
+Volumen:
+  postgresql-dba-custom-data
+
+La instancia personalizada es independiente de la original.
+
+IMPORTANTE:
+No ejecutar comandos de eliminacion global de Docker.
+No modificar ni eliminar la instancia original.
+
+================================================================================
+3. REQUISITOS PREVIOS
+================================================================================
+
+- Windows con PowerShell.
+- Docker Desktop instalado y funcionando.
+- Docker Compose disponible.
+- Git instalado.
+- Repositorio postgresql-dba-administration disponible localmente.
+- Rama p2 con los archivos de la practica.
+
+Los archivos requeridos son:
+
+custom-installation/
+  Dockerfile
+  compose.yaml
+
+El Dockerfile compila PostgreSQL 18.6 desde codigo fuente.
+
+El archivo compose.yaml define el contenedor, puerto, volumen y
+procedimiento de inicializacion de PostgreSQL.
+
+NOTA:
+Los comandos de esta practica se ejecutan en PowerShell.
+Las instrucciones RUN, FROM, ENV, USER y CMD pertenecen al Dockerfile
+y no deben ejecutarse directamente en PowerShell.
+
+================================================================================
+4. PREPARAR EL DIRECTORIO DE TRABAJO
+================================================================================
+
+Ejecutar en PowerShell:
+
+Set-Location "C:\Users\student\Desktop\postgresql-dba-administration\custom-installation"
+
+$ErrorActionPreference = "Stop"
+
+Verificar los archivos:
+
+Get-ChildItem -File
+
+Resultado esperado:
+
+Dockerfile
+compose.yaml
+
+Consultar el contenido:
+
+Get-Content ".\Dockerfile"
+
+Get-Content ".\compose.yaml"
+
+================================================================================
+5. COMPRENDER LA INSTALACION PERSONALIZADA
+================================================================================
+
+PostgreSQL utiliza directorios con responsabilidades diferentes.
+
+PG_HOME
+
+Es el directorio donde se instalan los ejecutables, bibliotecas y
+archivos relacionados con el software PostgreSQL.
+
+En esta practica:
+
+/opt/nobleprog/postgresql/18
+
+El Dockerfile utiliza:
+
+./configure --prefix=${PG_HOME} --with-openssl
+
+El parametro --prefix determina el directorio de instalacion.
+
+PGDATA
+
+Es el directorio que contiene los archivos de la instancia:
+
+- Archivos de configuracion.
+- Catalogos del sistema.
+- Archivos de las bases de datos.
+- WAL.
+- Archivos de control.
+- Otros archivos internos del cluster.
+
+En esta practica:
+
+/data/nobleprog/instance01
+
+PG_HOME y PGDATA son independientes.
+
+La ubicacion de los ejecutables no determina obligatoriamente la
+ubicacion de los archivos de datos.
+
+================================================================================
+6. PREPARACION DE PERMISOS
+================================================================================
+
+PostgreSQL no debe ejecutarse como root.
+
+El Dockerfile crea el usuario postgres y prepara el directorio de datos:
+
+RUN mkdir -p /data/nobleprog/instance01 \
+    && chown -R postgres:postgres /data/nobleprog \
+    && chmod 700 /data/nobleprog/instance01
+
+Estas instrucciones pertenecen al Dockerfile.
+
+No deben copiarse como comandos PowerShell.
+
+El directorio de datos queda preparado con:
+
+Propietario: postgres
+Permisos:    700
+
+Esto permite inicializar correctamente un volumen Docker nuevo sin
+tener que modificar manualmente su propietario.
+
+================================================================================
+7. VALIDAR DOCKER COMPOSE
+================================================================================
+
+Ejecutar:
+
+docker compose config --quiet
+
+if ($LASTEXITCODE -ne 0) {
+    throw "La configuracion Compose no es valida."
+}
+
+Resultado esperado:
+
+El comando finaliza sin errores.
+
+================================================================================
+8. CONSTRUIR LA IMAGEN PERSONALIZADA
+================================================================================
+
+Ejecutar:
+
+docker compose --progress plain build
+
+if ($LASTEXITCODE -ne 0) {
+    throw "La construccion de la imagen personalizada fallo."
+}
+
+El proceso realiza las siguientes actividades:
+
+1. Descarga Oracle Linux 9 como imagen base.
+2. Instala compiladores y dependencias.
+3. Descarga PostgreSQL 18.6 desde el sitio oficial.
+4. Ejecuta configure con un directorio personalizado.
+5. Compila PostgreSQL.
+6. Instala los ejecutables.
+7. Crea el usuario postgres.
+8. Prepara el directorio de datos.
+9. Genera la imagen personalizada.
+
+Resultado esperado:
+
+Image postgresql-dba:18-custom Built
+
+La primera compilacion puede tardar varios minutos.
+
+Docker puede reutilizar capas de compilaciones anteriores.
+
+================================================================================
+9. INICIAR LA INSTANCIA PERSONALIZADA
+================================================================================
+
+Ejecutar:
+
+docker compose up -d --no-build
+
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo iniciar el contenedor personalizado."
+}
+
+Docker Compose crea:
+
+- Una red del proyecto.
+- El volumen postgresql-dba-custom-data.
+- El contenedor postgresql-dba-custom.
+
+Cuando el directorio PGDATA no contiene un cluster inicializado,
+el comando configurado en Compose ejecuta initdb.
+
+En los siguientes arranques, si PG_VERSION ya existe, se omite initdb.
+
+Esto evita reinicializar un cluster existente.
+
+================================================================================
+10. VERIFICAR EL ARRANQUE
+================================================================================
+
+Consultar el contenedor:
+
+docker ps -a --filter "name=postgresql-dba-custom"
+
+Resultado esperado:
+
+Contenedor: postgresql-dba-custom
+Estado:     Up
+Puerto:     127.0.0.1:5433->5432/tcp
+
+Consultar los logs:
+
+docker logs --tail 50 postgresql-dba-custom
+
+Resultado esperado:
+
+Success. You can now start the database server using:
+
+database system is ready to accept connections
+
+NOTA:
+El estado Started de Docker no garantiza por si mismo que PostgreSQL
+haya terminado de inicializarse.
+
+================================================================================
+11. VERIFICAR PROPIETARIO Y PERMISOS
+================================================================================
+
+Ejecutar:
+
+docker exec postgresql-dba-custom stat -c "%u:%g %a %n" /data/nobleprog/instance01
+
+Resultado esperado:
+
+998:998 700 /data/nobleprog/instance01
+
+Los valores 998 corresponden al UID y GID observados para postgres
+en esta imagen del laboratorio.
+
+En otras construcciones, el UID y GID pueden ser diferentes.
+
+Lo importante es que el directorio pertenezca al usuario postgres
+y que sus permisos sean adecuados.
+
+================================================================================
+12. VERIFICAR DISPONIBILIDAD
+================================================================================
+
+Ejecutar:
+
+docker exec postgresql-dba-custom pg_isready -U postgres -d postgres
+
+Resultado esperado:
+
+/tmp:5432 - accepting connections
+
+================================================================================
+13. VERIFICAR VERSION
+================================================================================
+
+Ejecutar:
+
+docker exec postgresql-dba-custom postgres --version
+
+Resultado esperado:
+
+postgres (PostgreSQL) 18.6
+
+================================================================================
+14. VERIFICAR DIRECTORIO DE INSTALACION
+================================================================================
+
+Ejecutar:
+
+docker exec postgresql-dba-custom sh -c "command -v postgres"
+
+Resultado esperado:
+
+/opt/nobleprog/postgresql/18/bin/postgres
+
+Ejecutar:
+
+docker exec postgresql-dba-custom sh -c "command -v psql"
+
+Resultado esperado:
+
+/opt/nobleprog/postgresql/18/bin/psql
+
+Esto confirma que PostgreSQL utiliza la instalacion personalizada.
+
+================================================================================
+15. VERIFICAR DIRECTORIO DE DATOS
+================================================================================
+
+Ejecutar:
+
+docker exec postgresql-dba-custom psql -U postgres -d postgres -c "SHOW data_directory;"
+
+Resultado esperado:
+
+/data/nobleprog/instance01
+
+El directorio de datos es diferente del directorio de instalacion.
+
+================================================================================
+16. VERIFICAR EL VOLUMEN PERSISTENTE
+================================================================================
+
+Ejecutar:
+
+docker inspect --format '{{json .Mounts}}' postgresql-dba-custom
+
+Identificar:
+
+Name:
+postgresql-dba-custom-data
+
+Destination:
+/data/nobleprog/instance01
+
+Type:
+volume
+
+Esto confirma que los datos se almacenan en un volumen Docker.
+
+================================================================================
+17. VERIFICAR COEXISTENCIA DE INSTANCIAS
+================================================================================
+
+Ejecutar:
+
+docker ps --filter "name=postgresql-dba"
+
+Deben aparecer dos contenedores:
+
+postgresql-dba
+postgresql-dba-custom
+
+La instancia original utiliza el puerto 5432 del host.
+
+La instancia personalizada utiliza el puerto 5433 del host.
+
+Ambas utilizan el puerto 5432 dentro de sus respectivos contenedores.
+
+Los puertos no entran en conflicto porque cada contenedor tiene
+su propio espacio de red.
+
+================================================================================
+18. LIMPIEZA COMPLETA DEL ENTORNO PERSONALIZADO
+================================================================================
+
+ADVERTENCIA:
+
+Este procedimiento elimina permanentemente los datos del volumen
+postgresql-dba-custom-data.
+
+Ejecutarlo solamente cuando ya no se necesiten los datos de prueba.
+
+No elimina la instancia original.
+
+Ubicarse en:
+
+Set-Location "C:\Users\student\Desktop\postgresql-dba-administration\custom-installation"
+
+$ErrorActionPreference = "Stop"
+
+PASO 1 - ELIMINAR CONTENEDOR Y RED PERSONALIZADOS
+
+docker compose down --remove-orphans
+
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo eliminar el entorno Compose personalizado."
+}
+
+PASO 2 - ELIMINAR VOLUMEN PERSONALIZADO
+
+docker volume rm postgresql-dba-custom-data
+
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo eliminar el volumen personalizado."
+}
+
+PASO 3 - ELIMINAR IMAGEN PERSONALIZADA
+
+docker image rm postgresql-dba:18-custom
+
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo eliminar la imagen personalizada."
+}
+
+PASO 4 - VERIFICAR LA ELIMINACION
+
+docker ps -a --filter "name=postgresql-dba-custom"
+
+docker images postgresql-dba:18-custom
+
+docker volume ls --filter "name=postgresql-dba-custom-data"
+
+Los tres resultados deben mostrar listas vacias.
+
+PASO 5 - VERIFICAR LA INSTANCIA ORIGINAL
+
+docker ps -a --filter "name=postgresql-dba$"
+
+docker images postgresql-dba:18-p1
+
+docker volume ls --filter "name=postgres_data"
+
+La instancia original debe continuar disponible.
+
+IMPORTANTE:
+
+No ejecutar:
+
+docker system prune
+docker volume prune
+
+Estos comandos pueden afectar recursos ajenos a esta practica.
+
+================================================================================
+19. RESULTADOS DE APRENDIZAJE
+================================================================================
+
+Al concluir, los participantes deberan poder explicar:
+
+1. Que diferencia existe entre PG_HOME y PGDATA.
+2. Para que sirve --prefix durante la compilacion.
+3. Por que PostgreSQL no debe ejecutarse como root.
+4. Que funcion cumple initdb.
+5. Por que el directorio de datos necesita permisos adecuados.
+6. Como Docker conserva los datos mediante volumenes.
+7. Como dos instancias pueden utilizar puertos distintos en el host.
+8. Como comprobar que PostgreSQL realmente acepta conexiones.
+9. Como eliminar una instancia de laboratorio sin afectar otra.
+
+================================================================================
+20. CRITERIOS DE EXITO
+================================================================================
+
+La practica se considera satisfactoria cuando:
+
+[ ] La imagen personalizada se construyo correctamente.
+[ ] El contenedor personalizado inicio correctamente.
+[ ] initdb inicializo el cluster sin errores.
+[ ] PostgreSQL 18.6 acepta conexiones.
+[ ] El ejecutable postgres utiliza la ruta personalizada.
+[ ] PGDATA apunta al directorio personalizado.
+[ ] El volumen tiene propietario y permisos adecuados.
+[ ] Ambas instancias funcionan simultaneamente.
+[ ] La limpieza elimina exclusivamente los recursos personalizados.
+[ ] La instancia original permanece intacta.
+
+================================================================================
+FIN DE LA PRACTICA
+================================================================================
