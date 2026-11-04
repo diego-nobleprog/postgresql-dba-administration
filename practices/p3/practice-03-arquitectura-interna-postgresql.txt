@@ -1,0 +1,1673 @@
+﻿================================================================================
+PRACTICA 03 - ARQUITECTURA INTERNA DE POSTGRESQL 18
+================================================================================
+
+CURSO:
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion
+y Alta Disponibilidad
+
+MODULO:
+Modulo 2 - Arquitectura interna de PostgreSQL
+
+NIVEL:
+Intermedio - Administracion de bases de datos
+
+ENTORNO:
+Windows 11 + PowerShell 5.1 + Docker Desktop + PostgreSQL 18.6
+
+DURACION ESTIMADA:
+120 a 150 minutos
+
+MODALIDAD:
+Laboratorio guiado con interpretacion de resultados.
+
+ENFOQUE ADICIONAL:
+Equivalencias conceptuales entre PostgreSQL y Oracle Database.
+
+================================================================================
+1. OBJETIVO GENERAL
+================================================================================
+
+Comprender la arquitectura interna de PostgreSQL mediante la observacion
+directa de sus procesos, memoria, transacciones, WAL, checkpoints, estructuras
+fisicas y vistas de estadisticas.
+
+Al finalizar, los participantes podran:
+
+- Identificar los principales procesos de PostgreSQL.
+- Interpretar parametros de memoria y su impacto operativo.
+- Reconocer operaciones que utilizan archivos temporales.
+- Comprender la visibilidad de datos mediante MVCC.
+- Observar la generacion de WAL y los checkpoints.
+- Relacionar objetos logicos con archivos fisicos.
+- Consultar catalogos y estadisticas del motor.
+- Comparar los componentes estudiados con Oracle Database.
+- Utilizar la evidencia para diagnosticar problemas de administracion.
+
+La practica no busca memorizar comandos aislados. Cada ejercicio relaciona:
+
+CONCEPTO -> COMANDO -> RESULTADO -> INTERPRETACION -> DECISION DBA.
+
+================================================================================
+2. ARQUITECTURA DEL LABORATORIO
+================================================================================
+
++--------------------------------------------------------------------------+
+| WINDOWS 11                                                               |
+|                                                                          |
+|  VS CODE / POWERSHELL                                                     |
+|           |                                                              |
+|           | docker exec                                                  |
+|           v                                                              |
+|  +--------------------------------------------------------------------+  |
+|  | DOCKER DESKTOP                                                     |  |
+|  |                                                                    |  |
+|  |  Contenedor: postgresql-dba                                        |  |
+|  |  Imagen: postgresql-dba:18-p1                                      |  |
+|  |  PostgreSQL: 18.6                                                  |  |
+|  |  Puerto host: 127.0.0.1:5432                                       |  |
+|  |                                                                    |  |
+|  |  PGDATA: /var/lib/pgsql/data                                       |  |
+|  |                                                                    |  |
+|  |  Base del laboratorio: nobleprog_architecture_lab                 |  |
+|  |                                                                    |  |
+|  |  Esquema: operaciones                                             |  |
+|  |                                                                    |  |
+|  |  Tablas: productos, pedidos, mvcc_demo                             |  |
+|  +--------------------------------------------------------------------+  |
++--------------------------------------------------------------------------+
+
+IMPORTANTE:
+
+- Utilizamos el contenedor original de la practica 01.
+- No utilizamos el contenedor de instalacion personalizada.
+- No modificamos parametros globales de PostgreSQL.
+- No eliminamos contenedores ni volumenes Docker.
+- Los objetos de prueba se crean dentro de una base independiente.
+- Todas las instrucciones pueden ejecutarse desde una terminal PowerShell.
+
+================================================================================
+3. VALIDACION INICIAL DEL ENTORNO
+================================================================================
+
+3.1. FUNDAMENTO
+
+Antes de analizar un motor de bases de datos, un DBA debe identificar:
+
+- Version exacta del motor.
+- Instancia que esta administrando.
+- Estado del servicio.
+- Ubicacion del directorio de datos.
+- Puerto utilizado.
+- Disponibilidad para aceptar conexiones.
+
+Una diferencia de version puede cambiar nombres de procesos, vistas,
+columnas y comportamientos internos.
+
+3.2. COMANDOS
+
+Ejecutar desde PowerShell:
+
+    docker ps --filter "name=postgresql-dba"
+
+    docker exec -u postgres postgresql-dba postgres --version
+
+    docker exec -u postgres postgresql-dba pg_isready -U postgres -d postgres
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SHOW data_directory;"
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SHOW port;"
+
+3.3. SALIDA ESPERADA
+
+    postgres (PostgreSQL) 18.6
+
+    /var/run/postgresql:5432 - accepting connections
+
+    data_directory
+    ---------------------
+    /var/lib/pgsql/data
+
+    port
+    ------
+    5432
+
+3.4. INTERPRETACION
+
+La version confirma las caracteristicas del motor que estudiaremos.
+
+pg_isready confirma que PostgreSQL acepta conexiones en el endpoint
+consultado. No demuestra por si solo que todas las bases de datos
+o aplicaciones funcionen correctamente.
+
+data_directory identifica el directorio principal del cluster.
+
+En PostgreSQL, un cluster es un conjunto de bases de datos administradas
+por una misma instancia del servidor. No debe confundirse automaticamente
+con un cluster de alta disponibilidad.
+
+3.5. COMPARATIVA CON ORACLE
+
++-----------------------+-----------------------------------------------+
+| POSTGRESQL            | ORACLE                                        |
++-----------------------+-----------------------------------------------+
+| version()             | V$VERSION                                     |
+| pg_isready            | Comprobaciones de listener y conectividad     |
+| data_directory        | Archivos de datos y ubicaciones de la BD      |
+| Instancia PostgreSQL  | Instancia Oracle                              |
+| Cluster PostgreSQL    | No equivale directamente a Oracle RAC        |
++-----------------------+-----------------------------------------------+
+
+En Oracle, la instancia esta formada principalmente por memoria y procesos.
+
+En PostgreSQL, un proceso principal administra los procesos auxiliares
+y las conexiones de cliente. Las bases de datos del mismo cluster comparten
+la instancia y determinados recursos.
+
+CONCLUSION DBA:
+
+Identificar primero la instancia y version evita diagnosticar un entorno
+equivocado o ejecutar consultas incompatibles con el motor.
+
+================================================================================
+4. ARQUITECTURA Y PROCESOS
+================================================================================
+
+4.1. FUNDAMENTO
+
+PostgreSQL utiliza una arquitectura basada principalmente en procesos.
+
+Existe un proceso principal que administra el servidor y procesos
+auxiliares que realizan tareas especializadas.
+
+Tradicionalmente, cada conexion de cliente utiliza un proceso backend
+dedicado. Por ello, el numero de conexiones afecta el consumo de memoria
+y otros recursos del sistema operativo.
+
+Entre los procesos principales se encuentran:
+
+- Checkpointer: coordina los checkpoints.
+- Background Writer: escribe paginas modificadas de manera anticipada.
+- WAL Writer: escribe registros WAL pendientes.
+- Autovacuum Launcher: coordina tareas automaticas de mantenimiento.
+- Logical Replication Launcher: participa en replicacion logica.
+- IO Workers: realizan operaciones de entrada/salida asincronas.
+
+4.2. COMANDOS
+
+    docker exec postgresql-dba ps -eo pid,ppid,user,stat,comm,args
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT pid, backend_type, state, wait_event_type, wait_event FROM pg_stat_activity ORDER BY backend_type, pid;"
+
+4.3. SALIDA OBSERVADA EN EL LABORATORIO
+
+    PID   PPID   PROCESO
+    -------------------------------------------------
+    1     0      postgres
+    8     1      postgres: logger
+    9     1      postgres: io worker 0
+    10    1      postgres: io worker 1
+    11    1      postgres: io worker 2
+    12    1      postgres: checkpointer
+    13    1      postgres: background writer
+    15    1      postgres: walwriter
+    16    1      postgres: autovacuum launcher
+    17    1      postgres: logical replication launcher
+
+Los PID son ejemplos reales de nuestra validacion. Pueden cambiar.
+
+4.4. INTERPRETACION
+
+PID identifica el proceso del sistema operativo.
+
+PPID identifica su proceso padre.
+
+El PID 1 corresponde al proceso principal del contenedor en este entorno.
+
+Los procesos auxiliares aparecen asociados a ese proceso principal.
+
+pg_stat_activity permite observar procesos relacionados con PostgreSQL,
+incluyendo conexiones de clientes y determinados procesos internos.
+
+backend_type identifica la clase de proceso.
+
+state indica el estado de una sesion cuando aplica.
+
+wait_event_type y wait_event permiten investigar por que un proceso
+esta esperando.
+
+Ejemplo:
+
+    backend_type = background writer
+    wait_event_type = Activity
+    wait_event = BgwriterHibernate
+
+Esto indica una espera asociada a la actividad normal del proceso.
+No representa automaticamente un problema de rendimiento.
+
+4.5. COMPARATIVA CON ORACLE
+
++----------------------------+-----------------------------------------+
+| POSTGRESQL                 | ORACLE                                  |
++----------------------------+-----------------------------------------+
+| Proceso principal          | Procesos de instancia, sin mapeo 1:1    |
+| Backend por conexion       | Server process, segun configuracion     |
+| Background Writer          | DBWn                                    |
+| Checkpointer               | CKPT                                    |
+| WAL Writer                 | LGWR                                    |
+| Autovacuum                 | Sin equivalente directo                 |
+| pg_stat_activity           | V$SESSION y V$PROCESS                   |
++----------------------------+-----------------------------------------+
+
+DBWn y Background Writer realizan tareas relacionadas con escritura
+de bloques modificados, pero sus responsabilidades no son identicas.
+
+CKPT y Checkpointer estan relacionados con checkpoints, aunque Oracle
+y PostgreSQL coordinan el proceso de forma diferente.
+
+4.6. CONCLUSION OPERATIVA
+
+Un DBA puede usar estas vistas para distinguir:
+
+- Procesos internos normales.
+- Sesiones activas.
+- Sesiones en espera.
+- Bloqueos.
+- Consumo excesivo de conexiones.
+
+La existencia de una espera no significa necesariamente una falla.
+
+================================================================================
+5. GESTION DE MEMORIA
+================================================================================
+
+5.1. FUNDAMENTO
+
+PostgreSQL utiliza memoria compartida y memoria privada de procesos.
+
+La memoria compartida permite mantener estructuras utilizadas por
+diferentes procesos, incluyendo buffers de paginas de datos.
+
+La memoria privada se utiliza en actividades particulares de cada backend,
+como ordenamientos, operaciones hash y procesamiento de consultas.
+
+Parametros importantes:
+
+shared_buffers:
+Cantidad de memoria destinada al cache de bloques de PostgreSQL.
+
+work_mem:
+Limite base de memoria para determinadas operaciones internas.
+
+maintenance_work_mem:
+Memoria disponible para ciertas operaciones de mantenimiento.
+
+effective_cache_size:
+Estimacion de cache disponible utilizada por el optimizador.
+No representa una reserva de memoria.
+
+temp_buffers:
+Buffers locales para tablas temporales.
+
+max_connections:
+Limite de conexiones concurrentes configurado.
+
+5.2. COMANDOS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','temp_buffers','max_connections') ORDER BY name;"
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT name, size, allocated_size FROM pg_shmem_allocations ORDER BY allocated_size DESC LIMIT 15;"
+
+5.3. VALORES OBSERVADOS
+
++-----------------------+------------------+--------------------+
+| PARAMETRO             | VALOR            | INTERPRETACION     |
++-----------------------+------------------+--------------------+
+| shared_buffers        | 128 MB           | Cache PostgreSQL   |
+| work_mem              | 4 MB             | Memoria operacion  |
+| maintenance_work_mem  | 64 MB            | Mantenimiento      |
+| effective_cache_size  | 4 GB             | Estimacion planner |
+| temp_buffers          | 8 MB             | Tablas temporales  |
+| max_connections       | 100              | Limite conexiones  |
++-----------------------+------------------+--------------------+
+
+5.4. INTERPRETACION DE pg_settings
+
+setting contiene el valor numerico almacenado.
+
+unit indica su unidad.
+
+Por ejemplo:
+
+    shared_buffers = 16384
+    unit = 8kB
+
+Calculo:
+
+    16384 * 8 kB = 131072 kB = 128 MB
+
+context indica como puede aplicarse un cambio.
+
+postmaster implica que el parametro requiere reinicio del servidor
+para que un nuevo valor entre en vigor.
+
+user indica que el parametro puede ajustarse en el contexto de
+una sesion, sujeto a los permisos aplicables.
+
+source identifica de donde proviene el valor.
+
+pending_restart indica si existe un cambio pendiente de reinicio.
+
+5.5. INTERPRETACION DE pg_shmem_allocations
+
+En nuestra validacion:
+
+    Buffer Blocks     134221824 bytes
+    Buffer Descriptors 1048576 bytes
+    XLOG Ctl            4208200 bytes aproximadamente
+
+Buffer Blocks representa una de las principales asignaciones
+relacionadas con los buffers compartidos.
+
+Buffer Descriptors contiene estructuras de administracion de buffers.
+
+XLOG Ctl corresponde a estructuras de control relacionadas con WAL.
+
+La vista muestra asignaciones de memoria compartida. No debe utilizarse
+como si fuera una vista directa de memoria libre del servidor.
+
+5.6. COMPARATIVA CON ORACLE
+
++--------------------------+------------------------------------------+
+| POSTGRESQL               | ORACLE                                   |
++--------------------------+------------------------------------------+
+| shared_buffers           | Database Buffer Cache dentro de SGA      |
+| work_mem                 | SQL work areas / PGA                     |
+| maintenance_work_mem     | Memoria para operaciones de mantenimiento|
+| effective_cache_size     | Sin parametro exactamente equivalente   |
+| pg_shmem_allocations     | V$SGAINFO, V$SGASTAT, segun necesidad    |
+| pg_settings              | V$PARAMETER, V$SYSTEM_PARAMETER         |
++--------------------------+------------------------------------------+
+
+La SGA de Oracle contiene varias regiones de memoria.
+
+shared_buffers no representa toda la SGA; corresponde principalmente
+a la funcion de cache de bloques.
+
+La PGA de Oracle tampoco equivale directamente a work_mem.
+
+5.7. CONCLUSION OPERATIVA
+
+No es correcto dimensionar memoria utilizando solamente el numero
+de conexiones o un unico parametro.
+
+El DBA debe considerar simultaneamente:
+
+- Memoria compartida.
+- Operaciones concurrentes.
+- Consultas con multiples sorts o hashes.
+- Memoria del sistema operativo.
+- Procesos auxiliares.
+- Margen disponible para otras aplicaciones.
+
+================================================================================
+6. WORK_MEM Y ORDENAMIENTOS TEMPORALES
+================================================================================
+
+6.1. FUNDAMENTO
+
+Las consultas SQL pueden requerir operaciones de ordenamiento.
+
+Si el espacio necesario excede la memoria disponible para esa operacion,
+PostgreSQL puede recurrir a archivos temporales.
+
+Esto puede aumentar las operaciones de entrada/salida y afectar
+el tiempo de respuesta.
+
+work_mem no es una reserva fija por conexion ni un limite global
+para toda una consulta.
+
+6.2. PREPARACION DE DATOS
+
+La siguiente base de laboratorio fue creada durante la validacion:
+
+    nobleprog_architecture_lab
+
+El esquema contiene:
+
+    operaciones.productos
+    operaciones.pedidos
+    operaciones.mvcc_demo
+
+Para verificar los datos:
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT count(*) AS productos FROM operaciones.productos; SELECT count(*) AS pedidos FROM operaciones.pedidos;"
+
+En la carga inicial:
+
+    productos = 1000
+    pedidos = 50000
+
+Despues de la generacion de WAL, pedidos puede contener 59000 filas.
+
+6.3. BEFORE - CONSULTAR VALOR ORIGINAL
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SHOW work_mem;"
+
+Resultado observado:
+
+    4MB
+
+6.4. EJECUTAR ORDENAMIENTO CON MEMORIA LIMITADA
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "BEGIN; SET LOCAL work_mem = '64kB'; SHOW work_mem; EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT * FROM operaciones.pedidos ORDER BY total DESC, creado_en DESC; COMMIT; SHOW work_mem;"
+
+6.5. RESULTADO OBSERVADO
+
+    Sort Method: external merge  Disk: 2096kB
+
+    Buffers: shared hit=374, temp read=775 written=833
+
+    Execution Time: 2314.838 ms
+
+Los valores exactos dependen del entorno y del volumen de datos.
+
+6.6. INTERPRETACION DETALLADA
+
+Sort:
+El plan contiene una operacion de ordenamiento.
+
+external merge:
+El ordenamiento no se completo exclusivamente en memoria.
+PostgreSQL utilizo un algoritmo de ordenamiento externo.
+
+Disk: 2096kB:
+El nodo utilizo aproximadamente 2 MB de espacio temporal en disco.
+
+shared hit=374:
+Se registraron accesos a bloques encontrados en el cache compartido.
+
+temp read=775:
+Se registraron lecturas de bloques temporales.
+
+temp written=833:
+Se registraron escrituras de bloques temporales.
+
+Execution Time:
+Representa el tiempo total de ejecucion del plan.
+
+No debemos afirmar que todo ese tiempo fue causado por el disco.
+Tambien influyen el procesamiento, la carga del sistema y otros factores.
+
+6.7. RELACION ENTRE TEORIA Y EVIDENCIA
+
+TEORIA:
+Una operacion puede necesitar mas memoria que work_mem.
+
+EVIDENCIA:
+El plan reporta external merge y bloques temporales.
+
+INTERPRETACION:
+PostgreSQL utilizo almacenamiento temporal para completar el sort.
+
+DECISION DBA:
+Investigar el plan, volumen de datos, indices, concurrencia
+y consumo de memoria antes de aumentar work_mem.
+
+6.8. AFTER Y RESTAURACION
+
+SET LOCAL solo aplica durante la transaccion actual.
+
+Al finalizar COMMIT, el valor original vuelve a estar vigente.
+
+Verificar:
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SHOW work_mem;"
+
+Resultado esperado:
+
+    4MB
+
+6.9. COMPARATIVA CON ORACLE
+
++---------------------------+-----------------------------------------+
+| POSTGRESQL                | ORACLE                                  |
++---------------------------+-----------------------------------------+
+| work_mem                  | SQL work areas administradas en PGA     |
+| EXPLAIN ANALYZE           | DBMS_XPLAN con estadisticas reales      |
+| external merge            | Operacion sort que puede usar TEMP      |
+| pg_stat_database          | Estadisticas de sesiones y temporales   |
+| Archivos temporales       | Segmentos temporales en TEMP tablespace |
++---------------------------+-----------------------------------------+
+
+Oracle administra las areas de trabajo mediante mecanismos asociados
+a PGA, por ejemplo PGA_AGGREGATE_TARGET.
+
+No existe una conversion directa entre work_mem y PGA_AGGREGATE_TARGET.
+
+6.10. CONCLUSION OPERATIVA
+
+Un sort externo no implica automaticamente un incidente.
+
+Se convierte en una senal relevante cuando:
+
+- Ocurre repetidamente.
+- Consume grandes cantidades de almacenamiento temporal.
+- Coincide con latencia elevada.
+- Afecta numerosas sesiones concurrentes.
+
+================================================================================
+7. MAINTENANCE_WORK_MEM
+================================================================================
+
+7.1. FUNDAMENTO
+
+maintenance_work_mem controla memoria disponible para determinadas
+operaciones de mantenimiento.
+
+Entre ellas pueden encontrarse:
+
+- CREATE INDEX.
+- VACUUM.
+- Otras operaciones de mantenimiento compatibles.
+
+No debe confundirse con work_mem, cuyo uso esta relacionado con
+operaciones de ejecucion de consultas.
+
+7.2. BEFORE
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SHOW maintenance_work_mem;"
+
+Resultado:
+
+    64MB
+
+7.3. CAMBIO TEMPORAL Y CREACION DE INDICE
+
+Este comando supone que el indice no existe.
+
+Si ya ejecutaste la validacion, primero puedes consultar los indices
+existentes y omitir CREATE INDEX.
+
+Consulta:
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT indexname FROM pg_indexes WHERE schemaname = 'operaciones' ORDER BY indexname;"
+
+Ejercicio para un indice nuevo:
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "BEGIN; SET LOCAL maintenance_work_mem = '16MB'; SHOW maintenance_work_mem; CREATE INDEX IF NOT EXISTS idx_pedidos_producto ON operaciones.pedidos(producto_id); COMMIT; SHOW maintenance_work_mem;"
+
+7.4. SALIDA ESPERADA
+
+    maintenance_work_mem
+    ----------------------
+    16MB
+
+    CREATE INDEX
+
+    maintenance_work_mem
+    ----------------------
+    64MB
+
+Si el indice ya existe, PostgreSQL puede omitir su creacion.
+
+7.5. INTERPRETACION
+
+El valor 16MB demuestra que la transaccion aplico un parametro local.
+
+CREATE INDEX crea una estructura de acceso que puede ayudar
+a consultas que utilizan producto_id.
+
+El retorno a 64MB confirma que no se modifico la configuracion
+persistente del servidor.
+
+La existencia del indice no demuestra por si sola una mejora
+de rendimiento: eso debe comprobarse con consultas y planes.
+
+7.6. COMPARATIVA CON ORACLE
+
+En Oracle, la creacion de indices utiliza mecanismos propios
+de administracion de memoria, procesos y almacenamiento temporal.
+
+No existe un parametro equivalente exacto a maintenance_work_mem.
+
+Ambos motores permiten crear indices para mejorar determinadas
+estrategias de acceso, pero sus parametros de memoria son diferentes.
+
+7.7. CONCLUSION OPERATIVA
+
+La memoria de mantenimiento debe dimensionarse considerando
+las operaciones concurrentes y la memoria disponible.
+
+No conviene elevarla globalmente sin evaluar su impacto.
+
+================================================================================
+8. MVCC - MULTIVERSION CONCURRENCY CONTROL
+================================================================================
+
+8.1. FUNDAMENTO
+
+MVCC permite administrar la visibilidad de versiones de filas
+para diferentes transacciones.
+
+Una actualizacion puede crear una nueva version de una fila,
+mientras otras transacciones siguen observando una version
+anterior segun su snapshot y nivel de aislamiento.
+
+En PostgreSQL, las filas contienen informacion de control,
+incluyendo:
+
+xmin:
+Identificador de la transaccion que creo esa version.
+
+xmax:
+Identificador relacionado con la eliminacion, actualizacion
+o determinados bloqueos de esa version.
+
+ctid:
+Ubicacion fisica de la version dentro de la tabla.
+
+IMPORTANTE:
+xmax no debe interpretarse siempre como una eliminacion confirmada.
+
+8.2. PREPARAR TABLA
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "DROP TABLE IF EXISTS operaciones.mvcc_demo; CREATE TABLE operaciones.mvcc_demo (id integer PRIMARY KEY, estado text NOT NULL); INSERT INTO operaciones.mvcc_demo VALUES (1, 'ORIGINAL'); SELECT id, estado, xmin, xmax, ctid FROM operaciones.mvcc_demo;"
+
+Este comando reemplaza exclusivamente la tabla de demostracion MVCC.
+
+8.3. SALIDA INICIAL OBSERVADA
+
+    id | estado   | xmin | xmax | ctid
+    ---+----------+------+------+-------
+    1  | ORIGINAL | 784  | 0    | (0,1)
+
+8.4. INTERPRETACION
+
+estado = ORIGINAL:
+Es el valor visible inicialmente.
+
+xmin = 784:
+La version fue creada por una transaccion identificada con ese XID.
+
+xmax = 0:
+En este caso no existe una transaccion que haya marcado
+esa version para actualizacion o eliminacion.
+
+ctid = (0,1):
+Identifica bloque y posicion de la version de fila.
+
+Los identificadores de transaccion cambian entre ejecuciones.
+
+8.5. CONCURRENCIA - DOS SESIONES
+
+Para demostrar el comportamiento manualmente se utilizan dos
+terminales PowerShell.
+
+TERMINAL A:
+
+    docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab
+
+Dentro de psql:
+
+    BEGIN;
+
+    UPDATE operaciones.mvcc_demo
+    SET estado = 'MODIFICADO'
+    WHERE id = 1;
+
+No ejecutar COMMIT todavia.
+
+TERMINAL B:
+
+    docker exec -it -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab
+
+Dentro de psql:
+
+    SELECT id, estado, xmin, xmax, ctid
+    FROM operaciones.mvcc_demo;
+
+Resultado esperado antes del COMMIT:
+
+    estado = ORIGINAL
+
+Volver a TERMINAL A:
+
+    COMMIT;
+
+Volver a TERMINAL B:
+
+    SELECT id, estado, xmin, xmax, ctid
+    FROM operaciones.mvcc_demo;
+
+Resultado esperado:
+
+    estado = MODIFICADO
+
+Para salir de psql en ambas terminales:
+
+    \q
+
+8.6. RESULTADO REAL DE NUESTRA VALIDACION
+
+Antes del COMMIT:
+
+    id | estado   | xmin | xmax | ctid
+    ---+----------+------+------+-------
+    1  | ORIGINAL | 784  | 785  | (0,1)
+
+Despues del COMMIT:
+
+    id | estado     | xmin | xmax | ctid
+    ---+------------+------+------+-------
+    1  | MODIFICADO | 785  | 0    | (0,2)
+
+8.7. INTERPRETACION
+
+La transaccion lectora observo ORIGINAL mientras la actualizacion
+seguia sin confirmar.
+
+Despues del COMMIT, una nueva consulta observo MODIFICADO.
+
+El cambio de ctid demuestra que se creo otra version fisica.
+
+Esto corresponde al comportamiento observado bajo READ COMMITTED,
+nivel de aislamiento predeterminado de PostgreSQL.
+
+En REPEATABLE READ, una transaccion lectora puede mantener
+un snapshot estable y observar un comportamiento diferente.
+
+8.8. COMPARATIVA CON ORACLE
+
++---------------------------+-----------------------------------------+
+| POSTGRESQL                | ORACLE                                  |
++---------------------------+-----------------------------------------+
+| MVCC                      | Read consistency mediante Undo          |
+| Versiones en heap         | Versiones reconstruidas con Undo        |
+| VACUUM                    | Sin equivalente directo                 |
+| xmin / xmax               | Sin equivalentes directos               |
+| ctid                      | ROWID, con diferencias importantes      |
+| pg_stat_activity          | V$SESSION                               |
++---------------------------+-----------------------------------------+
+
+Oracle utiliza Undo para reconstruir versiones anteriores
+cuando una consulta necesita una vista consistente.
+
+PostgreSQL conserva versiones de tuplas dentro de su almacenamiento
+hasta que pueden ser reclamadas por los mecanismos de limpieza.
+
+Por esta diferencia, VACUUM es una operacion fundamental
+en la administracion de PostgreSQL.
+
+8.9. CONCLUSION OPERATIVA
+
+MVCC permite concurrencia entre lectores y escritores,
+pero tambien introduce necesidades de mantenimiento.
+
+Un DBA debe comprender:
+
+- Snapshots.
+- Transacciones largas.
+- Versiones obsoletas.
+- VACUUM y Autovacuum.
+- Impacto sobre almacenamiento y rendimiento.
+
+================================================================================
+9. WAL - WRITE-AHEAD LOG
+================================================================================
+
+9.1. FUNDAMENTO
+
+WAL es el registro utilizado por PostgreSQL para soportar
+durabilidad y recuperacion ante fallos.
+
+Antes de considerar persistidos determinados cambios de paginas
+de datos, deben cumplirse las reglas de escritura del WAL.
+
+WAL contiene registros que permiten reproducir modificaciones
+durante procesos de recuperacion.
+
+Tambien es fundamental para replicacion fisica y recuperacion
+a un punto en el tiempo.
+
+9.2. BEFORE - CONSULTAR LSN
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT pg_current_wal_lsn() AS lsn_before; SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;"
+
+9.3. RESULTADO OBSERVADO
+
+    lsn_before
+    ------------
+    0/2BCFD88
+
+    wal_records = 235338
+    wal_bytes   = 28902125
+
+9.4. GENERAR ACTIVIDAD TRANSACCIONAL
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "INSERT INTO operaciones.pedidos (producto_id, cantidad, total) SELECT (g % 1000) + 1, 2, 125.50 FROM generate_series(1, 10000) AS g; UPDATE operaciones.productos SET inventario = inventario - 1 WHERE id BETWEEN 1 AND 500; DELETE FROM operaciones.pedidos WHERE id BETWEEN 1 AND 1000; SELECT pg_current_wal_lsn() AS lsn_after;"
+
+9.5. SALIDA OBSERVADA
+
+    INSERT 0 10000
+    UPDATE 500
+    DELETE 1000
+
+    lsn_after
+    -----------
+    0/2E4E728
+
+9.6. INTERPRETACION
+
+INSERT creo 10000 registros.
+
+UPDATE modifico 500 filas.
+
+DELETE elimino 1000 filas.
+
+El LSN avanzo entre las dos mediciones.
+
+LSN significa Log Sequence Number y representa una posicion
+dentro de la secuencia WAL.
+
+El avance del LSN demuestra que el registro transaccional progreso.
+
+No debemos interpretar el LSN como un contador de filas.
+
+9.7. ESTADISTICAS WAL
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full FROM pg_stat_wal;"
+
+Las estadisticas acumuladas pueden reflejar actualizaciones
+con cierto retraso.
+
+En nuestra validacion, los contadores inicialmente conservaron
+sus valores anteriores y posteriormente mostraron incrementos.
+
+Esto no significa que WAL hubiera dejado de funcionar.
+
+9.8. COMPARATIVA CON ORACLE
+
++--------------------------+------------------------------------------+
+| POSTGRESQL               | ORACLE                                   |
++--------------------------+------------------------------------------+
+| WAL                      | Redo                                      |
+| WAL Writer               | LGWR                                      |
+| pg_wal                   | Online redo logs, con diferencias        |
+| LSN                      | SCN, relacionado pero no equivalente     |
+| WAL archiving            | Archived redo logs                       |
+| PITR                     | Point-in-time recovery                   |
++--------------------------+------------------------------------------+
+
+Oracle utiliza redo para registrar cambios y permitir recuperacion.
+
+SCN y LSN tienen funciones diferentes.
+
+SCN identifica una secuencia logica de cambios/transacciones
+en Oracle, mientras LSN representa posiciones dentro de WAL.
+
+No son valores intercambiables.
+
+9.9. CONCLUSION OPERATIVA
+
+WAL es esencial para:
+
+- Recuperacion ante fallos.
+- Replicacion fisica.
+- Recuperacion a un punto en el tiempo.
+- Analisis de actividad transaccional.
+
+Un DBA debe vigilar crecimiento, retencion y capacidad
+del almacenamiento asociado a WAL.
+
+================================================================================
+10. CHECKPOINTS Y BACKGROUND WRITER
+================================================================================
+
+10.1. FUNDAMENTO
+
+PostgreSQL modifica paginas de datos en memoria compartida.
+
+Las paginas modificadas se conocen como dirty buffers.
+
+El Background Writer puede escribir algunas paginas modificadas
+anticipadamente para facilitar la disponibilidad de buffers.
+
+El Checkpointer coordina checkpoints, que establecen puntos
+de recuperacion y provocan la escritura de paginas modificadas
+segun las reglas del motor.
+
+El WAL Writer atiende la escritura de registros WAL.
+
+Aunque los tres participan en persistencia y entrada/salida,
+sus responsabilidades no son identicas.
+
+10.2. BEFORE - ESTADISTICAS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT num_timed, num_requested, num_done, buffers_written FROM pg_stat_checkpointer; SELECT buffers_clean, maxwritten_clean, buffers_alloc FROM pg_stat_bgwriter;"
+
+10.3. RESULTADO OBSERVADO ANTES
+
+    num_timed      = 127
+    num_requested  = 1
+    num_done       = 3
+    buffers_written = 47
+
+    buffers_clean = 0
+
+10.4. EJECUTAR CHECKPOINT
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "CHECKPOINT;"
+
+10.5. AFTER - VERIFICAR
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT num_timed, num_requested, num_done, buffers_written FROM pg_stat_checkpointer; SELECT buffers_clean, maxwritten_clean, buffers_alloc FROM pg_stat_bgwriter;"
+
+10.6. RESULTADO OBSERVADO DESPUES
+
+    num_requested   = 2
+    num_done        = 4
+    buffers_written = 1728
+
+    buffers_clean   = 0
+
+10.7. INTERPRETACION
+
+num_requested aumento de 1 a 2.
+
+Esto es consistente con la solicitud de un checkpoint manual.
+
+num_done aumento de 3 a 4.
+
+El contador registra checkpoints completados.
+
+buffers_written aumento de 47 a 1728.
+
+Esto indica que se escribieron paginas durante checkpoints.
+
+buffers_clean permanecio en cero.
+
+Esto no demuestra un fallo del Background Writer.
+
+Simplemente no se registraron escrituras de limpieza
+atribuidas a ese proceso durante la observacion.
+
+Los contadores son acumulados desde su ultimo reinicio
+estadistico y pueden incluir actividad ajena al ejercicio.
+
+10.8. PARAMETROS RELEVANTES
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT name, setting, unit FROM pg_settings WHERE name IN ('checkpoint_timeout','checkpoint_completion_target','max_wal_size','min_wal_size') ORDER BY name;"
+
+Valores observados:
+
+    checkpoint_timeout          = 300 s
+    checkpoint_completion_target = 0.9
+    max_wal_size                = 1024 MB
+    min_wal_size                = 80 MB
+
+checkpoint_timeout:
+Intervalo maximo objetivo entre checkpoints automaticos.
+
+checkpoint_completion_target:
+Distribuye el trabajo de escritura asociado a checkpoints
+a lo largo de una parte del intervalo previsto.
+
+max_wal_size:
+Limite objetivo aproximado de crecimiento de WAL
+antes de que se soliciten checkpoints, sujeto a excepciones.
+
+10.9. COMPARATIVA CON ORACLE
+
++----------------------------+-----------------------------------------+
+| POSTGRESQL                 | ORACLE                                  |
++----------------------------+-----------------------------------------+
+| Checkpointer               | CKPT                                    |
+| Background Writer          | DBWn                                    |
+| WAL Writer                 | LGWR                                    |
+| pg_stat_checkpointer       | Vistas dinamicas de checkpoints/I/O     |
+| pg_stat_bgwriter           | Estadisticas de escritura relacionadas |
++----------------------------+-----------------------------------------+
+
+Oracle CKPT participa en la coordinacion de checkpoints
+y actualizacion de informacion de control.
+
+DBWn escribe buffers modificados a archivos de datos.
+
+LGWR escribe redo.
+
+La separacion conceptual ayuda a un DBA de Oracle
+a reconocer funciones parecidas en PostgreSQL.
+
+10.10. CONCLUSION OPERATIVA
+
+Los checkpoints son necesarios, pero una frecuencia excesiva
+puede incrementar actividad de escritura.
+
+No es recomendable ejecutar CHECKPOINT manualmente
+de forma recurrente en produccion sin una razon operativa.
+
+================================================================================
+11. ESTRUCTURA FISICA DE POSTGRESQL
+================================================================================
+
+11.1. FUNDAMENTO
+
+PostgreSQL organiza sus archivos dentro del directorio PGDATA.
+
+Entre sus componentes se encuentran:
+
+base:
+Archivos relacionados con bases de datos del tablespace predeterminado.
+
+global:
+Archivos de catalogos compartidos del cluster.
+
+pg_wal:
+Segmentos WAL.
+
+pg_tblspc:
+Enlaces hacia ubicaciones de tablespaces adicionales.
+
+pg_xact:
+Informacion de estado de transacciones.
+
+postgresql.conf:
+Archivo principal de configuracion.
+
+pg_hba.conf:
+Reglas de autenticacion y acceso.
+
+11.2. COMANDO
+
+    docker exec postgresql-dba sh -c 'ls -la /var/lib/pgsql/data'
+
+11.3. SALIDA REPRESENTATIVA
+
+    PG_VERSION
+    base
+    global
+    pg_wal
+    pg_tblspc
+    pg_xact
+    postgresql.conf
+    pg_hba.conf
+    pg_ident.conf
+
+11.4. INTERPRETACION
+
+PG_VERSION identifica la version mayor del formato del cluster.
+
+base contiene subdirectorios asociados a bases de datos.
+
+pg_wal contiene registros WAL.
+
+pg_tblspc permite localizar tablespaces adicionales
+cuando existen.
+
+Estos directorios no deben manipularse manualmente
+durante la operacion normal de PostgreSQL.
+
+11.5. RELACIONAR TABLAS CON ARCHIVOS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT c.relname, c.relkind, c.relfilenode, pg_relation_filepath(c.oid) AS physical_path, pg_size_pretty(pg_relation_size(c.oid)) AS relation_size, pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'operaciones' ORDER BY c.relname;"
+
+11.6. RESULTADO OBSERVADO
+
+    relname       physical_path      relation_size  total_size
+    ---------------------------------------------------------
+    pedidos       base/16389/16426   3536 kB        5608 kB
+    productos     base/16389/16414   96 kB          184 kB
+    mvcc_demo     base/16389/16438   8192 bytes     32 kB
+
+11.7. INTERPRETACION
+
+physical_path:
+Ruta relativa dentro del almacenamiento del cluster.
+
+relation_size:
+Tamano del almacenamiento principal de la relacion.
+
+total_size:
+Incluye almacenamiento adicional asociado a la relacion,
+como indices y TOAST cuando corresponda.
+
+La diferencia entre relation_size y total_size
+no representa necesariamente desperdicio de espacio.
+
+Puede corresponder a estructuras necesarias para la tabla.
+
+11.8. COMPARATIVA CON ORACLE
+
++-----------------------------+----------------------------------------+
+| POSTGRESQL                  | ORACLE                                 |
++-----------------------------+----------------------------------------+
+| PGDATA                      | Ubicaciones de archivos de la BD       |
+| base                        | Datafiles, con diferencias            |
+| pg_wal                      | Redo logs, con diferencias            |
+| pg_tblspc                   | Ubicaciones de tablespaces            |
+| pg_relation_filepath        | Diccionario de segmentos y datafiles  |
+| pg_relation_size            | Vistas de segmentos y espacio         |
++-----------------------------+----------------------------------------+
+
+En Oracle, los segmentos se almacenan en tablespaces
+respaldados por datafiles.
+
+En PostgreSQL, las relaciones pueden corresponder
+a archivos y segmentos fisicos administrados por el motor.
+
+11.9. CONCLUSION OPERATIVA
+
+Comprender la estructura fisica ayuda a investigar:
+
+- Crecimiento de almacenamiento.
+- Espacio utilizado por indices.
+- Ubicacion de relaciones.
+- Crecimiento de WAL.
+- Problemas de capacidad.
+
+================================================================================
+12. DATABASES, SCHEMAS Y TABLESPACES
+================================================================================
+
+12.1. FUNDAMENTO
+
+PostgreSQL organiza objetos mediante diferentes niveles logicos.
+
+Database:
+Contenedor logico de esquemas y objetos.
+
+Schema:
+Espacio de nombres para tablas, vistas y otros objetos.
+
+Tablespace:
+Ubicacion de almacenamiento para determinados objetos.
+
+Estos conceptos no tienen una correspondencia perfecta
+con la organizacion de Oracle.
+
+12.2. CONSULTAR DATABASES
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT oid, datname, dattablespace FROM pg_database ORDER BY datname;"
+
+12.3. RESULTADO OBSERVADO
+
+    oid    datname                    dattablespace
+    ------------------------------------------------
+    16389  nobleprog_architecture_lab  1663
+    5      postgres                    1663
+    4      template0                   1663
+    1      template1                   1663
+
+12.4. INTERPRETACION
+
+oid identifica internamente cada base de datos.
+
+dattablespace referencia su tablespace predeterminado.
+
+En nuestra evidencia, 1663 corresponde a pg_default.
+
+template0 y template1 son bases utilizadas
+como plantillas para crear nuevas bases de datos.
+
+12.5. CONSULTAR SCHEMAS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT nspname FROM pg_namespace ORDER BY nspname;"
+
+Resultado observado:
+
+    information_schema
+    operaciones
+    pg_catalog
+    pg_toast
+    public
+
+INTERPRETACION:
+
+operaciones es el esquema creado para el laboratorio.
+
+pg_catalog contiene catalogos internos del sistema.
+
+information_schema ofrece vistas estandarizadas de metadatos.
+
+pg_toast participa en almacenamiento de valores grandes.
+
+public es un esquema comun presente en nuevas bases.
+
+12.6. CONSULTAR TABLESPACES
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d postgres -c "SELECT oid, spcname, pg_tablespace_location(oid) AS location FROM pg_tablespace ORDER BY spcname;"
+
+Resultado observado:
+
+    oid   spcname
+    ------------------
+    1663  pg_default
+    1664  pg_global
+
+pg_default se utiliza como tablespace predeterminado.
+
+pg_global contiene relaciones compartidas del cluster.
+
+Las ubicaciones de estos tablespaces incorporados
+pueden mostrarse vacias en pg_tablespace_location().
+
+Esto no significa que carezcan de almacenamiento.
+
+12.7. COMPARATIVA CON ORACLE
+
++---------------------------+-----------------------------------------+
+| POSTGRESQL                | ORACLE                                  |
++---------------------------+-----------------------------------------+
+| Database                  | No existe correspondencia universal     |
+| Schema                    | Schema asociado a usuario               |
+| Tablespace                | Tablespace                              |
+| pg_database               | Vistas del diccionario sobre BD/PDB     |
+| pg_namespace              | DBA_USERS, DBA_OBJECTS, segun consulta  |
+| pg_tablespace             | DBA_TABLESPACES                         |
++---------------------------+-----------------------------------------+
+
+En Oracle multitenant existen CDB y PDB.
+
+Una base PostgreSQL puede parecerse conceptualmente
+a una PDB en determinados aspectos de aislamiento logico,
+pero no son equivalentes arquitectonicos.
+
+En Oracle, un esquema esta asociado a un usuario.
+
+En PostgreSQL, los esquemas son espacios de nombres
+y los roles son entidades separadas.
+
+12.8. CONCLUSION OPERATIVA
+
+Un DBA debe distinguir:
+
+- Aislamiento entre bases.
+- Organizacion por esquemas.
+- Propiedad y permisos.
+- Ubicacion fisica de almacenamiento.
+
+No conviene trasladar directamente el modelo mental
+de Oracle sin considerar estas diferencias.
+
+================================================================================
+13. CATALOGOS Y VISTAS DE ESTADISTICAS
+================================================================================
+
+13.1. FUNDAMENTO
+
+PostgreSQL mantiene catalogos internos con informacion
+sobre objetos y configuracion del cluster.
+
+Tambien dispone de vistas de estadisticas para observar
+actividad, accesos, operaciones y comportamiento del motor.
+
+No todas las vistas tienen el mismo proposito.
+
+Los catalogos describen principalmente estructuras y metadatos.
+
+Las vistas pg_stat_* muestran diferentes estadisticas
+de actividad y funcionamiento.
+
+13.2. CONSULTAR TABLAS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT schemaname, tablename, tableowner FROM pg_tables WHERE schemaname = 'operaciones' ORDER BY tablename;"
+
+Resultado:
+
+    operaciones | mvcc_demo | postgres
+    operaciones | pedidos   | postgres
+    operaciones | productos | postgres
+
+13.3. ESTADISTICAS DE TABLAS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT schemaname, relname, seq_scan, idx_scan, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE schemaname = 'operaciones' ORDER BY relname;"
+
+13.4. RESULTADO OBSERVADO
+
+    TABLA       INSERTS   UPDATES   DELETES   LIVE    DEAD
+    -------------------------------------------------------
+    mvcc_demo   1         1         0         1       1
+    pedidos     60000     0         1000      59000   1000
+    productos   1000      500       0         1000    500
+
+13.5. INTERPRETACION
+
+n_tup_ins:
+Numero acumulado de inserciones registradas.
+
+n_tup_upd:
+Numero acumulado de actualizaciones registradas.
+
+n_tup_del:
+Numero acumulado de eliminaciones registradas.
+
+n_live_tup:
+Estimacion de filas vivas.
+
+n_dead_tup:
+Estimacion de filas obsoletas.
+
+Los valores son estadisticas acumuladas o estimaciones,
+no necesariamente conteos exactos instantaneos.
+
+En nuestro escenario:
+
+pedidos registra 60000 inserciones y 1000 eliminaciones.
+
+El numero estimado de filas vivas es 59000.
+
+Esto coincide con la carga inicial de 50000,
+mas 10000 inserciones y menos 1000 eliminaciones.
+
+13.6. INTERPRETACION DE DEAD TUPLES
+
+productos registra 500 dead tuples.
+
+Esto es consistente con las 500 actualizaciones ejecutadas.
+
+Una actualizacion puede dejar una version anterior
+que posteriormente deba ser reclamada por VACUUM.
+
+No debe asumirse que toda dead tuple representa
+un problema grave de almacenamiento.
+
+13.7. ESTADISTICAS DE CACHE Y DISCO
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT schemaname, relname, heap_blks_read, heap_blks_hit, idx_blks_read, idx_blks_hit FROM pg_statio_user_tables WHERE schemaname = 'operaciones' ORDER BY relname;"
+
+INTERPRETACION:
+
+heap_blks_read:
+Bloques de tabla leidos a traves de la capa de buffers.
+
+heap_blks_hit:
+Bloques de tabla encontrados en cache compartido.
+
+idx_blks_read:
+Bloques de indices leidos.
+
+idx_blks_hit:
+Bloques de indices encontrados en cache compartido.
+
+Un hit indica que el bloque ya estaba disponible
+en el cache de PostgreSQL.
+
+No demuestra necesariamente que una lectura fisica
+haya ocurrido en cada read, ya que tambien existe
+cache del sistema operativo.
+
+13.8. ESTADISTICAS POR BASE DE DATOS
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT datname, numbackends, xact_commit, xact_rollback, blks_read, blks_hit, temp_files, temp_bytes, deadlocks FROM pg_stat_database WHERE datname = current_database();"
+
+Resultado observado:
+
+    xact_commit = 79
+    xact_rollback = 1
+    temp_files = 1
+    temp_bytes = 2146304
+    deadlocks = 0
+
+INTERPRETACION:
+
+xact_commit:
+Transacciones confirmadas registradas.
+
+xact_rollback:
+Transacciones revertidas registradas.
+
+temp_files:
+Archivos temporales registrados.
+
+temp_bytes:
+Bytes acumulados escritos en archivos temporales.
+
+deadlocks:
+Interbloqueos detectados.
+
+El archivo temporal registrado es consistente
+con el ordenamiento externo realizado anteriormente.
+
+Un contador de deadlocks igual a cero significa
+que no se registraron interbloqueos en ese periodo
+estadistico, no que nunca puedan ocurrir.
+
+13.9. ESTADISTICAS DE ENTRADA/SALIDA
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SELECT backend_type, object, context, reads, writes, writebacks, extends, fsyncs FROM pg_stat_io ORDER BY backend_type, object, context LIMIT 50;"
+
+INTERPRETACION:
+
+backend_type:
+Tipo de proceso que realizo la operacion.
+
+object:
+Tipo de objeto involucrado.
+
+context:
+Contexto de entrada/salida.
+
+reads:
+Operaciones de lectura registradas.
+
+writes:
+Operaciones de escritura registradas.
+
+writebacks:
+Operaciones de writeback registradas.
+
+extends:
+Operaciones relacionadas con extension de archivos.
+
+fsyncs:
+Solicitudes de sincronizacion registradas.
+
+Los valores NULL no deben interpretarse automaticamente
+como cero. Pueden indicar que una metrica no aplica
+a determinada combinacion de proceso y contexto.
+
+13.10. COMPARATIVA CON ORACLE
+
++------------------------------+----------------------------------------+
+| POSTGRESQL                   | ORACLE                                 |
++------------------------------+----------------------------------------+
+| pg_catalog                   | Data Dictionary                        |
+| pg_tables                    | DBA_TABLES / ALL_TABLES                |
+| pg_indexes                   | DBA_INDEXES / ALL_INDEXES              |
+| pg_stat_activity             | V$SESSION                              |
+| pg_stat_database             | Vistas V$ de estadisticas              |
+| pg_stat_user_tables          | Estadisticas de segmentos y actividad  |
+| pg_stat_io                   | Vistas de I/O, segun necesidad         |
+| ANALYZE                      | DBMS_STATS, con diferencias            |
++------------------------------+----------------------------------------+
+
+En Oracle, DBA_*, ALL_* y USER_* muestran diferentes
+alcances de metadatos segun permisos y propiedad.
+
+Las vistas V$ muestran informacion dinamica de la instancia.
+
+En PostgreSQL, pg_catalog y pg_stat_* cubren necesidades
+relacionadas, aunque sus columnas y semantica son diferentes.
+
+13.11. CONCLUSION OPERATIVA
+
+Las vistas de estadisticas son herramientas esenciales
+para investigar:
+
+- Consultas lentas.
+- Uso de indices.
+- Lecturas de bloques.
+- Escrituras.
+- Archivos temporales.
+- Versiones obsoletas.
+- Actividad transaccional.
+- Problemas de concurrencia.
+
+No se debe interpretar un contador aislado
+sin conocer su periodo estadistico y carga de trabajo.
+
+================================================================================
+14. VERIFICACION FINAL DEL LABORATORIO
+================================================================================
+
+14.1. OBJETIVO
+
+Confirmar que:
+
+- PostgreSQL continua disponible.
+- Los parametros temporales regresaron a sus valores originales.
+- Los objetos de laboratorio permanecen accesibles.
+- Las actividades no modificaron la configuracion global.
+
+14.2. COMANDOS
+
+    docker exec -u postgres postgresql-dba pg_isready -U postgres -d postgres
+
+    docker exec -u postgres postgresql-dba psql -X -U postgres -d nobleprog_architecture_lab -c "SHOW work_mem; SHOW maintenance_work_mem; SELECT (SELECT count(*) FROM operaciones.productos) AS productos, (SELECT count(*) FROM operaciones.pedidos) AS pedidos, (SELECT count(*) FROM operaciones.mvcc_demo) AS filas_mvcc; SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size;"
+
+14.3. RESULTADO FINAL DE NUESTRA VALIDACION
+
+    work_mem = 4MB
+
+    maintenance_work_mem = 64MB
+
+    productos = 1000
+
+    pedidos = 59000
+
+    filas_mvcc = 1
+
+    database_size = 13MB
+
+Estos valores corresponden a nuestra ejecucion de referencia.
+Una repeticion de cargas puede modificar los conteos.
+
+14.4. INTERPRETACION
+
+Los parametros originales se conservaron porque los cambios
+se realizaron mediante SET LOCAL dentro de transacciones.
+
+La base de datos de laboratorio contiene los objetos
+y datos utilizados en los ejercicios.
+
+El tamano de la base refleja almacenamiento de tablas,
+indices y otras estructuras internas.
+
+No es equivalente a sumar solamente el tamano
+de los registros visibles.
+
+================================================================================
+15. MATRIZ FINAL DE EQUIVALENCIAS POSTGRESQL VS ORACLE
+================================================================================
+
++----------------------------+-------------------------------------------+
+| POSTGRESQL                 | ORACLE                                    |
++----------------------------+-------------------------------------------+
+| Proceso backend            | Server process                            |
+| Background Writer          | DBWn                                      |
+| Checkpointer               | CKPT                                      |
+| WAL Writer                 | LGWR                                      |
+| shared_buffers             | Database Buffer Cache                    |
+| work_mem                   | SQL work areas / PGA                     |
+| maintenance_work_mem       | Sin equivalencia exacta                  |
+| WAL                        | Redo                                      |
+| LSN                        | SCN, solo analogia parcial               |
+| MVCC                       | Read consistency mediante Undo           |
+| VACUUM                     | Sin equivalente directo                  |
+| Schema                     | Schema, con diferencias de propiedad     |
+| Tablespace                 | Tablespace                                |
+| pg_catalog                 | Data Dictionary                          |
+| pg_stat_activity           | V$SESSION                                |
+| pg_stat_io                 | Vistas dinamicas de I/O                   |
+| EXPLAIN ANALYZE            | DBMS_XPLAN y estadisticas reales         |
++----------------------------+-------------------------------------------+
+
+REGLA IMPORTANTE:
+
+Una equivalencia conceptual no significa que dos componentes
+tengan la misma implementacion, configuracion o comportamiento.
+
+El objetivo es aprovechar los conocimientos previos de Oracle
+para comprender PostgreSQL, no administrar ambos motores
+como si fueran identicos.
+
+================================================================================
+16. PREGUNTAS DE REFLEXION PARA LOS PARTICIPANTES
+================================================================================
+
+1. Por que PostgreSQL utiliza procesos backend por conexion?
+
+2. Que diferencia existe entre shared_buffers y work_mem?
+
+3. Por que effective_cache_size no debe interpretarse como
+   memoria reservada?
+
+4. Que demuestra external merge dentro de un plan de ejecucion?
+
+5. Por que una consulta puede utilizar mas memoria que work_mem?
+
+6. Que diferencia existe entre work_mem y maintenance_work_mem?
+
+7. Por que una sesion puede observar ORIGINAL mientras otra
+   transaccion ya ejecuto UPDATE?
+
+8. Que representa el cambio de ctid despues de una actualizacion?
+
+9. Que diferencia arquitectonica existe entre MVCC en PostgreSQL
+   y read consistency mediante Undo en Oracle?
+
+10. Que representa el avance del LSN?
+
+11. Por que WAL es importante para recuperacion y replicacion?
+
+12. Por que un checkpoint puede generar escrituras de paginas?
+
+13. Que significa que buffers_clean permanezca en cero?
+
+14. Por que relation_size y total_size pueden ser diferentes?
+
+15. Que diferencia existe entre database, schema y tablespace?
+
+16. Que informacion aporta n_dead_tup al administrador?
+
+17. Por que un contador de estadisticas no siempre refleja
+    inmediatamente una operacion reciente?
+
+18. Que vistas de PostgreSQL utilizarias para investigar
+    un problema que antes analizabas mediante V$SESSION
+    y V$PROCESS en Oracle?
+
+================================================================================
+17. CRITERIOS DE FINALIZACION
+================================================================================
+
+La practica se considera completada cuando los participantes pueden:
+
+[ ] Identificar los principales procesos de PostgreSQL.
+
+[ ] Explicar el papel de shared_buffers.
+
+[ ] Interpretar un ordenamiento externo.
+
+[ ] Diferenciar work_mem y maintenance_work_mem.
+
+[ ] Explicar MVCC utilizando xmin, xmax y ctid.
+
+[ ] Identificar el avance del WAL.
+
+[ ] Interpretar estadisticas de checkpoints.
+
+[ ] Relacionar objetos logicos con archivos fisicos.
+
+[ ] Diferenciar databases, schemas y tablespaces.
+
+[ ] Consultar catalogos y vistas de estadisticas.
+
+[ ] Reconocer equivalencias y diferencias con Oracle.
+
+[ ] Explicar que significa una salida, no solo ejecutar comandos.
+
+================================================================================
+FIN DE LA PRACTICA 03
+================================================================================
