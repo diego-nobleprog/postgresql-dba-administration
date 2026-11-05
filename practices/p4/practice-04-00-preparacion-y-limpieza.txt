@@ -1,0 +1,57 @@
+﻿PRACTICA 04-00 - PREPARACION Y LIMPIEZA
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
+
+OBJETIVO
+Preparar un laboratorio de seguridad aislado logicamente, verificar sus
+dependencias y establecer procedimientos de limpieza seguros.
+
+AMBIENTE
+- Windows 11 / PowerShell 5.1
+- Docker Desktop
+- PostgreSQL 18
+- Contenedor: postgresql-dba
+- Base de datos: nobleprog_security_scenarios
+- Esquema: seguridad
+
+REGLAS DE SEGURIDAD
+1. No modificar bases de datos de practicas anteriores.
+2. No ejecutar cambios destructivos sobre el contenedor principal.
+3. Utilizar un contenedor temporal para pruebas de HBA y TLS.
+4. Evitar credenciales reales.
+5. Restaurar configuraciones y privilegios temporales.
+
+PASO 1 - VERIFICAR EL ENTORNO
+
+docker ps --filter "name=postgresql-dba"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d postgres -c "SELECT version();"
+
+PASO 2 - VERIFICAR LA BASE
+
+docker exec -u postgres postgresql-dba psql -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname='nobleprog_security_scenarios';"
+
+PASO 3 - VERIFICAR LOS DATOS
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT * FROM seguridad.operaciones ORDER BY id;"
+
+RESULTADO ESPERADO
+- PostgreSQL disponible.
+- Base nobleprog_security_scenarios existente.
+- Cuatro operaciones de ejemplo.
+- Dos registros NORTE y dos SUR.
+
+PASO 4 - VERIFICAR EL ESTADO DE GIT
+
+git branch --show-current
+git status
+
+La rama esperada es p4.
+
+LIMPIEZA
+Las guias posteriores incluyen restauraciones especificas.
+No eliminar la base del laboratorio sin una instruccion explicita.
+
+COMPARACION CON ORACLE
+PostgreSQL DATABASE y SCHEMA no corresponden exactamente a Oracle PDB
+y SCHEMA. En PostgreSQL los roles pueden poseer objetos, heredar permisos
+y utilizarse como identidades de autenticacion.

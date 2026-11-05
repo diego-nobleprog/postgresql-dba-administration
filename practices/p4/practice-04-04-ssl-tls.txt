@@ -1,0 +1,76 @@
+﻿PRACTICA 04-04 - SSL/TLS
+
+OBJETIVO
+Diferenciar conexiones cifradas, validacion de certificados y
+verificacion del nombre del servidor.
+
+CONCEPTOS
+ssl=on habilita TLS en PostgreSQL.
+sslmode=disable no utiliza TLS.
+sslmode=require exige TLS.
+sslmode=verify-ca verifica la cadena de confianza.
+sslmode=verify-full verifica confianza y nombre del servidor.
+
+PASO 1 - CONSULTAR ESTADO DEL LABORATORIO PRINCIPAL
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SHOW ssl;"
+
+RESULTADO ESPERADO
+off.
+
+PASO 2 - COMPRENDER LA PRUEBA NEGATIVA
+
+Cuando el servidor tiene ssl=off, una conexion que exige
+sslmode=require debe fallar.
+
+Ese rechazo es correcto: el cliente no debe degradarse
+silenciosamente a una conexion sin cifrar.
+
+PASO 3 - ENTORNO TEMPORAL AISLADO
+
+Para la validacion se utilizo un contenedor PostgreSQL temporal,
+sin puertos publicados y con red externa deshabilitada.
+
+Se genero un certificado autofirmado de laboratorio con:
+
+CN=localhost
+subjectAltName=DNS:localhost
+
+Se protegió la llave privada con permisos 600.
+
+PostgreSQL temporal se inicio con:
+ssl=on
+ssl_cert_file=/tmp/p4-server.crt
+ssl_key_file=/tmp/p4-server.key
+
+PASO 4 - RESULTADOS VERIFICADOS
+
+1. ssl=off + sslmode=require:
+   conexion rechazada.
+
+2. ssl=on + sslmode=require:
+   conexion aceptada.
+
+3. ssl=on + sslmode=verify-full + localhost:
+   conexion aceptada con certificado de confianza configurado.
+
+4. ssl=on + sslmode=verify-full + 127.0.0.1:
+   conexion rechazada por discrepancia de hostname.
+
+5. ssl=on + sslmode=disable:
+   conexion sin TLS aceptada porque HBA no la prohibia.
+
+INTERPRETACION DBA
+Habilitar TLS no significa exigir TLS para todos los clientes.
+Para imponer cifrado deben disenarse reglas HBA adecuadas,
+por ejemplo hostssl y rechazos de conexiones no cifradas.
+
+SEGURIDAD
+Los certificados autofirmados son apropiados para este laboratorio
+controlado, pero no sustituyen una PKI administrada de produccion.
+Nunca distribuir llaves privadas en el repositorio.
+
+COMPARACION CON ORACLE
+Oracle Net puede utilizar TCPS y wallets/certificados.
+PostgreSQL utiliza TLS con configuracion del servidor,
+certificados y opciones sslmode del cliente.

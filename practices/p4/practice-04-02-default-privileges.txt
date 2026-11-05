@@ -1,0 +1,57 @@
+﻿PRACTICA 04-02 - DEFAULT PRIVILEGES
+
+OBJETIVO
+Demostrar que ALTER DEFAULT PRIVILEGES modifica los privilegios de
+objetos futuros, sin alterar retroactivamente objetos existentes.
+
+CONCEPTO
+Los privilegios predeterminados dependen del rol creador del objeto.
+La configuracion IN SCHEMA aplica a objetos futuros en ese esquema.
+
+PRECONDICION
+Verificar que no existan objetos de una ejecucion anterior:
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT tablename FROM pg_tables WHERE schemaname='seguridad' AND tablename LIKE 'dp_%';"
+
+PASO 1 - CREAR TABLA ANTES DE LA REGLA
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SET ROLE seg_owner; CREATE TABLE seguridad.dp_before(id integer PRIMARY KEY);"
+
+PASO 2 - VERIFICAR AUSENCIA DE SELECT
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_auditor','seguridad.dp_before','SELECT');"
+
+Resultado esperado: false.
+
+PASO 3 - CONFIGURAR DEFAULT PRIVILEGES
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "ALTER DEFAULT PRIVILEGES FOR ROLE seg_owner IN SCHEMA seguridad GRANT SELECT ON TABLES TO seg_auditor;"
+
+PASO 4 - CREAR TABLA DESPUES DE LA REGLA
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SET ROLE seg_owner; CREATE TABLE seguridad.dp_after(id integer PRIMARY KEY);"
+
+PASO 5 - COMPROBAR DIFERENCIA
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_auditor','seguridad.dp_before','SELECT') AS antes,has_table_privilege('seg_usuario_auditor','seguridad.dp_after','SELECT') AS despues;"
+
+Resultado esperado:
+antes = false
+despues = true
+
+PASO 6 - RESTAURAR DEFAULT PRIVILEGES
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "ALTER DEFAULT PRIVILEGES FOR ROLE seg_owner IN SCHEMA seguridad REVOKE SELECT ON TABLES FROM seg_auditor;"
+
+PASO 7 - LIMPIEZA
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "DROP TABLE IF EXISTS seguridad.dp_before,seguridad.dp_after;"
+
+PRECAUCION
+Si ocurre un error entre los pasos 3 y 6, ejecutar la restauracion
+de DEFAULT PRIVILEGES antes de continuar.
+
+COMPARACION CON ORACLE
+Oracle puede automatizar concesiones mediante procedimientos,
+triggers DDL u otros mecanismos. PostgreSQL proporciona
+ALTER DEFAULT PRIVILEGES como mecanismo nativo.

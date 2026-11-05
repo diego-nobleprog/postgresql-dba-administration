@@ -1,0 +1,62 @@
+﻿PRACTICA 04-03 - AUTENTICACION Y PG_HBA.CONF
+
+OBJETIVO
+Comprender autenticacion SCRAM-SHA-256 y el orden de evaluacion
+de reglas en pg_hba.conf.
+
+CONCEPTOS
+pg_hba.conf controla las conexiones permitidas y el metodo de autenticacion.
+Las reglas se evaluan en orden: la primera coincidencia determina el resultado.
+SCRAM-SHA-256 es un mecanismo de autenticacion basado en contrasenas.
+Una regla reject deniega una conexion coincidente.
+
+PASO 1 - INSPECCIONAR CONFIGURACION
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SHOW password_encryption;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SHOW hba_file;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT rule_number,type,database,user_name,address,auth_method,error FROM pg_hba_file_rules ORDER BY rule_number;"
+
+RESULTADO ESPERADO
+password_encryption = scram-sha-256.
+Reglas IPv4 localhost con autenticacion SCRAM.
+Sin errores de parseo de HBA.
+
+PASO 2 - PROBAR CONEXION REAL
+
+$env:PGPASSWORD = "LabNorte_2026!"
+
+docker exec -e "PGPASSWORD=$env:PGPASSWORD" -e "PGSSLMODE=disable" -u postgres postgresql-dba psql -X -w -h 127.0.0.1 -U seg_usuario_norte -d nobleprog_security_scenarios -c "SELECT current_user;"
+
+Remove-Item Env:PGPASSWORD
+
+RESULTADO ESPERADO
+La conexion se autentica como seg_usuario_norte.
+
+PASO 3 - INTERPRETAR EL CICLO HBA
+
+En un contenedor temporal aislado se valido:
+
+BEFORE:
+host all all 127.0.0.1/32 trust
+La conexion TCP fue permitida.
+
+AFTER:
+host all all 127.0.0.1/32 reject
+Tras pg_reload_conf(), la conexion fue rechazada.
+
+RESTORE:
+host all all 127.0.0.1/32 trust
+Tras restaurar y recargar, la conexion volvio a funcionar.
+
+IMPORTANTE
+trust se utilizo exclusivamente para ilustrar la precedencia
+de reglas dentro de un contenedor aislado y sin red externa.
+No utilizar trust como configuracion recomendada de produccion.
+No modificar pg_hba.conf del contenedor principal para este ejercicio.
+
+COMPARACION CON ORACLE
+Oracle utiliza mecanismos como autenticacion de base de datos,
+Oracle Net y controles de acceso de red. pg_hba.conf es especifico
+de PostgreSQL y determina el metodo de autenticacion por conexion.

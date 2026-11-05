@@ -1,0 +1,58 @@
+﻿PRACTICA 04-01 - ROLES Y PRIVILEGIOS
+
+OBJETIVO
+Comprender LOGIN, NOLOGIN, herencia de roles, GRANT, REVOKE y minimo privilegio.
+
+CONCEPTOS
+LOGIN permite autenticarse.
+NOLOGIN permite crear roles de agrupacion o propiedad.
+GRANT concede privilegios.
+REVOKE retira privilegios.
+Los privilegios efectivos pueden provenir de membresias.
+
+CONTEXTO DEL LABORATORIO
+seg_owner: propietario de objetos, NOLOGIN.
+seg_operador: rol de operaciones, NOLOGIN.
+seg_auditor: rol de lectura, NOLOGIN.
+seg_usuario_norte: LOGIN, miembro de seg_operador.
+seg_usuario_sur: LOGIN, miembro de seg_operador.
+seg_usuario_auditor: LOGIN, miembro de seg_auditor.
+
+PASO 1 - EXAMINAR ROLES
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT rolname,rolcanlogin,rolsuper,rolbypassrls FROM pg_roles WHERE rolname LIKE 'seg_%' ORDER BY rolname;"
+
+PASO 2 - EXAMINAR MEMBRESIAS
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT member::regrole AS usuario,roleid::regrole AS rol FROM pg_auth_members WHERE member IN (SELECT oid FROM pg_roles WHERE rolname LIKE 'seg_usuario_%');"
+
+PASO 3 - VERIFICAR PRIVILEGIOS
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_norte','seguridad.operaciones','SELECT') AS norte_select,has_table_privilege('seg_usuario_norte','seguridad.operaciones','DELETE') AS norte_delete,has_table_privilege('seg_usuario_auditor','seguridad.operaciones','SELECT') AS auditor_select;"
+
+RESULTADO ESPERADO
+norte_select = true
+norte_delete = false
+auditor_select = true
+
+PASO 4 - REVOKE Y RESTAURACION
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "REVOKE UPDATE ON seguridad.operaciones FROM seg_operador;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_norte','seguridad.operaciones','UPDATE');"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "GRANT UPDATE ON seguridad.operaciones TO seg_operador;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_norte','seguridad.operaciones','UPDATE');"
+
+INTERPRETACION
+La revocacion afecta a los usuarios que dependen de la membresia.
+La restauracion devuelve el privilegio esperado.
+
+PRECAUCION
+El bloque anterior presupone el estado inicial validado de P4.
+No ejecutarlo sobre una base productiva.
+
+COMPARACION CON ORACLE
+Oracle dispone de CREATE ROLE, GRANT y REVOKE. PostgreSQL unifica
+usuarios y grupos bajo el concepto de ROLE, diferenciados por atributos.

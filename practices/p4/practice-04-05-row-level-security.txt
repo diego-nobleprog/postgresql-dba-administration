@@ -1,0 +1,66 @@
+﻿PRACTICA 04-05 - ROW LEVEL SECURITY
+
+OBJETIVO
+Implementar filtrado de filas segun la identidad del usuario.
+
+CONCEPTO
+RLS permite restringir las filas visibles o modificables.
+Una politica USING controla que filas son accesibles.
+WITH CHECK controla las filas nuevas o modificadas.
+Las politicas pueden variar por comando y rol.
+
+CONTEXTO
+La tabla seguridad.operaciones contiene registros NORTE y SUR.
+Los usuarios operativos deben ver solamente su sucursal.
+El auditor puede consultar ambas.
+
+PASO 1 - COMPROBAR ESTADO INICIAL
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT relrowsecurity FROM pg_class WHERE oid='seguridad.operaciones'::regclass;"
+
+Resultado esperado: false.
+
+PASO 2 - CREAR POLITICA DE OPERADORES
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "CREATE POLICY p4_norte_sur ON seguridad.operaciones FOR SELECT TO seg_operador USING ((current_user='seg_usuario_norte' AND sucursal='NORTE') OR (current_user='seg_usuario_sur' AND sucursal='SUR'));"
+
+PASO 3 - CREAR POLITICA DEL AUDITOR
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "CREATE POLICY p4_auditor ON seguridad.operaciones FOR SELECT TO seg_auditor USING (true);"
+
+PASO 4 - HABILITAR RLS
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "ALTER TABLE seguridad.operaciones ENABLE ROW LEVEL SECURITY;"
+
+PASO 5 - COMPROBAR NORTE
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SET ROLE seg_usuario_norte; SELECT sucursal,concepto,monto FROM seguridad.operaciones ORDER BY id;"
+
+Resultado esperado: dos registros NORTE.
+
+PASO 6 - COMPROBAR SUR
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SET ROLE seg_usuario_sur; SELECT sucursal,concepto,monto FROM seguridad.operaciones ORDER BY id;"
+
+Resultado esperado: dos registros SUR.
+
+PASO 7 - COMPROBAR AUDITOR
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SET ROLE seg_usuario_auditor; SELECT COUNT(*) FROM seguridad.operaciones;"
+
+Resultado esperado: cuatro registros.
+
+PASO 8 - RESTAURAR CONFIGURACION
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "ALTER TABLE seguridad.operaciones DISABLE ROW LEVEL SECURITY; DROP POLICY IF EXISTS p4_norte_sur ON seguridad.operaciones; DROP POLICY IF EXISTS p4_auditor ON seguridad.operaciones;"
+
+IMPORTANTE
+La practica valida politicas SELECT. Para INSERT y UPDATE se
+requieren politicas adicionales y pruebas de WITH CHECK.
+Superusuarios y roles BYPASSRLS pueden eludir las politicas.
+El propietario normalmente tambien puede eludirlas, salvo FORCE RLS.
+
+COMPARACION CON ORACLE
+Oracle Virtual Private Database (VPD) ofrece restricciones
+de acceso a filas mediante politicas y predicados.
+PostgreSQL dispone de RLS nativo con CREATE POLICY.

@@ -1,0 +1,79 @@
+﻿PRACTICA 04-06 - HARDENING Y AUDITORIA
+
+OBJETIVO
+Aplicar criterios de minimo privilegio y revisar parametros
+relevantes de registro y auditoria.
+
+CONCEPTOS
+Hardening reduce la superficie de ataque.
+La auditoria permite reconstruir eventos y acciones relevantes.
+El logging nativo proporciona visibilidad operativa, pero
+no equivale automaticamente a una auditoria completa.
+
+PASO 1 - REVISAR SUPERUSUARIOS Y BYPASSRLS
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT rolname,rolsuper,rolbypassrls FROM pg_roles WHERE rolname LIKE 'seg_%' ORDER BY rolname;"
+
+RESULTADO ESPERADO
+Ningun rol seg_ es superusuario.
+Ningun rol seg_ tiene BYPASSRLS.
+
+PASO 2 - REVISAR PRIVILEGIOS PUBLIC DEL ESQUEMA
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace n, LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='seguridad' AND a.grantee=0 AND a.privilege_type='USAGE') AS sin_usage_public;"
+
+Resultado esperado: true.
+
+PASO 3 - REVISAR PERMISOS DEL AUDITOR
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_auditor','seguridad.operaciones','SELECT') AS puede_leer,has_table_privilege('seg_usuario_auditor','seguridad.operaciones','DELETE') AS puede_borrar;"
+
+Resultado esperado:
+puede_leer = true
+puede_borrar = false
+
+PASO 4 - REVISAR CONFIGURACION DE LOGGING
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT name,setting FROM pg_settings WHERE name IN ('logging_collector','log_connections','log_disconnections','log_statement','log_line_prefix','log_min_duration_statement') ORDER BY name;"
+
+PARAMETROS RELEVANTES
+logging_collector: captura logs hacia archivos.
+log_connections: registra intentos o eventos de conexion segun configuracion.
+log_disconnections: registra desconexiones.
+log_statement: controla el registro de sentencias.
+log_line_prefix: define metadatos de cada entrada.
+log_min_duration_statement: registra consultas lentas.
+
+PASO 5 - INTERPRETACION
+Analizar el nivel de visibilidad y sus costos:
+- Volumen de logs.
+- Informacion sensible potencialmente registrada.
+- Retencion y proteccion.
+- Rotacion.
+- Acceso restringido.
+- Integracion con observabilidad y alertamiento.
+
+PASO 6 - VERIFICAR INTEGRIDAD DEL LABORATORIO
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT COUNT(*) FROM seguridad.operaciones;"
+
+Resultado esperado: 4.
+
+RECOMENDACIONES DBA
+Evitar cuentas compartidas.
+No otorgar SUPERUSER por comodidad.
+Separar roles de propiedad y operacion.
+Utilizar SCRAM y TLS donde corresponda.
+Revisar permisos PUBLIC.
+Proteger logs, certificados y credenciales.
+Auditar periodicamente roles, privilegios y configuracion.
+
+COMPARACION CON ORACLE
+Oracle Unified Auditing y privilegios de sistema permiten
+controles avanzados. PostgreSQL proporciona logging nativo
+y puede ampliarse con herramientas como pgAudit.
+
+CIERRE
+El laboratorio principal fue validado mediante 37 pruebas.
+La validacion aislada de HBA y TLS agrego 17 pruebas.
+Total: 54 pruebas aprobadas, sin fallos.
