@@ -1,0 +1,115 @@
+﻿\set ON_ERROR_STOP on
+
+\echo === BEFORE: BASE DE SEGURIDAD ===
+
+SELECT datname
+FROM pg_database
+WHERE datname = 'nobleprog_security_scenarios';
+
+\echo === CREAR BASE SI NO EXISTE ===
+
+SELECT 'CREATE DATABASE nobleprog_security_scenarios'
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM pg_database
+    WHERE datname = 'nobleprog_security_scenarios'
+)
+\gexec
+
+\connect nobleprog_security_scenarios
+
+\echo === CREAR ROLES DEL LABORATORIO ===
+
+SET password_encryption = 'scram-sha-256';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_owner') THEN
+        CREATE ROLE seg_owner NOLOGIN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_operador') THEN
+        CREATE ROLE seg_operador NOLOGIN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_auditor') THEN
+        CREATE ROLE seg_auditor NOLOGIN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_usuario_norte') THEN
+        CREATE ROLE seg_usuario_norte LOGIN PASSWORD 'LabNorte_2026!';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_usuario_sur') THEN
+        CREATE ROLE seg_usuario_sur LOGIN PASSWORD 'LabSur_2026!';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'seg_usuario_auditor') THEN
+        CREATE ROLE seg_usuario_auditor LOGIN PASSWORD 'LabAuditor_2026!';
+    END IF;
+END
+$$;
+
+GRANT seg_operador TO seg_usuario_norte;
+GRANT seg_operador TO seg_usuario_sur;
+GRANT seg_auditor TO seg_usuario_auditor;
+
+\echo === CREAR ESQUEMA Y DATOS ===
+
+CREATE SCHEMA IF NOT EXISTS seguridad AUTHORIZATION seg_owner;
+
+CREATE TABLE IF NOT EXISTS seguridad.operaciones (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sucursal text NOT NULL,
+    concepto text NOT NULL,
+    monto numeric(12,2) NOT NULL
+);
+
+INSERT INTO seguridad.operaciones (sucursal, concepto, monto)
+SELECT v.sucursal, v.concepto, v.monto
+FROM (
+    VALUES
+        ('NORTE', 'Venta de equipo', 15000.00),
+        ('NORTE', 'Servicio tecnico', 2500.00),
+        ('SUR', 'Venta de accesorios', 3200.00),
+        ('SUR', 'Mantenimiento', 1800.00)
+) AS v(sucursal, concepto, monto)
+WHERE NOT EXISTS (SELECT 1 FROM seguridad.operaciones);
+
+ALTER TABLE seguridad.operaciones OWNER TO seg_owner;
+
+\echo === ASIGNAR PRIVILEGIOS INICIALES ===
+
+REVOKE ALL ON SCHEMA seguridad FROM PUBLIC;
+REVOKE ALL ON TABLE seguridad.operaciones FROM PUBLIC;
+
+GRANT CONNECT ON DATABASE nobleprog_security_scenarios
+TO seg_usuario_norte, seg_usuario_sur, seg_usuario_auditor;
+
+GRANT USAGE ON SCHEMA seguridad TO seg_operador, seg_auditor;
+
+GRANT SELECT, INSERT, UPDATE ON seguridad.operaciones TO seg_operador;
+GRANT SELECT ON seguridad.operaciones TO seg_auditor;
+
+\echo === AFTER: ROLES ===
+
+SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole
+FROM pg_roles
+WHERE rolname LIKE 'seg_%'
+ORDER BY rolname;
+
+\echo === AFTER: PROPIETARIOS ===
+
+SELECT n.nspname AS esquema,
+       c.relname AS tabla,
+       pg_get_userbyid(c.relowner) AS propietario
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'seguridad'
+  AND c.relkind IN ('r', 'p');
+
+\echo === AFTER: DATOS ===
+
+SELECT * FROM seguridad.operaciones ORDER BY id;
+
+\echo === PREPARACION COMPLETADA ===
