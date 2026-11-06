@@ -1,0 +1,22 @@
+$ErrorActionPreference = "Stop"
+
+Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+Get-Content -Raw ".\practices\p4\scripts\setup.txt" | docker exec -i -u postgres postgresql-dba psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+if ($LASTEXITCODE -ne 0) {
+    throw "ERROR: Fallo la preparacion del modulo de Seguridad."
+}
+
+Write-Host ""
+Write-Host "=== PREPARACION EJECUTADA ==="
+
+
+---
+
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT sucursal, COUNT(*) AS operaciones, SUM(monto) AS total FROM seguridad.operaciones GROUP BY sucursal ORDER BY sucursal;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname LIKE 'seg_%' ORDER BY rolname;"
+
+docker exec -u postgres postgresql-dba psql -U postgres -d nobleprog_security_scenarios -c "SELECT has_table_privilege('seg_usuario_norte','seguridad.operaciones','SELECT') AS norte_select, has_table_privilege('seg_usuario_norte','seguridad.operaciones','DELETE') AS norte_delete, has_table_privilege('seg_usuario_auditor','seguridad.operaciones','SELECT') AS auditor_select;"
