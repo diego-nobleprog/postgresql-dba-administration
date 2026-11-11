@@ -1,0 +1,197 @@
+PRACTICA 06.05 - XID Y MANTENIMIENTO PREVENTIVO
+
+SITUACION Y PREGUNTA CENTRAL
+
+El DBA debe anticipar acumulacion de versiones, estadisticas atrasadas
+y problemas de antiguedad transaccional.
+¿Que evidencia permite decidir una accion antes de una emergencia?
+
+OBJETIVO
+
+Observar congelacion de XID y construir un diagnostico preventivo.
+No se fuerza un wraparound ni se simula la cercania real a sus limites.
+
+PREPARACION Y CONEXION
+
+Seguir el recorrido de 06.00 a 06.04.
+freeze_work debe conservar sus 1000 filas y no haber recibido VACUUM FREEZE.
+
+PowerShell:
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+psql:
+
+\pset pager off
+SET application_name='p6_manual_freeze';
+
+1. GENERAR UNA EDAD OBSERVABLE
+
+\o /tmp/nobleprog-p6-lab/evidence/manual-xid-advance.txt
+\i /tmp/p6-scripts/05-advance-xid.sql
+\o
+
+El archivo contiene 200 llamadas a pg_current_xact_id().
+Sin BEGIN exterior, cada sentencia trabaja en su transaccion autocommit.
+La funcion asigna un identificador a la transaccion que lo necesita.
+
+No usar solamente SELECT 1 para intentar consumir XID: una consulta
+de lectura no requiere necesariamente un identificador transaccional.
+
+La salida se conserva en manual-xid-advance.txt.
+Los participantes deben distinguir asignacion de XID de numero de consultas.
+
+2. BEFORE: MEDIR EL HORIZONTE DE LA TABLA
+
+SELECT age(relfrozenxid) AS xid_age_before
+FROM pg_class
+WHERE oid='maintenance.freeze_work'::regclass \gset
+
+SELECT relname,relfrozenxid,age(relfrozenxid) AS xid_age,
+       relpages,relallvisible,relallfrozen,
+       pg_relation_size(oid) AS heap_bytes
+FROM pg_class WHERE oid='maintenance.freeze_work'::regclass;
+
+Referencia temporal: edad 238.
+La edad es una distancia transaccional, no segundos ni horas.
+El valor exacto varia con otras transacciones de la instancia.
+
+relpages es informacion de catalogo y puede estar atrasada.
+Antes de mantenimiento se observaron 0 paginas en ese campo aunque habia
+1000 filas. pg_relation_size permite consultar el tamano fisico actual.
+
+3. CONGELAR Y MEDIR AFTER
+
+VACUUM (FREEZE, VERBOSE) maintenance.freeze_work;
+
+SELECT relname,relfrozenxid,age(relfrozenxid) AS xid_age,
+       relpages,relallvisible,relallfrozen,
+       age(relfrozenxid) < :'xid_age_before'::integer AS age_reduced
+FROM pg_class WHERE oid='maintenance.freeze_work'::regclass;
+
+SELECT count(*) FROM maintenance.freeze_work;
+
+Evidencia temporal:
+- edad de 238 a 0.
+- 9 paginas, todas all-frozen.
+- 1000 filas conservadas.
+
+FREEZE realiza una congelacion agresiva. relfrozenxid representa un
+horizonte de la relacion; su avance no elimina las filas del negocio.
+No interpretar el valor de una columna xmin aislada como una prueba
+completa del estado interno de congelacion.
+
+El proceso de mantenimiento es intencionalmente persistente:
+no se intenta retroceder relfrozenxid. Los datos iniciales se recuperan
+recreando el laboratorio, no manipulando identificadores internos.
+
+4. DIFERENCIAR HORIZONTES DE TABLA Y BASE
+
+SELECT datname,datfrozenxid,age(datfrozenxid) AS xid_age,
+       current_setting('autovacuum_freeze_max_age') AS freeze_max_age
+FROM pg_database WHERE datallowconn
+ORDER BY age(datfrozenxid) DESC;
+
+La tabla recien congelada puede tener edad 0 y la base una edad mayor.
+El horizonte de la base depende del conjunto de relaciones relevantes,
+no solamente de la tabla elegida para la demostracion.
+
+El parametro freeze_max_age es un umbral de mantenimiento automatico,
+no una expresion directa del tiempo restante hasta wraparound.
+Las 200 transacciones de este laboratorio no reproducen una emergencia.
+
+5. REVISAR TABLAS Y MANTENIMIENTO
+
+SELECT c.relname,age(c.relfrozenxid) AS xid_age,
+       c.relpages,c.relallvisible,c.relallfrozen,
+       s.n_live_tup,s.n_dead_tup,
+       s.last_vacuum,s.last_autovacuum,
+       s.last_analyze,s.last_autoanalyze
+FROM pg_class c
+JOIN pg_namespace n ON n.oid=c.relnamespace
+LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid
+WHERE n.nspname='maintenance' AND c.relkind='r'
+ORDER BY age(c.relfrozenxid) DESC;
+
+Interpretar junto con el historial de esta practica:
+- distribution puede conservar unas 17900 versiones obsoletas:
+  recibio UPDATE y ANALYZE, pero no VACUUM.
+- auto_work debe mostrar las ejecuciones automaticas observadas en 06.04.
+- freeze_work permite comprobar la congelacion reciente.
+- n_live_tup de mvcc_work puede diferir de COUNT(*).
+
+Una estadistica estimada no demuestra perdida de datos.
+Una fecha nula no demuestra por si sola una averia: considerar creacion,
+carga, reinicios o reinicio de contadores y mantenimiento realizado.
+
+6. BUSCAR RETENCIONES Y ACTIVIDAD
+
+SELECT pid,application_name,state,
+       clock_timestamp()-xact_start AS transaction_age,
+       backend_xmin,age(backend_xmin) AS xmin_age
+FROM pg_stat_activity WHERE xact_start IS NOT NULL
+ORDER BY xact_start;
+
+SELECT gid,prepared,owner,database FROM pg_prepared_xacts;
+
+SELECT slot_name,slot_type,active,xmin,catalog_xmin,restart_lsn
+FROM pg_replication_slots;
+
+Resultado de referencia: ninguna transaccion preparada ni slot.
+Estas consultas amplian el diagnostico; no prueban aqui el comportamiento
+de prepared transactions o replicacion, porque no se crearon esos escenarios.
+
+Revisar transacciones prolongadas, estado y horizontes antes de decidir.
+No cancelar sesiones o eliminar slots unicamente por aparecer en la lista.
+
+7. ACTIVIDAD GUIADA DE DIAGNOSTICO
+
+Los participantes deben entregar una conclusion para cada pregunta:
+
+a) ¿Hay versiones obsoletas? ¿Son estimaciones o conteos exactos?
+b) ¿Existe una transaccion que pueda impedir la limpieza?
+c) ¿Las estadisticas representan la distribucion actual?
+d) ¿Se demostraron ejecuciones automaticas mediante contadores y fechas?
+e) ¿Que relaciones presentan mayor edad de XID en esta instancia?
+f) ¿Conviene VACUUM, ANALYZE, investigar una retencion o evaluar
+   una reescritura con ventana y espacio de trabajo?
+
+Toda recomendacion debe indicar evidencia, accion propuesta, impacto
+esperado y comprobacion posterior.
+El laboratorio no establece umbrales universales de alertas para produccion.
+
+COMPARACION CON ORACLE
+
+El identificador XID, la congelacion y la proteccion antiwraparound
+pertenecen al mecanismo transaccional de PostgreSQL.
+No equiparar su edad con SCN, undo retention ni una rutina Oracle
+de mantenimiento que pueda sustituir VACUUM FREEZE.
+
+La comparacion util es operativa: ambos entornos requieren observar
+transacciones, almacenamiento y estadisticas con sus herramientas propias.
+
+CONCLUSION Y CIERRE
+
+Los participantes deben separar prevencion de emergencia, interpretar
+las edades sin convertirlas a tiempo y justificar acciones de mantenimiento.
+
+Salir con \q.
+Ejecutar el cierre controlado de 06.00 para restaurar configuracion,
+verificar el estado final, preservar evidencias y eliminar el contenedor
+del recorrido guiado.
+
+ALTERNATIVA AUTOMATIZADA
+
+En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+
+docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/05-freeze-mantenimiento.sh
+if ($LASTEXITCODE -ne 0) { throw "Fallo 05-freeze-mantenimiento.sh." }
+
+La restauracion y detencion se realizan posteriormente con
+99-cleanup-lab.sh, como indica 06.00.
+
+FUENTES
+
+https://www.postgresql.org/docs/18/transaction-id.html
+https://www.postgresql.org/docs/18/routine-vacuuming.html
+https://www.postgresql.org/docs/18/monitoring-stats.html

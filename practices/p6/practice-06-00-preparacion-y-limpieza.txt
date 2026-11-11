@@ -1,0 +1,291 @@
+PRACTICA 06.00 - PREPARACION Y LIMPIEZA
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
+
+OBJETIVO Y ARQUITECTURA
+
+Construir un entorno reproducible para observar MVCC, limpieza de versiones,
+reescritura, estadisticas, mantenimiento automatico y congelacion de XID.
+
+Windows PowerShell controla Docker. PostgreSQL se ejecuta como postgres
+dentro de un contenedor Linux sin puertos publicados y sin acceso de red.
+Las conexiones usan un socket Unix dentro del contenedor.
+
+Imagen: postgresql-dba:18-p1
+Version observada en la validacion temporal: PostgreSQL 18.6.
+Contenedor guiado: p6-maintenance-lab
+Etiqueta: nobleprog.p6.lab=true
+Scripts Linux: /tmp/p6-scripts
+Cluster: /tmp/nobleprog-p6-lab/data
+Socket: /tmp/nobleprog-p6-lab/socket
+Puerto del socket: 5546
+Base: nobleprog_maintenance_scenarios
+Esquema: maintenance
+
+El puerto 5546 identifica el socket interno; no se publica en Windows.
+La autenticacion trust del cluster es exclusiva de este entorno aislado.
+
+REQUISITOS
+
+Docker Desktop iniciado, imagen disponible y repositorio en la rama p6.
+Ejecutar PowerShell desde:
+C:\Users\student\Desktop\postgresql-dba-administration
+
+Las rutas de scripts deben existir en practices/p6/scripts/.
+No se necesitan archivos de temp/ para construir este laboratorio.
+
+MODOS DE TRABAJO
+
+Elegir un recorrido para cada instancia nueva:
+
+A. Guiado: preparar y ejecutar los comandos interactivos de 06.01 a 06.05.
+B. Scripts separados: preparar y ejecutar los cinco scripts, en orden.
+C. Auditoria completa: ejecutar run-validation.sh en otro contenedor nuevo.
+
+A y B modifican las mismas tablas. No ejecutar ambos sobre una misma carga.
+Para repetir, cerrar el laboratorio, eliminar su contenedor identificado
+y crear otro desde esta guia. La preparacion rechaza un cluster existente.
+
+1. CREAR EL LABORATORIO GUIADO - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+    $branch = git branch --show-current
+    if ($LASTEXITCODE -ne 0 -or $branch -ne "p6") {
+        throw "Debes estar en p6."
+    }
+
+    $names = @(docker container ls -a --format '{{.Names}}')
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar Docker." }
+    if ($names -contains "p6-maintenance-lab") {
+        throw "El contenedor ya existe. No se sobrescribira."
+    }
+
+    docker create --name p6-maintenance-lab --network none --label nobleprog.p6.lab=true --entrypoint /bin/bash postgresql-dba:18-p1 /tmp/p6-scripts/00-start-container.sh manual
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo crear el contenedor." }
+
+    docker cp ".\practices\p6\scripts" "p6-maintenance-lab:/tmp/p6-scripts"
+    if ($LASTEXITCODE -ne 0) { throw "No se pudieron copiar los scripts." }
+
+    docker start p6-maintenance-lab
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo iniciar el contenedor." }
+
+    $ready = $false
+    for ($attempt = 1; $attempt -le 60; $attempt++) {
+        $logs = @(docker logs p6-maintenance-lab)
+        if ($LASTEXITCODE -ne 0) { throw "No se pudieron leer los logs." }
+        if ($logs -contains "LABORATORIO MANUAL PREPARADO") {
+            $ready = $true
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    docker logs p6-maintenance-lab
+    if (-not $ready) {
+        throw "No se confirmo la preparacion. Revisar los logs."
+    }
+
+    docker exec -u postgres p6-maintenance-lab pg_ctl -D /tmp/nobleprog-p6-lab/data status
+    if ($LASTEXITCODE -ne 0) { throw "PostgreSQL no esta disponible." }
+}
+
+El lanzador comprueba sintaxis Bash y ejecuta 00-prepare-lab.sh.
+Ese script inicializa el cluster, configura el socket, crea la base y
+el esquema, construye las tablas y carga los datos.
+
+No es solamente una comprobacion de existencia: crea el entorno desde cero.
+Tambien conserva la configuracion original y genera restore.sql.
+
+Resultado esperado:
+- mvcc_work: 10000 filas.
+- bloat_work: 30000 filas.
+- distribution: 20000 filas; 100 con estado raro.
+- auto_work: vacia; se carga en 06.04.
+- freeze_work: 1000 filas.
+- Autovacuum global habilitado.
+- Mantenimiento automatico ordinario deshabilitado en las cinco tablas
+  para controlar los primeros experimentos.
+
+2. CONECTAR UNA SESION INTERACTIVA - POWERSHELL
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+Dentro de psql:
+
+\pset pager off
+SELECT current_database(),current_user,version();
+SELECT count(*) FROM maintenance.mvcc_work;
+SELECT count(*) FROM maintenance.bloat_work;
+SELECT count(*) FROM maintenance.distribution;
+SELECT count(*) FROM maintenance.auto_work;
+SELECT count(*) FROM maintenance.freeze_work;
+\q
+
+Para A, B y C, abrir terminales PowerShell distintas y repetir la conexion.
+No introducir comandos Docker dentro de psql ni comandos SQL en PowerShell.
+
+3. ORDEN DE LOS ESCENARIOS
+
+06.01 MVCC, versiones obsoletas y VACUUM.
+06.02 Bloat y VACUUM FULL.
+06.03 ANALYZE y estadisticas.
+06.04 Autovacuum y Autoanalyze.
+06.05 Congelacion de XID y diagnostico preventivo.
+
+Cada guia explica sus resultados y la comparacion con Oracle.
+Los participantes deben interpretar las salidas antes de continuar.
+
+4. ALTERNATIVA: SCRIPTS SEPARADOS - POWERSHELL
+
+Usar una carga recien preparada y no ejecutar las operaciones manuales.
+Este bloque procesa los escenarios en orden y se detiene ante un error.
+
+& {
+    $ErrorActionPreference = "Stop"
+    $scripts = @(
+        "01-mvcc-vacuum.sh",
+        "02-bloat-vacuum-full.sh",
+        "03-analyze-estadisticas.sh",
+        "04-autovacuum-autoanalyze.sh",
+        "05-freeze-mantenimiento.sh"
+    )
+    foreach ($script in $scripts) {
+        docker exec -u postgres p6-maintenance-lab /bin/bash "/tmp/p6-scripts/$script"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Fallo el escenario: $script"
+        }
+    }
+}
+
+Los scripts conservan los cambios de datos para inspeccion.
+Los ajustes temporales se restauran con 99-cleanup-lab.sh.
+No repetir un script sobre las mismas tablas: recrear el laboratorio.
+
+5. AUDITORIA COMPLETA EN OTRO CONTENEDOR - POWERSHELL
+
+Esta alternativa prepara, prueba, restaura y detiene la instancia.
+No utiliza el contenedor del recorrido guiado.
+
+& {
+    $ErrorActionPreference = "Stop"
+    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+    $name = "p6-maintenance-validation"
+    $names = @(docker container ls -a --format '{{.Names}}')
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar Docker." }
+    if ($names -contains $name) { throw "El contenedor ya existe." }
+
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+    $token = [Guid]::NewGuid().ToString("N")
+    $logPath = Join-Path (Get-Location).Path "temp\p6-published-$token.txt"
+    $evidencePath = Join-Path (Get-Location).Path "temp\p6-evidence-$token"
+
+    docker create --name $name --network none --label nobleprog.p6.lab=true --entrypoint /bin/bash postgresql-dba:18-p1 /tmp/p6-scripts/00-start-container.sh validate
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo crear el contenedor." }
+
+    docker cp ".\practices\p6\scripts" "${name}:/tmp/p6-scripts"
+    if ($LASTEXITCODE -ne 0) { throw "No se pudieron copiar los scripts." }
+
+    $output = @(docker start -a $name | ForEach-Object {
+        Write-Host $_
+        [string]$_
+    })
+    $runCode = $LASTEXITCODE
+
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($logPath,[string[]]$output,$utf8)
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar el contenedor." }
+    $info = @((($raw -join [Environment]::NewLine) | ConvertFrom-Json))[0]
+
+    docker cp "${name}:/tmp/nobleprog-p6-lab/evidence" $evidencePath
+    if ($LASTEXITCODE -ne 0) { throw "No se pudieron copiar las evidencias." }
+
+    Write-Output "Evidencia: $logPath"
+    if ($runCode -ne 0 -or $info.State.ExitCode -ne 0) {
+        throw "La auditoria requiere revision."
+    }
+
+    foreach ($line in @(
+        "00: PASS","01: PASS","02: PASS",
+        "03: PASS","04: PASS","05: PASS",
+        "TOTAL FAIL: 0","CODIGO EJECUTOR: 0",
+        "RESULTADO: VALIDACION TEMPORAL EXITOSA",
+        "=== FIN VALIDACION P6 ==="
+    )) {
+        if ($output -notcontains $line) {
+            throw "No se encontro la evidencia: $line"
+        }
+    }
+}
+
+Referencia temporal: 41 PASS, 0 FAIL y codigo 0.
+Comprobar tambien los resultados intermedios: un resumen aislado no basta.
+La auditoria completa no demuestra por si sola que todas las instrucciones
+interactivas de estos TXT hayan sido reproducidas.
+
+6. RESTAURACION Y LIMPIEZA DEL LABORATORIO GUIADO - POWERSHELL
+
+Cerrar las sesiones psql con ROLLBACK si corresponde y luego con \q.
+Ejecutar el cierre cuando termine la actividad autorizada:
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p6-maintenance-lab"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar el contenedor." }
+    $info = @((($raw -join [Environment]::NewLine) | ConvertFrom-Json))[0]
+
+    if ($info.Config.Labels.'nobleprog.p6.lab' -ne "true") {
+        throw "El contenedor no tiene la etiqueta del laboratorio."
+    }
+
+    docker exec -u postgres $name /bin/bash /tmp/p6-scripts/99-cleanup-lab.sh
+    if ($LASTEXITCODE -ne 0) {
+        throw "El cierre fallo. Conservar el contenedor para diagnostico."
+    }
+
+    docker exec $name test ! -e /tmp/nobleprog-p6-lab/data/postmaster.pid
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se confirmo la ausencia de postmaster.pid."
+    }
+
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+    $token = [Guid]::NewGuid().ToString("N")
+    docker cp "${name}:/tmp/nobleprog-p6-lab/evidence" ".\temp\p6-manual-evidence-$token"
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudieron conservar las evidencias."
+    }
+
+    docker rm -f $name
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo eliminar el contenedor." }
+}
+
+99-cleanup-lab.sh restaura opciones de tablas y postgresql.auto.conf,
+verifica los estados BEFORE/AFTER y detiene PostgreSQL.
+La eliminacion posterior descarta los datos de ese laboratorio.
+No es una restauracion logica de las filas originales: repetir requiere
+crear otro contenedor y volver a cargar mediante esta guia.
+
+El contenedor de auditoria completa queda detenido y conservado.
+Su eliminacion debe comprobar separadamente nombre, etiqueta y estado.
+No utilizar limpieza global de Docker.
+
+INTERPRETACION Y COMPARACION CON ORACLE
+
+Las sesiones A/B/C representan conexiones independientes, como varias
+sesiones SQL*Plus o SQL Developer. El aislamiento del contenedor protege
+el entorno principal, pero no sustituye las verificaciones transaccionales.
+
+La preparacion, la ejecucion y la limpieza son etapas distintas.
+Una instancia detenida no implica que su contenedor haya sido eliminado.
+Las guias y scripts del repositorio deben conservarse al cerrar el entorno.
+
+FUENTES
+
+https://www.postgresql.org/docs/18/routine-vacuuming.html
+https://www.postgresql.org/docs/18/sql-vacuum.html

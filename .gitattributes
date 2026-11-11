@@ -1,0 +1,5 @@
+
+# P6: preserve LF in course material
+practices/p6/scripts/*.sh text eol=lf
+practices/p6/scripts/*.sql text eol=lf
+practices/p6/*.txt text eol=lf

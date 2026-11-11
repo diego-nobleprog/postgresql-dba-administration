@@ -1,0 +1,158 @@
+PRACTICA 06.03 - ANALYZE Y ESTADISTICAS
+
+SITUACION Y PREGUNTA CENTRAL
+
+Un valor antes infrecuente pasa a representar casi toda una tabla.
+¿El planificador sigue estimando con una distribucion anterior?
+
+OBJETIVO
+
+Relacionar distribucion, estadisticas y estimaciones de cardinalidad.
+Distinguir mejora de estimaciones, cambio de plan y tiempo de ejecucion.
+
+PREPARACION Y CONEXION
+
+Seguir el recorrido guiado de 06.00.
+distribution debe tener 20000 filas: 100 raro y 19900 normal.
+La preparacion ya ejecuto ANALYZE sobre la distribucion inicial.
+Autovacuum ordinario permanece deshabilitado para controlar la prueba.
+
+PowerShell:
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+psql:
+
+\pset pager off
+SET application_name='p6_manual_analyze';
+
+1. CONSULTAR LA DISTRIBUCION Y SUS ESTADISTICAS
+
+SELECT estado,count(*)
+FROM maintenance.distribution GROUP BY estado ORDER BY estado;
+
+SELECT attname,n_distinct,most_common_vals,most_common_freqs
+FROM pg_stats
+WHERE schemaname='maintenance'
+AND tablename='distribution' AND attname='estado';
+
+Resultado inicial esperado:
+- normal: 19900; raro: 100.
+- Dos valores distintos.
+- Frecuencias aproximadas: normal 0.995 y raro 0.005.
+
+pg_stats describe informacion utilizada por el planificador.
+No es la misma informacion que los contadores de actividad de
+pg_stat_user_tables. Ambos tipos de estadisticas responden preguntas distintas.
+
+2. CAMBIAR LA DISTRIBUCION
+
+UPDATE maintenance.distribution SET estado='raro'
+WHERE id BETWEEN 101 AND 18000;
+
+SELECT estado,count(*)
+FROM maintenance.distribution GROUP BY estado ORDER BY estado;
+
+Se actualizan 17900 filas. Ahora raro tiene 18000 y normal 2000.
+El total permanece en 20000.
+El UPDATE cambia los datos; no sustituye una recopilacion de estadisticas
+de distribucion mediante ANALYZE.
+
+3. OBSERVAR EL PLAN ANTES DE ANALYZE
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM maintenance.distribution WHERE estado='raro';
+
+EXPLAIN ANALYZE ejecuta realmente la consulta. Aqui se usa un SELECT.
+Comparar rows estimadas con actual rows, teniendo en cuenta loops.
+
+Evidencia temporal:
+- Index Scan.
+- 189 filas estimadas.
+- 18000 filas reales, loops=1.
+
+La estimacion no tuvo que ser exactamente 100: el planificador puede ajustar
+estimaciones con informacion del tamano actual. Lo relevante es la gran
+diferencia frente a la distribucion real.
+
+Registrar nodo, filas estimadas, filas reales y buffers.
+Los tiempos incluyen condiciones de esa ejecucion y no son un benchmark.
+
+4. ACTUALIZAR ESTADISTICAS
+
+ANALYZE VERBOSE maintenance.distribution;
+
+SELECT attname,n_distinct,most_common_vals,most_common_freqs
+FROM pg_stats
+WHERE schemaname='maintenance'
+AND tablename='distribution' AND attname='estado';
+
+Resultado esperado: raro aproximadamente 0.9 y normal 0.1.
+ANALYZE observa los datos y actualiza estadisticas; no es el procedimiento
+encargado de retirar las versiones obsoletas del UPDATE.
+
+5. COMPARAR EL PLAN
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM maintenance.distribution WHERE estado='raro';
+
+SELECT count(*) FROM maintenance.distribution WHERE estado='raro';
+
+Evidencia temporal:
+- Seq Scan.
+- 18000 estimadas y 18000 reales.
+- Los datos devueltos no cambiaron por ejecutar ANALYZE.
+
+Evaluar el error absoluto:
+abs(estimadas - reales)
+
+En la evidencia paso de 17811 a 0.
+No exigir siempre el mismo nodo ni una reduccion de tiempo.
+El plan depende de costos, configuracion, distribucion y almacenamiento.
+
+La funcion del script automatizado obtiene el plan en JSON.
+En PostgreSQL 18.6 Actual Rows se observo como 18000.00.
+La conversion validada usa numeric antes de bigint. En esta medicion el
+nodo superior tiene loops=1; no extrapolar redondeos a promedios por loop.
+
+6. DIFERENCIAR ANALISIS Y LIMPIEZA
+
+SELECT n_live_tup,n_dead_tup,last_analyze,last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relid='maintenance.distribution'::regclass;
+
+La evidencia temporal conservo unas 17900 versiones obsoletas despues
+de ANALYZE. Es coherente con haber actualizado estadisticas sin VACUUM.
+Los contadores son estimados; el conteo real se obtiene mediante SELECT.
+
+No agregar una limpieza intermedia para ocultar este resultado:
+forma parte de la diferencia que se quiere explicar.
+
+COMPARACION CON ORACLE
+
+DBMS_STATS permite recopilar estadisticas del optimizador de Oracle.
+La comparacion con ANALYZE ayuda a entender cardinalidades y distribucion.
+Las opciones de muestreo, histogramas y gestion de planes no son identicas.
+Una mejor estimacion no garantiza por si sola un menor tiempo de respuesta.
+
+CONCLUSION Y CIERRE
+
+Los participantes deben justificar cuando recopilar estadisticas despues
+de cambios significativos en la distribucion y separar ese trabajo de
+la limpieza fisica de versiones.
+
+Salir con \q y continuar con 06.04.
+La tabla conserva los cambios para el diagnostico preventivo posterior.
+
+ALTERNATIVA AUTOMATIZADA
+
+En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+
+docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/03-analyze-estadisticas.sh
+if ($LASTEXITCODE -ne 0) { throw "Fallo 03-analyze-estadisticas.sh." }
+
+FUENTES
+
+https://www.postgresql.org/docs/18/sql-analyze.html
+https://www.postgresql.org/docs/18/using-explain.html
+https://docs.oracle.com/en/database/oracle/oracle-database/19/arpls/DBMS_STATS.html

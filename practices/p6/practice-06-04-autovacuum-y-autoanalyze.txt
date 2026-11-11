@@ -1,0 +1,214 @@
+PRACTICA 06.04 - AUTOVACUUM Y AUTOANALYZE
+
+SITUACION Y PREGUNTA CENTRAL
+
+Una tabla acumula cambios sin mantenimiento manual.
+¿Como demostramos que los procesos automaticos se ejecutaron realmente?
+
+OBJETIVO
+
+Relacionar configuracion, umbrales, cambios y evidencia de ejecucion.
+Aplicar BEFORE, cambio, AFTER, restauracion y verificacion final.
+
+PREPARACION
+
+Seguir el recorrido guiado de 06.00; auto_work debe estar vacia.
+No ejecutar VACUUM ni ANALYZE manuales sobre esa tabla durante esta prueba.
+Mantener la misma sesion psql para conservar las tablas temporales BEFORE.
+
+PowerShell:
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+psql:
+
+\pset pager off
+SET application_name='p6_manual_auto';
+
+1. BEFORE: CONSERVAR Y CONSULTAR
+
+CREATE TEMP TABLE p6_guc_before AS
+SELECT name,setting,unit,source FROM pg_settings
+WHERE name IN ('autovacuum_naptime','log_autovacuum_min_duration');
+
+CREATE TEMP TABLE p6_options_before AS
+SELECT reloptions FROM pg_class
+WHERE oid='maintenance.auto_work'::regclass;
+
+TABLE p6_guc_before;
+TABLE p6_options_before;
+
+SELECT count(*) FROM maintenance.auto_work;
+
+SELECT current_setting('autovacuum') AS autovacuum,
+       current_setting('track_counts') AS track_counts;
+
+Esperado: tabla vacia; ambos parametros globales on.
+La opcion inicial de auto_work debe ser autovacuum_enabled=false.
+La guia 00 ya conserva postgresql.auto.conf y las opciones anteriores
+a todos los cambios del laboratorio.
+
+2. ACELERAR LA OBSERVACION Y VERIFICAR
+
+ALTER SYSTEM SET autovacuum_naptime='1s';
+ALTER SYSTEM SET log_autovacuum_min_duration='0';
+SELECT pg_reload_conf();
+SELECT pg_sleep(1);
+
+SELECT name,setting,unit,source FROM pg_settings
+WHERE name IN ('autovacuum_naptime','log_autovacuum_min_duration');
+
+Esperado: naptime=1 s y duracion minima de log=0 ms.
+La recarga solicitada debe comprobarse consultando el valor efectivo.
+Estos ajustes aceleran y hacen observable el laboratorio; no constituyen
+una recomendacion de configuracion para produccion.
+
+ALTER TABLE maintenance.auto_work SET (
+    autovacuum_enabled=false,
+    autovacuum_vacuum_threshold=25,
+    autovacuum_vacuum_scale_factor=0,
+    autovacuum_vacuum_insert_threshold=-1,
+    autovacuum_analyze_threshold=25,
+    autovacuum_analyze_scale_factor=0
+);
+
+SELECT reloptions FROM pg_class
+WHERE oid='maintenance.auto_work'::regclass;
+
+Los umbrales por tabla prevalecen sobre sus valores globales.
+No esperar que pg_settings muestre las opciones particulares de la tabla.
+
+Para actualizaciones/eliminaciones, PostgreSQL 18 aplica un umbral basado
+en base + factor * reltuples, limitado por vacuum_max_threshold cuando
+este limite esta habilitado. Aqui el factor cero deja el umbral en 25.
+Autoanalyze usa su base y factor para los cambios desde el ultimo ANALYZE.
+El valor -1 deshabilita el disparador de VACUUM por inserciones en esta tabla.
+
+3. GENERAR TRABAJO CON EL MANTENIMIENTO ORDINARIO DESHABILITADO
+
+INSERT INTO maintenance.auto_work
+SELECT g,0,repeat(md5(g::text),8)
+FROM generate_series(1,12000) AS g;
+
+UPDATE maintenance.auto_work
+SET version=version+1 WHERE id<=6000;
+
+SELECT pg_sleep(3);
+
+SELECT n_live_tup,n_dead_tup,n_mod_since_analyze,
+       vacuum_count,analyze_count,autovacuum_count,autoanalyze_count
+FROM pg_stat_user_tables
+WHERE relid='maintenance.auto_work'::regclass;
+
+Esperado: versiones obsoletas por encima de 25 y contadores automaticos 0.
+Los manuales tambien deben permanecer en 0.
+Las estadisticas se publican con demora: una lectura inmediata puede quedar
+atrasada. Repetir la consulta antes de interpretar un valor inesperado.
+
+Deshabilitar mantenimiento ordinario no elimina las medidas automaticas
+de proteccion contra wraparound. Ese limite conceptual no se provoca aqui.
+
+4. HABILITAR Y OBSERVAR
+
+ALTER TABLE maintenance.auto_work SET (autovacuum_enabled=true);
+
+SELECT n_live_tup,n_dead_tup,n_mod_since_analyze,
+       vacuum_count,analyze_count,autovacuum_count,autoanalyze_count,
+       last_autovacuum,last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relid='maintenance.auto_work'::regclass;
+\watch 1
+
+Observar durante un maximo de 90 segundos y salir del seguimiento con Ctrl+C.
+Se espera al menos una ejecucion de cada proceso y fechas no nulas.
+La referencia temporal obtuvo:
+- autovacuum_count=1; autoanalyze_count=1.
+- vacuum_count=0; analyze_count=0.
+- n_dead_tup=0; n_mod_since_analyze=0.
+
+Si no se observa dentro del plazo, registrar el escenario como pendiente
+de diagnostico. No ejecutar VACUUM manual para aparentar un exito automatico.
+
+SELECT count(*) AS rows,sum(version) AS version_sum
+FROM maintenance.auto_work;
+
+Resultado real esperado: 12000 y 6000.
+Los procesos automaticos no deben cambiar el contenido logico de los datos.
+
+5. RESTAURAR LAS OPCIONES DEL INICIO DE ESTE ESCENARIO
+
+ALTER TABLE maintenance.auto_work RESET (
+    autovacuum_vacuum_threshold,
+    autovacuum_vacuum_scale_factor,
+    autovacuum_vacuum_insert_threshold,
+    autovacuum_analyze_threshold,
+    autovacuum_analyze_scale_factor
+);
+ALTER TABLE maintenance.auto_work SET (autovacuum_enabled=false);
+
+SELECT c.reloptions,
+       c.reloptions IS NOT DISTINCT FROM b.reloptions AS restored
+FROM pg_class c CROSS JOIN p6_options_before b
+WHERE c.oid='maintenance.auto_work'::regclass;
+
+Esperado: restored=true.
+La opcion false corresponde al estado controlado de la preparacion.
+El cierre final restablece las opciones anteriores al laboratorio completo.
+
+6. RESTAURAR LA CONFIGURACION GLOBAL - OTRA TERMINAL POWERSHELL
+
+Mantener abierta la sesion psql anterior y ejecutar:
+
+& {
+    $ErrorActionPreference = "Stop"
+    docker exec -u postgres p6-maintenance-lab cp /tmp/nobleprog-p6-lab/evidence/postgresql.auto.conf.before /tmp/nobleprog-p6-lab/data/postgresql.auto.conf
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudo restaurar postgresql.auto.conf."
+    }
+}
+
+Regresar a la misma sesion psql:
+
+SELECT pg_reload_conf();
+SELECT pg_sleep(1);
+
+SELECT p.name,b.setting AS before_value,p.setting AS after_value,
+       p.setting=b.setting AS restored
+FROM pg_settings p JOIN p6_guc_before b ON b.name=p.name
+ORDER BY p.name;
+
+Esperado: ambas comparaciones true.
+Se repone el archivo guardado por 00.00, no solamente valores elegidos de
+memoria. No realizar cambios ajenos al laboratorio entre ambas etapas.
+
+COMPARACION CON ORACLE
+
+Oracle puede recopilar estadisticas automaticamente mediante tareas de
+mantenimiento. Autoanalyze es la referencia funcional para esa comparacion.
+Autovacuum tambien limpia versiones y participa en la proteccion de XID;
+no equivale solamente a la recoleccion automatica de estadisticas de Oracle.
+
+CONCLUSION Y CIERRE
+
+Los participantes deben distinguir configuracion habilitada de ejecucion
+demostrada y reconocer que los umbrales no garantizan un instante exacto
+de inicio. La disponibilidad de trabajadores y otras condiciones influyen.
+
+Salir con \q y continuar con 06.05.
+El cierre y la restauracion completa del entorno estan en 06.00.
+
+ALTERNATIVA AUTOMATIZADA
+
+En lugar de este recorrido, siguiendo la ruta de scripts de 06.00:
+
+docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/04-autovacuum-autoanalyze.sh
+if ($LASTEXITCODE -ne 0) { throw "Fallo 04-autovacuum-autoanalyze.sh." }
+
+Esa ruta conserva los ajustes hasta ejecutar 99-cleanup-lab.sh.
+La auditoria completa aplica su restauracion automaticamente al finalizar.
+
+FUENTES
+
+https://www.postgresql.org/docs/18/runtime-config-vacuum.html
+https://www.postgresql.org/docs/18/routine-vacuuming.html
+https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/gathering-optimizer-statistics.html

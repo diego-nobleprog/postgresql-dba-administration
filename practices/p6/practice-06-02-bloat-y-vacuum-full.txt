@@ -1,0 +1,169 @@
+PRACTICA 06.02 - BLOAT Y VACUUM FULL
+
+SITUACION Y PREGUNTA CENTRAL
+
+Una tabla pierde el 90 por ciento de sus filas, pero conserva un archivo
+grande. ¿Conviene reutilizar ese espacio o reescribir la tabla?
+
+OBJETIVO
+
+Comparar limpieza y reescritura, medir almacenamiento y observar el impacto
+de una solicitud AccessExclusiveLock sobre otras sesiones.
+
+PREPARACION
+
+Laboratorio de 06.00, siguiendo el recorrido guiado.
+bloat_work debe conservar las 30000 filas originales.
+No ejecutar tambien el script automatizado sobre estas mismas tablas.
+
+Abrir tres terminales PowerShell y conectar A, B y C:
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+En cada psql:
+
+\pset pager off
+
+1. MEDIR ANTES DE ELIMINAR - PSQL B
+
+SET application_name='p6_manual_B';
+
+SELECT pg_relation_size('maintenance.bloat_work') AS heap_before,
+       pg_relation_filenode('maintenance.bloat_work') AS node_before \gset
+
+SELECT count(*) FROM maintenance.bloat_work;
+
+Resultado esperado: 30000.
+Las variables psql conservan los valores en B: mantener esa conexion.
+
+DELETE FROM maintenance.bloat_work WHERE id%10<>0;
+VACUUM (VERBOSE, TRUNCATE FALSE) maintenance.bloat_work;
+
+SELECT count(*) FROM maintenance.bloat_work;
+
+SELECT :'heap_before'::bigint AS initial_heap,
+       pg_relation_size('maintenance.bloat_work') AS current_heap,
+       pg_indexes_size('maintenance.bloat_work') AS indexes_bytes,
+       pg_total_relation_size('maintenance.bloat_work') AS total_bytes;
+
+Resultado: 27000 eliminadas y 3000 restantes.
+TRUNCATE FALSE impide el truncado del extremo del heap en esta medicion.
+En la evidencia temporal el heap conservo 17555456 bytes.
+
+Esto demuestra espacio que puede reutilizarse, pero no calcula por si solo
+un porcentaje exacto de bloat. Los bytes incluyen estructura y otros costos.
+VACUUM normal puede truncar paginas finales vacias en otras condiciones.
+
+2. MANTENER UN LECTOR ABIERTO - PSQL A
+
+SET application_name='p6_manual_A';
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM maintenance.bloat_work;
+
+Resultado esperado: 3000. Mantener la transaccion abierta.
+El SELECT mantiene un AccessShareLock hasta finalizar la transaccion.
+
+3. COMPARAR VACUUM Y FULL - PSQL B
+
+VACUUM (VERBOSE, TRUNCATE FALSE) maintenance.bloat_work;
+
+Debe terminar aunque A mantenga su lectura.
+
+VACUUM (FULL, VERBOSE) maintenance.bloat_work;
+
+Esta segunda orden debe quedar esperando. No cancelarla todavia.
+Pasar a C mientras B espera.
+
+4. EXAMINAR LA ESPERA - PSQL C
+
+SET application_name='p6_manual_C';
+
+SELECT a.pid,a.application_name,a.state,
+       l.mode,l.granted,pg_blocking_pids(a.pid) AS blocking_pids
+FROM pg_stat_activity a
+JOIN pg_locks l ON l.pid=a.pid
+WHERE l.relation='maintenance.bloat_work'::regclass
+ORDER BY a.application_name,l.mode;
+
+Identificar:
+- A con AccessShareLock concedido.
+- B solicitando AccessExclusiveLock, todavia no concedido.
+- Un PID bloqueador asociado a la espera de B.
+
+No confundir un bloqueo solicitado con uno ya obtenido.
+
+SHOW lock_timeout \gset p6_before_
+SET lock_timeout='700ms';
+SELECT count(*) FROM maintenance.bloat_work;
+
+Se espera una cancelacion por lock timeout.
+Aunque C solo quiera leer, queda detras de la solicitud exclusiva pendiente.
+
+\errverbose
+SET lock_timeout = :'p6_before_lock_timeout';
+SHOW lock_timeout;
+
+SQLSTATE esperado: 55P03.
+La restauracion devuelve lock_timeout al valor de esa sesion antes del cambio.
+No es una prueba de deadlock: se demuestra espera y timeout.
+
+5. LIBERAR EL LECTOR - PSQL A
+
+COMMIT;
+
+B debe continuar y terminar VACUUM FULL.
+No evaluar los tamanos mientras B siga ejecutando o esperando.
+
+6. COMPROBAR LA REESCRITURA - PSQL B
+
+SELECT count(*) FROM maintenance.bloat_work;
+
+SELECT :'heap_before'::bigint AS initial_heap,
+       pg_relation_size('maintenance.bloat_work') AS full_heap,
+       :'node_before'::oid AS initial_filenode,
+       pg_relation_filenode('maintenance.bloat_work') AS full_filenode,
+       pg_relation_filenode('maintenance.bloat_work')
+           <> :'node_before'::oid AS rewritten;
+
+Resultado esperado: 3000 filas, un heap menor y rewritten=true.
+Referencia temporal: heap de 17555456 a 1761280 bytes.
+El filenode cambio de 16397 a 16442 en esa instancia; sus numeros pueden variar.
+
+VACUUM FULL construye una nueva copia y requiere espacio adicional mientras
+coexisten la copia anterior y la nueva. Su bloqueo exige planificar la
+interrupcion del acceso a la tabla.
+
+INTERPRETACION DBA
+
+Si la carga volvera a crecer, el espacio interno puede ser util.
+Si existe una reduccion permanente importante, evaluar una reescritura,
+su espacio de trabajo y el tiempo de indisponibilidad.
+Un archivo grande aislado no justifica programar FULL de forma rutinaria.
+
+COMPARACION CON ORACLE
+
+Oracle dispone de mecanismos de gestion de segmentos, como segment shrink
+para objetos y condiciones compatibles. Sirven como referencia conceptual
+para recuperar espacio, pero sus requisitos y bloqueos son diferentes.
+No equiparar un shrink online de Oracle con VACUUM FULL de PostgreSQL.
+
+CONCLUSION Y CIERRE
+
+Los participantes deben distinguir limpieza, reutilizacion y devolucion
+de espacio, e identificar el costo de la solicitud exclusiva.
+
+Cerrar A, B y C con \q. Continuar con 06.03.
+El cierre completo del laboratorio esta en 06.00.
+
+ALTERNATIVA AUTOMATIZADA
+
+En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+
+docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/02-bloat-vacuum-full.sh
+if ($LASTEXITCODE -ne 0) { throw "Fallo 02-bloat-vacuum-full.sh." }
+
+FUENTES
+
+https://www.postgresql.org/docs/18/sql-vacuum.html
+https://www.postgresql.org/docs/18/explicit-locking.html
+https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-space-for-schema-objects.html
