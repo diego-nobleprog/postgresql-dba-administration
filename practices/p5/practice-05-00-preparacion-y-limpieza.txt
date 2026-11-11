@@ -1,0 +1,549 @@
+================================================================================
+PRACTICA 05.00 - PREPARACION, EJECUCION Y LIMPIEZA DEL LABORATORIO
+CURSO: POSTGRESQL DBA - ADMINISTRACION, PERFORMANCE, BACKUP Y HA
+MODULO 4: BACKUP & RECOVERY
+POSTGRESQL 18
+================================================================================
+
+1. SITUACION Y OBJETIVO
+--------------------------------------------------------------------------------
+
+Una organizacion necesita demostrar que sus respaldos realmente permiten
+recuperar informacion cuando ocurre un error humano o una falla del servidor.
+
+Antes de experimentar con respaldos y recuperaciones, necesitamos construir
+un laboratorio aislado, reproducible y con datos controlados.
+
+PREGUNTA CENTRAL:
+
+Como preparar una infraestructura PostgreSQL donde podamos generar respaldos,
+provocar perdidas de informacion, recuperar estados historicos y verificar
+los resultados sin afectar las practicas anteriores?
+
+Al finalizar esta preparacion tendremos:
+
+- Una instancia PostgreSQL origen.
+- Una base de datos con clientes y pagos.
+- Archivos para backups logicos.
+- Directorios para backups fisicos.
+- Un directorio de archivado WAL.
+- Espacios independientes para restauraciones PITR.
+- Scripts reutilizables de preparacion y recuperacion.
+
+
+2. ARQUITECTURA DEL LABORATORIO
+--------------------------------------------------------------------------------
+
+EQUIPO WINDOWS
+|
+|-- PowerShell 5.1
+|-- Repositorio PostgreSQL DBA
+|
++-- Docker
+    |
+    |-- postgresql-dba
+    |   |
+    |   +-- Contenedor principal.
+    |       Se conserva sin modificaciones.
+    |
+    +-- p5-backup-lab
+        |
+        |-- PostgreSQL origen            Puerto interno 55431
+        |-- Restauracion fisica          Puerto interno 55432
+        |-- PITR por tiempo              Puerto interno 55433
+        |-- Recuperacion por nombre      Puerto interno 55434
+        |-- Recuperacion por LSN         Puerto interno 55435
+        |
+        +-- /tmp/nobleprog-p5-lab/
+            |
+            |-- source/
+            |-- socket/
+            |-- logical/
+            |-- base/physical/
+            |-- archive/
+            |-- restore/
+            |-- recover/
+            |-- metadata/
+            +-- log/
+
+Los puertos mencionados identifican procesos PostgreSQL que comparten
+el entorno Linux del contenedor P5.
+
+NO se publican puertos hacia el host Windows.
+
+Las conexiones entre estos procesos se realizan usando sockets Unix.
+
+El contenedor P5 utiliza la imagen:
+
+postgresql-dba:18-p1
+
+La version observada durante la validacion fue:
+
+PostgreSQL 18.6
+
+El laboratorio utiliza autenticacion local trust porque trabaja en un
+contenedor aislado y desechable.
+
+ESTO NO ES UNA RECOMENDACION DE SEGURIDAD PARA PRODUCCION.
+
+Los backups permanecen dentro del contenedor P5.
+
+Eliminar el contenedor elimina tambien sus respaldos y evidencias.
+Por lo tanto, esta arquitectura demuestra mecanismos de recuperacion,
+pero no constituye una estrategia productiva de disaster recovery.
+
+
+3. COMPROBACIONES INICIALES
+--------------------------------------------------------------------------------
+
+CONSOLA: PowerShell de Windows.
+
+Ubicarse en el repositorio:
+
+Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+Consultar la rama:
+
+git branch --show-current
+
+RESULTADO ESPERADO:
+
+p5
+
+Para participantes que todavia no tengan p5 localmente:
+
+git fetch origin
+git switch p5
+git pull --ff-only origin p5
+
+Comprobar Docker:
+
+docker version
+
+Comprobar la imagen:
+
+docker image inspect postgresql-dba:18-p1
+
+Comprobar el contenedor principal:
+
+docker ps -a --filter "name=postgresql-dba"
+
+No eliminar ni reconstruir el contenedor principal.
+
+La practica P5 trabaja en un contenedor distinto.
+
+
+4. CREAR EL LABORATORIO DESDE CERO
+--------------------------------------------------------------------------------
+
+CONSOLA: PowerShell de Windows.
+
+Ejecutar el siguiente bloque completo:
+
+& {
+    $ErrorActionPreference = "Stop"
+
+    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+    $container = "p5-backup-lab"
+    $image = "postgresql-dba:18-p1"
+
+    # Evitar sobrescribir un laboratorio existente.
+    $names = @(docker ps -a --format "{{.Names}}")
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudo consultar Docker."
+    }
+
+    if ($names -contains $container) {
+        throw "El contenedor P5 ya existe. No sera sobrescrito."
+    }
+
+    # Verificar la imagen requerida.
+    docker image inspect $image | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "No existe la imagen requerida."
+    }
+
+    $created = $false
+
+    try {
+        # Crear contenedor aislado sin publicar puertos.
+        docker run -d --name $container --network none --label "nobleprog.p5.lab=true" --user root --entrypoint /bin/bash $image -c "sleep 86400" | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Fallo la creacion del contenedor P5."
+        }
+
+        $created = $true
+
+        # Crear el directorio de trabajo Linux.
+        docker exec -u root $container /bin/bash -c "mkdir -p /tmp/nobleprog-p5-lab && chown postgres:postgres /tmp/nobleprog-p5-lab"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo preparar el directorio Linux."
+        }
+
+        # Copiar los scripts definitivos del repositorio.
+        docker cp ".\practices\p5\scripts" "${container}:/tmp/p5-scripts"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Fallo la copia de scripts."
+        }
+
+        # Establecer la propiedad del directorio copiado.
+        docker exec -u root $container /bin/bash -c "chown -R postgres:postgres /tmp/p5-scripts"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "No se pudieron establecer los permisos."
+        }
+
+        # Validar sintaxis antes de iniciar PostgreSQL.
+        docker exec -u postgres $container /bin/bash -c 'for f in /tmp/p5-scripts/*.sh; do bash -n "$f" || exit 1; done'
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Hay errores de sintaxis Bash."
+        }
+
+        # Crear la instancia y cargar los datos.
+        docker exec -u postgres $container /bin/bash /tmp/p5-scripts/00-prepare-lab.sh
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Fallo la preparacion de PostgreSQL."
+        }
+
+        Write-Output "Laboratorio P5 preparado correctamente."
+    }
+    catch {
+        if ($created) {
+            docker rm -f $container | Out-Null
+        }
+
+        throw
+    }
+}
+
+QUE HACE EL BLOQUE:
+
+1. Comprueba la imagen y el estado de Docker.
+2. Impide sobrescribir un contenedor P5 preexistente.
+3. Crea un contenedor aislado sin puertos publicados.
+4. Copia los scripts del repositorio.
+5. Comprueba la sintaxis de los scripts Bash.
+6. Inicializa un cluster PostgreSQL independiente.
+7. Configura WAL archiving.
+8. Crea la base de datos del laboratorio.
+9. Ejecuta el script SQL de carga inicial.
+10. Comprueba los datos y los parametros iniciales.
+
+El script que prepara PostgreSQL es:
+
+practices/p5/scripts/00-prepare-lab.sh
+
+El SQL utilizado es:
+
+practices/p5/scripts/00-load-data.sql
+
+
+5. ESTRUCTURA DE LA BASE DE DATOS
+--------------------------------------------------------------------------------
+
+BASE DE DATOS:
+
+nobleprog_backup_scenarios
+
+ESQUEMA:
+
+backups
+
+TABLA 1:
+
+backups.clientes
+
+COLUMNAS:
+id       integer PRIMARY KEY
+nombre   text NOT NULL
+
+DATOS:
+
+ID   NOMBRE
+---  ---------------
+1    Cliente Norte
+2    Cliente Sur
+
+TABLA 2:
+
+backups.pagos
+
+COLUMNAS:
+id          integer PRIMARY KEY
+cliente_id  integer REFERENCES backups.clientes(id)
+monto       numeric(12,2)
+estado      text
+
+DATOS:
+
+ID    CLIENTE_ID   MONTO     ESTADO
+----  -----------  --------  -----------
+101   1            100.00    CONFIRMADO
+102   2            250.00    CONFIRMADO
+103   1            300.00    CONFIRMADO
+
+Estos tres pagos representan el estado inicial del sistema.
+
+Los pagos 201 y 202 se crearan posteriormente, despues del
+backup fisico, para demostrar PITR.
+
+El pago 303 se creara en una instancia promovida para
+demostrar una nueva historia WAL.
+
+
+6. INGRESAR AL LABORATORIO
+--------------------------------------------------------------------------------
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+Ahora estamos dentro del contenedor Linux.
+
+Cargar las variables del laboratorio:
+
+source /tmp/p5-scripts/00-env.sh
+
+El script define:
+
+PGHOST=/tmp/nobleprog-p5-lab/socket
+PGPORT=55431
+PGUSER=postgres
+PGDATABASE=nobleprog_backup_scenarios
+
+Ingresar a PostgreSQL:
+
+psql -X
+
+Ahora estamos dentro de psql.
+
+CONSULTA 1:
+
+SELECT current_database(), current_user;
+
+RESULTADO:
+
+nobleprog_backup_scenarios
+postgres
+
+INTERPRETACION:
+
+current_database() muestra la base utilizada en la conexion.
+
+current_user muestra el rol PostgreSQL efectivo.
+
+No debemos confundir el usuario Linux postgres con el rol
+PostgreSQL postgres, aunque compartan nombre en este ejercicio.
+
+CONSULTA 2:
+
+SELECT pg_is_in_recovery();
+
+RESULTADO ESPERADO:
+
+f
+
+INTERPRETACION:
+
+La instancia origen no esta ejecutando una recuperacion WAL.
+
+CONSULTA 3:
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO:
+
+Tres pagos: 101, 102 y 103.
+
+CONSULTA 4:
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+Salir de psql:
+
+\q
+
+Regresamos a Linux.
+
+Salir de Linux:
+
+exit
+
+Regresamos a PowerShell.
+
+
+7. SECUENCIA DE LOS ESCENARIOS
+--------------------------------------------------------------------------------
+
+ESCENARIO 05.01:
+
+Backup logico, perdida de tabla y pg_restore.
+
+ESCENARIO 05.02:
+
+Backup fisico, pg_verifybackup e instancia restaurada.
+
+ESCENARIO 05.03:
+
+WAL archiving, fallo controlado y restauracion.
+
+ESCENARIO 05.04:
+
+Dos pagos nuevos, DROP TABLE y PITR.
+
+ESCENARIO 05.05:
+
+Recovery targets por tiempo, nombre y LSN; timelines.
+
+NO CAMBIAR EL ORDEN.
+
+05.02 requiere que 05.01 termine con tres pagos disponibles.
+
+05.03 requiere haber detenido la instancia restaurada 55432.
+
+05.04 requiere el backup fisico y los WAL archivados.
+
+05.05 requiere que 05.04 ya haya preparado los recovery targets.
+
+
+8. RESTAURACION DEL LABORATORIO
+--------------------------------------------------------------------------------
+
+Hay que distinguir diferentes niveles de restauracion.
+
+RESTAURACION LOGICA:
+
+Recuperar una tabla desde un dump custom.
+
+RESTAURACION FISICA:
+
+Reconstruir una instancia desde los archivos del backup base.
+
+RECUPERACION PITR:
+
+Reconstruir un estado historico utilizando backup base y WAL.
+
+LIMPIEZA DEL LABORATORIO:
+
+Eliminar exclusivamente los recursos que pertenecen a P5.
+
+Una limpieza Docker no sustituye una restauracion SQL.
+
+Tampoco debemos eliminar los archivos WAL antes de concluir PITR.
+
+
+9. LIMPIEZA FINAL
+--------------------------------------------------------------------------------
+
+REALIZAR SOLO CUANDO LOS CINCO ESCENARIOS HAYAN TERMINADO.
+
+ADVERTENCIA:
+
+Este procedimiento elimina el contenedor P5 y los respaldos
+que se encuentran dentro de su filesystem.
+
+No elimina contenedores ajenos, imagenes ni volumenes.
+
+CONSOLA: PowerShell.
+
+& {
+    $ErrorActionPreference = "Stop"
+
+    $container = "p5-backup-lab"
+
+    $owned = @(
+        docker ps -a --filter "label=nobleprog.p5.lab=true" --format "{{.Names}}"
+    )
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudo consultar Docker."
+    }
+
+    if ($owned -notcontains $container) {
+        throw "No se encontro el contenedor P5 esperado."
+    }
+
+    docker rm -f $container
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fallo la limpieza del contenedor P5."
+    }
+
+    $remaining = @(docker ps -a --format "{{.Names}}")
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudo verificar la limpieza."
+    }
+
+    if ($remaining -contains $container) {
+        throw "El contenedor P5 continua presente."
+    }
+
+    Write-Output "Limpieza P5 completada."
+
+    docker ps -a --filter "name=postgresql-dba"
+}
+
+IMPORTANTE:
+
+La limpieza final no elimina los archivos publicados en Git.
+
+Los scripts y guias permanecen en practices/p5/.
+
+Podremos reconstruir el ambiente ejecutando nuevamente
+la preparacion inicial de esta guia.
+
+
+10. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle utiliza herramientas como Data Pump y RMAN.
+
+Tambien utiliza archived redo logs y mecanismos de
+recuperacion a puntos historicos.
+
+En PostgreSQL estudiaremos:
+
+pg_dump / pg_restore
+pg_basebackup / pg_verifybackup
+WAL archiving
+PITR
+Recovery targets
+Timelines
+
+No son equivalencias exactas.
+
+La comparacion busca identificar la finalidad de cada mecanismo,
+sus dependencias y sus diferencias operativas.
+
+
+11. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+Un laboratorio de backup y recovery debe permitir:
+
+- Crear los datos iniciales.
+- Generar y verificar respaldos.
+- Provocar incidentes de manera controlada.
+- Recuperar datos en instancias independientes.
+- Comprobar cada estado resultante.
+- Restaurar o limpiar el ambiente.
+
+El exito de un backup no se demuestra solamente porque exista
+un archivo o porque un comando termine sin errores.
+
+Debe comprobarse su capacidad de recuperacion.

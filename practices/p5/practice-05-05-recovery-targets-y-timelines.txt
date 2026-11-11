@@ -1,0 +1,485 @@
+================================================================================
+PRACTICA 05.05 - RECOVERY TARGETS Y TIMELINES
+MODULO 4: BACKUP & RECOVERY - POSTGRESQL 18
+================================================================================
+
+1. SITUACION
+--------------------------------------------------------------------------------
+
+Despues de un incidente, el equipo DBA identifica
+varios posibles estados de recuperacion.
+
+Un estado contiene cuatro pagos.
+
+Otro contiene cinco.
+
+Una instancia recuperada puede ser promovida y aceptar
+nuevas transacciones.
+
+PREGUNTA CENTRAL:
+
+Como seleccionamos distintos recovery targets y
+como se representa una historia WAL nueva?
+
+
+2. CONCEPTOS
+--------------------------------------------------------------------------------
+
+RECOVERY TARGET:
+
+Criterio que determina donde debe detenerse el replay WAL.
+
+RECOVERY_TARGET_TIME:
+
+Selecciona un instante de recuperacion.
+
+RECOVERY_TARGET_NAME:
+
+Selecciona un restore point nombrado.
+
+RECOVERY_TARGET_LSN:
+
+Selecciona una posicion WAL.
+
+RECOVERY_TARGET_INCLUSIVE:
+
+Permite controlar la inclusion del registro de transaccion
+correspondiente al objetivo, cuando aplica a ese tipo de target.
+
+RECOVERY_TARGET_ACTION:
+
+Define que hace PostgreSQL al alcanzar el target.
+
+pause:
+Detiene temporalmente el replay.
+
+promote:
+Finaliza la recuperacion y permite operar como primaria.
+
+shutdown:
+Detiene el servidor al alcanzar el objetivo.
+
+TIMELINE:
+
+Historia del WAL que puede diferenciarse de otra
+despues de una recuperacion promovida.
+
+TIMELINE HISTORY:
+
+Archivo que describe el punto desde el que una nueva
+timeline se separo de su historia anterior.
+
+Los primeros ocho caracteres hexadecimales del
+nombre de segmento WAL representan la timeline.
+
+
+3. BEFORE - IDENTIFICAR LOS TARGETS
+--------------------------------------------------------------------------------
+
+Requisitos:
+
+- 05.04 terminado.
+- Recuperacion temporal 55433 disponible.
+- Backup fisico conservado.
+- WAL archivados.
+- Metadata de targets disponible.
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+CONSOLA: Linux.
+
+source /tmp/p5-scripts/00-env.sh
+
+Consultar los targets:
+
+cat "$P5_ROOT/metadata/lsn-a.txt"
+
+cat "$P5_ROOT/metadata/lsn-b.txt"
+
+cat "$P5_ROOT/metadata/target-time.txt"
+
+RESULTADOS REALES DE REFERENCIA:
+
+Punto A:
+0/50008E8
+
+Punto B:
+0/5000A48
+
+Tiempo:
+2026-11-11 00:51:08.600081+00
+
+INTERPRETACION:
+
+Punto A se registro despues del pago 201.
+
+Punto B se registro despues del pago 202.
+
+El target temporal se registro antes del DROP TABLE.
+
+Estas posiciones y fechas son especificas de la
+ejecucion que realizo el instructor.
+
+No deben copiarse como valores de una nueva ejecucion.
+
+
+4. RECUPERAR POR NOMBRE Y POR LSN
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/05-recovery-targets.sh
+
+Este script crea dos copias independientes
+del backup fisico original.
+
+TARGET NAME:
+
+Directorio:
+$P5_ROOT/recover/name
+
+Puerto:
+55434
+
+Configuracion:
+
+recovery_target_name = 'p5_punto_a'
+recovery_target_action = 'pause'
+
+TARGET LSN:
+
+Directorio:
+$P5_ROOT/recover/lsn
+
+Puerto:
+55435
+
+Configuracion:
+
+recovery_target_lsn = LSN del punto B
+recovery_target_action = 'promote'
+
+La recuperacion por tiempo del puerto 55433
+continua disponible.
+
+
+5. AFTER - RECUPERACION POR NOMBRE
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55434
+
+CONSOLA: psql.
+
+SELECT pg_get_wal_replay_pause_state();
+
+RESULTADO:
+
+paused
+
+INTERPRETACION:
+
+El replay alcanzo el restore point nombrado
+y quedo detenido.
+
+La instancia todavia no fue promovida.
+
+Consultar:
+
+SELECT id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO:
+
+101
+102
+103
+201
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+4
+
+INTERPRETACION:
+
+El pago 201 ya existia al alcanzar el punto A.
+
+El pago 202 fue confirmado despues de dicho punto.
+
+Por eso esta recuperacion contiene cuatro pagos.
+
+Salir:
+
+\q
+
+
+6. AFTER - RECUPERACION POR LSN
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55435
+
+CONSOLA: psql.
+
+SELECT pg_is_in_recovery();
+
+RESULTADO:
+
+f
+
+SELECT id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO:
+
+101
+102
+103
+201
+202
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+5
+
+INTERPRETACION:
+
+El objetivo LSN corresponde al punto B.
+
+El pago 202 ya habia sido confirmado.
+
+La instancia fue promovida despues de alcanzar el target.
+
+Por eso puede aceptar nuevas escrituras.
+
+Salir:
+
+\q
+
+
+7. COMPARAR CON LA RECUPERACION POR TIEMPO
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55433
+
+CONSOLA: psql.
+
+SELECT id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO ESPERADO DESPUES DEL SCRIPT 05:
+
+101
+102
+103
+201
+202
+303
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+6
+
+INTERPRETACION:
+
+La recuperacion por tiempo inicio con cinco pagos.
+
+El escenario 05.05 agrego el pago 303:
+
+INSERT INTO backups.pagos
+VALUES (303,1,900.00,'NUEVA_TIMELINE');
+
+Esta operacion se realizo sobre la instancia
+recuperada y promovida.
+
+No fue aplicada al origen ni a las otras recuperaciones.
+
+Salir:
+
+\q
+
+
+8. IDENTIFICAR LA TIMELINE ORIGINAL
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT pg_walfile_name(pg_current_wal_lsn());
+
+En la validacion del instructor, el identificador
+original fue:
+
+00000001
+
+INTERPRETACION:
+
+Los primeros ocho caracteres del nombre WAL
+identifican la timeline.
+
+Salir:
+
+\q
+
+
+9. IDENTIFICAR LA TIMELINE RECUPERADA
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55433
+
+CONSOLA: psql.
+
+SELECT pg_walfile_name(pg_current_wal_lsn());
+
+En la validacion se observo:
+
+00000002
+
+INTERPRETACION:
+
+La recuperacion promovida creo una historia WAL nueva.
+
+Las operaciones posteriores a la promocion
+pertenecen a esa nueva timeline.
+
+Salir:
+
+\q
+
+
+10. INSPECCIONAR EL ARCHIVO HISTORY
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+ls -lh "$P5_ROOT/recover/time/pg_wal"/*.history
+
+En la validacion se encontro:
+
+00000002.history
+
+Consultar:
+
+cat "$P5_ROOT/recover/time/pg_wal/00000002.history"
+
+INTERPRETACION:
+
+El archivo history describe el punto de separacion
+respecto de la timeline anterior.
+
+No contiene todas las filas ni es una copia
+de las tablas.
+
+Contiene metadatos de la historia de WAL.
+
+
+11. COMPARACION DE ESTADOS
+--------------------------------------------------------------------------------
+
+INSTANCIA   RECUPERACION   PAGOS   CONDICION
+---------   -------------  ------  ------------------------
+55431       Origen         N/A     Tabla eliminada
+55433       Tiempo         6       Promovida y modificada
+55434       Nombre         4       Replay pausado
+55435       LSN            5       Promovida
+
+INTERPRETACION:
+
+Las distintas cantidades representan estados historicos
+y operaciones realizadas en instancias independientes.
+
+El origen mantiene la evidencia del error humano.
+
+El target NAME se detuvo despues del pago 201.
+
+El target LSN se detuvo despues del pago 202.
+
+La recuperacion por tiempo fue promovida y recibio
+una operacion nueva.
+
+No debemos interpretar estas instancias como replicas
+que se estan sincronizando actualmente.
+
+
+12. RESTAURACION Y LIMPIEZA
+--------------------------------------------------------------------------------
+
+No ejecutar mas operaciones sobre las instancias.
+
+Regresar a la guia:
+
+practice-05-00-preparacion-y-limpieza.txt
+
+Ejecutar la limpieza final solamente cuando se hayan
+revisado y conservado las evidencias necesarias.
+
+La limpieza elimina exclusivamente el laboratorio P5.
+
+No modifica las practicas anteriores.
+
+
+13. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle utiliza el concepto de incarnation para
+identificar distintas historias de recuperacion.
+
+RESETLOGS se relaciona con el inicio de una
+nueva historia de redo.
+
+PostgreSQL utiliza timelines y archivos history.
+
+La finalidad conceptual es comparable.
+
+No tienen implementaciones identicas.
+
+
+14. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+Demostramos recuperacion por:
+
+- Tiempo.
+- Restore point nombrado.
+- LSN.
+
+Tambien demostramos:
+
+- Pausa de WAL replay.
+- Promocion.
+- Nueva timeline.
+- Operaciones independientes despues de la promocion.
+
+LIMITES:
+
+La seleccion de targets en produccion requiere
+investigar el momento real del incidente.
+
+No basta con elegir un timestamp arbitrario.
+
+Se necesita comprobar la consistencia del estado
+recuperado antes de restaurar el servicio.
+
+REFERENCIA:
+
+https://www.postgresql.org/docs/18/continuous-archiving.html

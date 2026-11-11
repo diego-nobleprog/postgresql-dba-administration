@@ -1,0 +1,376 @@
+================================================================================
+PRACTICA 05.01 - BACKUP LOGICO CON PG_DUMP Y PG_RESTORE
+MODULO 4: BACKUP & RECOVERY - POSTGRESQL 18
+================================================================================
+
+1. SITUACION
+--------------------------------------------------------------------------------
+
+Una empresa conserva sus registros de pagos en PostgreSQL.
+
+Antes de una operacion administrativa se crea un backup logico.
+
+Posteriormente, un operador elimina accidentalmente la tabla
+que contiene los pagos.
+
+El resto de los objetos permanece disponible.
+
+PREGUNTA CENTRAL:
+
+Podemos recuperar una tabla eliminada y sus restricciones
+sin reemplazar el cluster completo?
+
+
+2. CONCEPTOS
+--------------------------------------------------------------------------------
+
+BACKUP LOGICO:
+
+Representacion de objetos, definiciones y datos que puede
+utilizarse para reconstruirlos en una base PostgreSQL.
+
+PG_DUMP:
+
+Herramienta que genera un respaldo logico de una base.
+
+No es una copia del directorio PGDATA.
+
+PG_RESTORE:
+
+Herramienta que permite restaurar respaldos producidos en
+formatos compatibles, como custom, directory o tar.
+
+FORMATO CUSTOM:
+
+Se especifica mediante -Fc.
+
+Produce un archivo que puede inspeccionarse mediante
+la tabla de contenidos o TOC.
+
+TOC:
+
+Table of Contents.
+
+Describe los elementos almacenados en el backup.
+
+Puede incluir definiciones de tablas, datos, indices y
+restricciones, entre otros objetos.
+
+DEPENDENCIAS:
+
+Una tabla puede estar relacionada con otras mediante
+foreign keys, referencias o tipos compartidos.
+
+Una restauracion selectiva requiere comprobar estas relaciones.
+
+CONSISTENCIA:
+
+pg_dump utiliza una vista consistente de los datos respaldados.
+
+Un dump no contiene automaticamente las transacciones que
+se confirmen despues del momento correspondiente a la captura.
+
+
+3. PREPARACION
+--------------------------------------------------------------------------------
+
+Debe haberse completado la guia 05.00.
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+CONSOLA: Linux.
+
+source /tmp/p5-scripts/00-env.sh
+
+Ingresar a PostgreSQL:
+
+psql -X
+
+
+4. BEFORE - DATOS ORIGINALES
+--------------------------------------------------------------------------------
+
+CONSOLA: psql.
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO ESPERADO:
+
+ID    CLIENTE   MONTO    ESTADO
+----  --------  -------  -----------
+101   1         100.00   CONFIRMADO
+102   2         250.00   CONFIRMADO
+103   1         300.00   CONFIRMADO
+
+INTERPRETACION:
+
+Estos tres registros son la referencia que utilizaremos
+para verificar la restauracion.
+
+Comprobar la foreign key:
+
+SELECT conname, pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid = 'backups.pagos'::regclass
+  AND contype = 'f';
+
+INTERPRETACION:
+
+contype='f' identifica una foreign key.
+
+pg_get_constraintdef muestra la definicion de la restriccion.
+
+El objetivo no es recuperar solamente los tres registros:
+tambien debemos comprobar que la relacion entre clientes
+y pagos se conserva.
+
+Salir de psql:
+
+\q
+
+
+5. CREAR EL BACKUP
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+Primero creamos el backup completo de la base:
+
+pg_dump -h "$PGHOST" -p "$PGPORT" -U postgres -d "$PGDATABASE" -Fc -f "$P5_ROOT/logical/completo.dump"
+
+EXPLICACION:
+
+-h:
+Host o directorio de socket.
+
+-p:
+Puerto PostgreSQL.
+
+-U:
+Rol de conexion.
+
+-d:
+Base que se respalda.
+
+-Fc:
+Formato custom.
+
+-f:
+Archivo de salida.
+
+Ahora creamos un respaldo selectivo:
+
+pg_dump -h "$PGHOST" -p "$PGPORT" -U postgres -d "$PGDATABASE" -Fc -t backups.pagos -f "$P5_ROOT/logical/pagos.dump"
+
+EXPLICACION:
+
+La opcion -t limita el respaldo al objeto seleccionado.
+
+No significa que se respalden automaticamente todas las
+tablas relacionadas.
+
+En este laboratorio, backups.clientes seguira existiendo
+cuando recuperemos backups.pagos.
+
+Consultar los archivos:
+
+ls -lh "$P5_ROOT/logical"
+
+Inspeccionar el TOC:
+
+pg_restore -l "$P5_ROOT/logical/pagos.dump"
+
+BUSCAR:
+
+TABLE backups pagos
+TABLE DATA backups pagos
+CONSTRAINT backups pagos
+
+INTERPRETACION:
+
+TABLE describe la definicion estructural.
+
+TABLE DATA representa los registros respaldados.
+
+CONSTRAINT representa definiciones de restricciones.
+
+El TOC muestra que elementos pueden restaurarse.
+
+IMPORTANTE:
+
+No volveremos a utilizar -t en pg_restore porque
+el archivo ya contiene la seleccion correspondiente.
+
+Filtrar otra vez con pg_restore -t puede excluir
+objetos subsidiarios, como restricciones o indices.
+
+
+6. SIMULAR LA PERDIDA
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X
+
+CONSOLA: psql.
+
+DROP TABLE backups.pagos;
+
+Verificar:
+
+SELECT COALESCE(
+    to_regclass('backups.pagos')::text,
+    'AUSENTE'
+);
+
+RESULTADO:
+
+AUSENTE
+
+EXPLICACION:
+
+to_regclass devuelve el identificador del objeto si existe.
+
+Si no existe, devuelve NULL.
+
+COALESCE transforma ese NULL en el texto AUSENTE.
+
+Dado que ejecutamos DROP TABLE como una sentencia independiente
+con el autocommit habitual de psql, su efecto se confirma
+al completar correctamente la sentencia.
+
+El respaldo logico permanece en el filesystem Linux.
+
+Salir:
+
+\q
+
+
+7. RECUPERACION MEDIANTE PG_RESTORE
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+pg_restore -h "$PGHOST" -p "$PGPORT" -U postgres -d "$PGDATABASE" --exit-on-error "$P5_ROOT/logical/pagos.dump"
+
+EXPLICACION:
+
+pg_restore lee el archivo custom.
+
+Reconstruye los elementos incluidos en su TOC.
+
+--exit-on-error detiene la operacion ante un error SQL.
+
+La base de datos de destino debe existir.
+
+La tabla backups.clientes tambien debe existir para
+permitir la reconstruccion de la referencia correspondiente.
+
+
+8. AFTER - VALIDAR DATOS Y ESTRUCTURA
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO ESPERADO:
+
+101  1  100.00  CONFIRMADO
+102  2  250.00  CONFIRMADO
+103  1  300.00  CONFIRMADO
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+Validar la foreign key:
+
+SELECT count(*)
+FROM pg_constraint
+WHERE conrelid = 'backups.pagos'::regclass
+  AND contype = 'f';
+
+RESULTADO:
+
+1
+
+INTERPRETACION:
+
+Recuperamos tres registros y una clave foranea.
+
+Esto respalda que recuperamos tanto los datos como
+una parte importante de la estructura de la tabla.
+
+No demuestra una restauracion integral de todos los
+roles, privilegios u objetos de un sistema productivo.
+
+Salir:
+
+\q
+
+
+9. RESTAURACION Y ESTADO FINAL
+--------------------------------------------------------------------------------
+
+La restauracion con pg_restore devuelve la tabla
+al estado necesario para continuar el laboratorio.
+
+ESTADO FINAL:
+
+backups.clientes existe.
+
+backups.pagos existe.
+
+La tabla pagos contiene tres registros.
+
+La foreign key esta disponible.
+
+Los archivos de dump siguen conservados.
+
+No eliminar los dumps ni modificar los tres pagos.
+
+El escenario 05.02 utiliza este estado.
+
+
+10. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle Data Pump usa expdp e impdp para exportar e
+importar datos y objetos.
+
+pg_dump y pg_restore tienen una finalidad comparable.
+
+No son herramientas identicas:
+
+Sus formatos, opciones, metadatos y comportamientos
+de dependencias pueden ser diferentes.
+
+Un DBA debe verificar el alcance real del respaldo.
+
+
+11. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+Un respaldo logico puede recuperar una tabla eliminada
+si contiene sus datos y definiciones necesarias.
+
+Sin embargo, un backup logico no incorpora
+automaticamente operaciones posteriores a su captura.
+
+REFERENCIAS:
+
+https://www.postgresql.org/docs/18/app-pgdump.html
+https://www.postgresql.org/docs/18/app-pgrestore.html

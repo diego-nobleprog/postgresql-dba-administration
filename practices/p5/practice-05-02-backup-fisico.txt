@@ -1,0 +1,312 @@
+================================================================================
+PRACTICA 05.02 - BACKUP FISICO CON PG_BASEBACKUP
+MODULO 4: BACKUP & RECOVERY - POSTGRESQL 18
+================================================================================
+
+1. SITUACION
+--------------------------------------------------------------------------------
+
+Una empresa pierde la disponibilidad de su servidor PostgreSQL
+debido a una falla de almacenamiento.
+
+Ahora no necesitamos recuperar solamente una tabla.
+
+Necesitamos reconstruir una instancia completa.
+
+PREGUNTA CENTRAL:
+
+Como comprobamos que un backup fisico permite iniciar
+una instancia independiente y recuperar sus datos?
+
+
+2. CONCEPTOS
+--------------------------------------------------------------------------------
+
+BACKUP FISICO:
+
+Copia de los archivos que forman el cluster PostgreSQL.
+
+CLUSTER:
+
+Conjunto de bases de datos gestionadas por una instancia
+PostgreSQL y su directorio de datos.
+
+PGDATA:
+
+Directorio que contiene los principales archivos fisicos
+y metadatos del cluster.
+
+PG_BASEBACKUP:
+
+Herramienta para obtener un backup fisico online.
+
+ONLINE:
+
+El servidor permanece disponible durante la obtencion
+del respaldo.
+
+WAL:
+
+Write-Ahead Log.
+
+Registra informacion necesaria para durabilidad y
+recuperacion de cambios.
+
+Un backup fisico online necesita WAL suficiente para
+alcanzar un estado consistente.
+
+BACKUP_MANIFEST:
+
+Archivo que describe elementos del respaldo y contiene
+informacion necesaria para verificarlo.
+
+PG_VERIFYBACKUP:
+
+Herramienta que verifica el respaldo mediante el manifest.
+
+Su exito no sustituye una prueba funcional de restauracion.
+
+
+3. BEFORE
+--------------------------------------------------------------------------------
+
+Requisitos:
+
+- Guia 05.00 completada.
+- Escenario 05.01 completado.
+- Tres pagos disponibles.
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+CONSOLA: Linux.
+
+source /tmp/p5-scripts/00-env.sh
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+SELECT pg_is_in_recovery();
+
+RESULTADO:
+
+f
+
+INTERPRETACION:
+
+Tenemos tres pagos iniciales.
+
+La instancia origen no esta en recovery.
+
+Salir:
+
+\q
+
+
+4. CREAR EL BACKUP FISICO
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/02-basebackup.sh
+
+Este script ejecuta:
+
+pg_basebackup -h "$PGHOST" -p "$PGPORT" -U postgres -D "$P5_ROOT/base/physical" -Fp -Xs --checkpoint=fast
+
+PARAMETROS:
+
+-D:
+Directorio de destino del backup.
+
+-Fp:
+Formato plain, con archivos fisicos.
+
+-Xs:
+Incluye WAL mediante streaming.
+
+--checkpoint=fast:
+Solicita un checkpoint rapido.
+
+Un checkpoint rapido puede incrementar el I/O;
+no debe elegirse automaticamente para produccion.
+
+Este comando obtiene un respaldo fisico del cluster
+mientras el origen permanece disponible.
+
+
+5. VERIFICAR EL BACKUP
+--------------------------------------------------------------------------------
+
+El script verifica el archivo:
+
+$P5_ROOT/base/physical/backup_manifest
+
+Despues ejecuta:
+
+pg_verifybackup "$P5_ROOT/base/physical"
+
+SALIDA REAL DE REFERENCIA:
+
+backup successfully verified
+
+INTERPRETACION:
+
+La herramienta valido el respaldo conforme a su manifest,
+incluidos los archivos y WAL pertinentes.
+
+Esto aporta evidencia sobre la integridad del respaldo.
+
+NO demuestra por si solo que una aplicacion funcione
+correctamente despues de restaurar.
+
+Por eso continuamos con un arranque real.
+
+
+6. RESTAURAR UNA INSTANCIA INDEPENDIENTE
+--------------------------------------------------------------------------------
+
+El script realiza una copia:
+
+cp -a "$P5_ROOT/base/physical" "$P5_ROOT/restore/standalone"
+
+Y arranca el nuevo cluster:
+
+pg_ctl -D "$P5_ROOT/restore/standalone" -l "$P5_ROOT/log/standalone.log" -o "-c port=55432 -c archive_mode=off" -w start
+
+EXPLICACION:
+
+No reutilizamos PGDATA del origen.
+
+El backup es copiado a un directorio independiente.
+
+La instancia restaurada utiliza el puerto interno 55432.
+
+archive_mode=off impide que este proceso de prueba
+archive WAL sobre el repositorio utilizado por el origen.
+
+Al iniciar, PostgreSQL realiza las operaciones de recuperacion
+necesarias para que la copia alcance un estado consistente.
+
+
+7. AFTER - COMPROBAR LA RESTAURACION
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55432
+
+CONSOLA: psql.
+
+SELECT current_database(), pg_is_in_recovery();
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+INTERPRETACION:
+
+Estamos consultando el cluster restaurado.
+
+Los tres pagos estan disponibles en la nueva instancia.
+
+La comprobacion valida que el respaldo sirvio
+para iniciar PostgreSQL y consultar los datos.
+
+Salir:
+
+\q
+
+
+8. RESTAURAR EL ESTADO DEL LABORATORIO
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+Detener la instancia restaurada:
+
+pg_ctl -D "$P5_ROOT/restore/standalone" -m fast -w stop
+
+EXPLICACION:
+
+El backup fisico permanece disponible.
+
+Solamente detenemos el proceso del puerto 55432.
+
+Comprobar que el origen sigue disponible:
+
+psql -X
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+Salir:
+
+\q
+
+ESTADO FINAL:
+
+Origen 55431: disponible.
+
+Restauracion 55432: detenida.
+
+Backup fisico: conservado.
+
+Archivos WAL: conservados.
+
+No borrar el backup porque PITR lo utilizara.
+
+
+9. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle utiliza RMAN para respaldos y recuperaciones fisicas.
+
+pg_basebackup proporciona respaldo fisico online del cluster.
+
+Son comparables en su finalidad, pero no tienen las mismas
+capacidades, catalogos o estrategias.
+
+No debe asumirse que pg_basebackup ofrece por si solo
+todas las funciones de administracion de RMAN.
+
+
+10. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+Un backup fisico permite reconstruir un cluster PostgreSQL.
+
+Comprobamos:
+
+- Respaldo generado.
+- Manifest disponible.
+- pg_verifybackup exitoso.
+- Instancia restaurada iniciada.
+- Datos consultados correctamente.
+
+LIMITE:
+
+El backup fisico por si solo no contiene necesariamente
+todos los cambios que ocurran despues de su finalizacion.
+
+REFERENCIAS:
+
+https://www.postgresql.org/docs/18/app-pgbasebackup.html
+https://www.postgresql.org/docs/18/app-pgverifybackup.html

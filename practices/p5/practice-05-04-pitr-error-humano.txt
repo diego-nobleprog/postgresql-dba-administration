@@ -1,0 +1,474 @@
+================================================================================
+PRACTICA 05.04 - POINT-IN-TIME RECOVERY ANTE ERROR HUMANO
+MODULO 4: BACKUP & RECOVERY - POSTGRESQL 18
+================================================================================
+
+1. SITUACION
+--------------------------------------------------------------------------------
+
+Una empresa dispone de un backup fisico con tres pagos.
+
+Despues del respaldo, la aplicacion confirma dos pagos nuevos.
+
+Posteriormente, un administrador elimina accidentalmente
+la tabla de pagos y confirma la operacion.
+
+Necesitamos recuperar los cinco pagos anteriores al incidente
+sin reproducir el DROP TABLE.
+
+PREGUNTA CENTRAL:
+
+Como recuperar un estado anterior a un error confirmado
+utilizando el backup base y los WAL archivados?
+
+
+2. CONCEPTOS
+--------------------------------------------------------------------------------
+
+PITR:
+
+Point-in-Time Recovery.
+
+Procedimiento para reconstruir un estado historico mediante
+un backup fisico y la reproduccion controlada de WAL.
+
+BACKUP BASE:
+
+Punto fisico inicial para la recuperacion.
+
+WAL REPLAY:
+
+Aplicacion de registros WAL que permite avanzar
+desde el backup hasta un estado posterior.
+
+RECOVERY_TARGET_TIME:
+
+Parametro que especifica un instante de recuperacion.
+
+RESTORE_COMMAND:
+
+Comando utilizado para leer archivos WAL desde
+su ubicacion de archivado.
+
+RECOVERY.SIGNAL:
+
+Archivo que indica que PostgreSQL debe realizar recovery
+al iniciar con los parametros correspondientes.
+
+RECOVERY_TARGET_ACTION:
+
+Controla lo que ocurre cuando el replay alcanza
+el objetivo solicitado.
+
+En este escenario usaremos:
+
+promote
+
+Una vez finalizada la recuperacion, la instancia
+podra aceptar nuevas escrituras.
+
+DIFERENCIA ENTRE ROLLBACK Y PITR:
+
+ROLLBACK revierte los cambios de una transaccion
+que todavia no ha sido confirmada.
+
+No permite deshacer desde otra sesion un DROP TABLE
+que ya fue confirmado.
+
+PITR reconstruye otra instancia en un estado historico
+anterior al incidente.
+
+
+3. BEFORE - ESTADO INICIAL
+--------------------------------------------------------------------------------
+
+Requisitos:
+
+- Escenarios 05.01, 05.02 y 05.03 terminados.
+- Backup fisico disponible.
+- WAL archiving funcionando.
+- Tres pagos en el origen.
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+CONSOLA: Linux.
+
+source /tmp/p5-scripts/00-env.sh
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO:
+
+101
+102
+103
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+3
+
+Salir:
+
+\q
+
+
+4. CREAR TRANSACCIONES DESPUES DEL BACKUP
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/04-prepare-incident.sh
+
+El script ejecuta operaciones equivalentes a:
+
+INSERT INTO backups.pagos
+VALUES (201,1,450.00,'DESPUES_BACKUP_A');
+
+SELECT pg_create_restore_point('p5_punto_a');
+
+INSERT INTO backups.pagos
+VALUES (202,2,650.00,'DESPUES_BACKUP_B');
+
+SELECT pg_create_restore_point('p5_antes_error');
+
+SELECT clock_timestamp();
+
+INTERPRETACION:
+
+Los pagos 201 y 202 se confirman DESPUES del backup fisico.
+
+El punto A corresponde a la historia posterior al pago 201.
+
+El punto B corresponde a la historia posterior al pago 202.
+
+clock_timestamp registra la referencia temporal actual
+del servidor antes de provocar el incidente.
+
+El objetivo se guarda en:
+
+/tmp/nobleprog-p5-lab/metadata/target-time.txt
+
+Consultar:
+
+cat "$P5_ROOT/metadata/target-time.txt"
+
+SALIDA REAL DE REFERENCIA:
+
+2026-11-11 00:51:08.600081+00
+
+IMPORTANTE:
+
+Este valor pertenece a la ejecucion del instructor.
+
+En una nueva ejecucion utilizaremos el tiempo registrado
+automaticamente por el script, no un valor copiado.
+
+
+5. BEFORE DEL INCIDENTE - CINCO PAGOS
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO:
+
+101  100.00  CONFIRMADO
+102  250.00  CONFIRMADO
+103  300.00  CONFIRMADO
+201  450.00  DESPUES_BACKUP_A
+202  650.00  DESPUES_BACKUP_B
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+5
+
+INTERPRETACION:
+
+El respaldo fisico contenia tres pagos.
+
+Ahora hay cinco porque se confirmaron dos transacciones
+posteriores al respaldo.
+
+Si restauraramos solamente el backup base, no habriamos
+recuperado automaticamente toda la actividad posterior.
+
+
+6. PROVOCAR EL ERROR HUMANO
+--------------------------------------------------------------------------------
+
+CONSOLA: psql, todavia conectado al origen 55431.
+
+BEGIN;
+
+DROP TABLE backups.pagos;
+
+COMMIT;
+
+INTERPRETACION:
+
+BEGIN abre una transaccion explicita.
+
+DROP TABLE elimina la tabla dentro de esa transaccion.
+
+COMMIT confirma la eliminacion.
+
+Verificar:
+
+SELECT COALESCE(
+    to_regclass('backups.pagos')::text,
+    'AUSENTE'
+);
+
+RESULTADO:
+
+AUSENTE
+
+La tabla ya no esta disponible en el origen.
+
+IMPORTANTE:
+
+Este DROP se ejecuta exclusivamente en el cluster P5.
+
+Salir:
+
+\q
+
+
+7. CONSERVAR WAL DEL INCIDENTE
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/04-archive-incident.sh
+
+El script comprueba que la tabla esta ausente.
+
+Despues ejecuta un cambio de segmento WAL y
+espera hasta que su archivo quede archivado.
+
+SALIDA REAL DE REFERENCIA:
+
+000000010000000000000005
+
+INTERPRETACION:
+
+El WAL archivado contiene la historia necesaria
+para avanzar hasta el incidente.
+
+PITR permitira detener el replay antes de aplicar
+la transaccion destructiva.
+
+
+8. REALIZAR PITR
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/04-recover-time.sh
+
+Este script:
+
+1. Copia el backup fisico original.
+
+2. Crea recovery.signal.
+
+3. Configura restore_command.
+
+4. Selecciona recovery_target_time.
+
+5. Usa recovery_target_timeline=current.
+
+6. Establece recovery_target_action=promote.
+
+7. Inicia otra instancia en el puerto 55433.
+
+8. Espera hasta que termine la promocion.
+
+9. Comprueba los cinco pagos.
+
+El origen no se modifica durante esta recuperacion.
+
+
+9. AFTER - VERIFICAR LA RECUPERACION
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X -p 55433
+
+CONSOLA: psql.
+
+SELECT pg_is_in_recovery();
+
+RESULTADO:
+
+f
+
+INTERPRETACION:
+
+La instancia recuperada ha sido promovida.
+
+Consultar:
+
+SELECT id, cliente_id, monto, estado
+FROM backups.pagos
+ORDER BY id;
+
+RESULTADO ESPERADO:
+
+101  100.00  CONFIRMADO
+102  250.00  CONFIRMADO
+103  300.00  CONFIRMADO
+201  450.00  DESPUES_BACKUP_A
+202  650.00  DESPUES_BACKUP_B
+
+SELECT count(*) FROM backups.pagos;
+
+RESULTADO:
+
+5
+
+INTERPRETACION:
+
+Se recuperaron los tres pagos originales.
+
+Se conservaron los pagos 201 y 202.
+
+El DROP TABLE no se reprodujo.
+
+Salir:
+
+\q
+
+Comparar con el origen:
+
+psql -X
+
+SELECT COALESCE(
+    to_regclass('backups.pagos')::text,
+    'AUSENTE'
+);
+
+RESULTADO:
+
+AUSENTE
+
+INTERPRETACION:
+
+El origen todavia refleja el error humano.
+
+La instancia recuperada refleja el estado anterior al error.
+
+Esto demuestra que PITR reconstruyo una historia
+independiente en lugar de modificar el origen.
+
+Salir:
+
+\q
+
+
+10. RPO Y RTO
+--------------------------------------------------------------------------------
+
+RPO:
+
+Recovery Point Objective.
+
+Define la perdida maxima de informacion tolerada.
+
+RTO:
+
+Recovery Time Objective.
+
+Define el tiempo objetivo para recuperar el servicio.
+
+El punto elegido para PITR afecta los cambios recuperados.
+
+Pero esta demostracion no mide formalmente RPO ni RTO.
+
+Para establecerlos en produccion se requieren pruebas
+operativas y objetivos definidos por la organizacion.
+
+
+11. RESTAURACION Y ESTADO FINAL
+--------------------------------------------------------------------------------
+
+No detener la recuperacion del puerto 55433.
+
+La practica 05.05 utiliza su timeline.
+
+ESTADO ESPERADO:
+
+Origen 55431:
+Tabla pagos eliminada.
+
+PITR 55433:
+Cinco pagos disponibles.
+
+Backup fisico:
+Conservado.
+
+WAL:
+Conservados.
+
+Recovery targets:
+Registrados en metadata.
+
+
+12. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle RMAN permite recuperaciones incompletas mediante
+criterios como tiempo y SCN.
+
+PostgreSQL utiliza recovery targets para controlar
+hasta donde reproduce WAL.
+
+LSN y SCN no son implementaciones equivalentes.
+
+La finalidad comparable es reconstruir un estado anterior
+a una transaccion destructiva.
+
+
+13. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+El backup contenia tres pagos.
+
+Dos operaciones posteriores elevaron el total a cinco.
+
+La eliminacion confirmada destruyo la tabla en el origen.
+
+PITR reconstruyo una instancia con los cinco pagos
+y excluyo el DROP TABLE.
+
+LIMITES:
+
+No probamos failover de aplicaciones.
+
+No medimos tiempos reales de recuperacion productiva.
+
+No comprobamos backups almacenados fuera del contenedor.
+
+REFERENCIA:
+
+https://www.postgresql.org/docs/18/continuous-archiving.html

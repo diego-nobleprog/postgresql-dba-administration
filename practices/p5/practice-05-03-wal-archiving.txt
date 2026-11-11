@@ -1,0 +1,360 @@
+================================================================================
+PRACTICA 05.03 - WAL ARCHIVING Y RESTAURACION DEL ARCHIVADOR
+MODULO 4: BACKUP & RECOVERY - POSTGRESQL 18
+================================================================================
+
+1. SITUACION
+--------------------------------------------------------------------------------
+
+Una organizacion genera respaldos fisicos periodicos.
+
+Sin embargo, sus aplicaciones registran nuevos pagos
+durante todo el dia.
+
+Una falla puede ocurrir varias horas despues del
+ultimo backup fisico.
+
+PREGUNTA CENTRAL:
+
+Como podemos conservar la historia WAL posterior
+al backup y comprobar el funcionamiento del archivador?
+
+
+2. CONCEPTOS
+--------------------------------------------------------------------------------
+
+WAL:
+
+Write-Ahead Log.
+
+Registra informacion necesaria para recuperar
+cambios y mantener la durabilidad de las transacciones.
+
+SEGMENTO WAL:
+
+Archivo que contiene una seccion del registro WAL.
+
+ARCHIVE_MODE:
+
+Parametro que habilita el archivado de WAL.
+
+ARCHIVE_COMMAND:
+
+Comando encargado de conservar los segmentos WAL
+en la ubicacion de archivado.
+
+El comando debe comunicar exito solo cuando
+el archivo se haya almacenado correctamente.
+
+PG_STAT_ARCHIVER:
+
+Vista que contiene estadisticas del archivador.
+
+archived_count:
+
+Cantidad acumulada de archivados exitosos.
+
+failed_count:
+
+Cantidad acumulada de intentos fallidos.
+
+LAST_ARCHIVED_WAL:
+
+Identificador del ultimo WAL archivado correctamente.
+
+LAST_FAILED_WAL:
+
+Identificador del WAL asociado al ultimo fallo registrado.
+
+PG_SWITCH_WAL:
+
+Solicita un cambio de segmento WAL.
+
+Permite provocar actividad observable sin esperar
+que el segmento se llene naturalmente.
+
+
+3. BEFORE - VALORES INICIALES
+--------------------------------------------------------------------------------
+
+Requisitos:
+
+- 05.02 completado.
+- Instancia restaurada 55432 detenida.
+- Servidor origen funcionando.
+
+CONSOLA: PowerShell.
+
+docker exec -it -u postgres p5-backup-lab bash
+
+CONSOLA: Linux.
+
+source /tmp/p5-scripts/00-env.sh
+
+psql -X
+
+CONSOLA: psql.
+
+SELECT name, setting, context, source
+FROM pg_settings
+WHERE name IN (
+    'wal_level',
+    'archive_mode',
+    'archive_command'
+)
+ORDER BY name;
+
+VALORES DE REFERENCIA:
+
+wal_level = replica
+archive_mode = on
+
+El archive_command debe identificar el directorio
+de archivado del laboratorio P5.
+
+INTERPRETACION:
+
+wal_level determina la informacion escrita en WAL.
+
+archive_mode controla si el archivador esta habilitado.
+
+archive_command define como se guarda cada archivo.
+
+context indica cuando pueden aplicarse
+cambios de parametros.
+
+source identifica el origen del valor efectivo.
+
+Consultar estadisticas:
+
+SELECT archived_count,
+       failed_count,
+       last_archived_wal,
+       last_failed_wal
+FROM pg_stat_archiver;
+
+IMPORTANTE:
+
+Los contadores son acumulados.
+
+No tienen por que comenzar en cero.
+
+La ejecucion de pg_basebackup puede haber
+provocado actividad WAL anterior.
+
+Salir:
+
+\q
+
+
+4. OPERACION - ARCHIVADO Y ERROR CONTROLADO
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+bash /tmp/p5-scripts/03-archive-wal.sh
+
+El script realiza este procedimiento:
+
+1. Consulta y conserva el archive_command original.
+
+2. Consulta archived_count.
+
+3. Identifica el segmento WAL activo.
+
+4. Ejecuta pg_switch_wal.
+
+5. Comprueba que el segmento aparece en el archivo.
+
+6. Espera hasta que archived_count avance.
+
+7. Cambia temporalmente archive_command a /bin/false.
+
+8. Solicita otro cambio de segmento.
+
+9. Espera un incremento de failed_count.
+
+10. Restaura el archive_command original.
+
+11. Comprueba que el segmento fallido termina archivado.
+
+La operacion de cambio temporal utiliza ALTER SYSTEM.
+
+El archivo postgresql.auto.conf registra ese cambio
+hasta que sea restaurado mediante ALTER SYSTEM RESET.
+
+El script tiene una restauracion de seguridad para
+intentar reponer el comando original ante errores.
+
+
+5. EVIDENCIAS REALES DEL INSTRUCTOR
+--------------------------------------------------------------------------------
+
+La validacion de PostgreSQL 18.6 produjo:
+
+archive_mode = on
+wal_level = replica
+
+SEGMENTO ARCHIVADO:
+
+000000010000000000000003
+
+CONTADOR ANTES:
+
+3
+
+CONTADOR DESPUES:
+
+4
+
+INTERPRETACION:
+
+El archivo WAL fue archivado.
+
+El contador archived_count avanzo.
+
+Estas evidencias son complementarias.
+
+El archivo demuestra que se conservo ese segmento.
+
+La estadistica demuestra que PostgreSQL registro
+una operacion de archivado exitosa.
+
+FALLO CONTROLADO:
+
+archive_command = /bin/false
+
+failed_count antes = 0
+failed_count despues = 1
+
+INTERPRETACION:
+
+/bin/false devuelve un codigo no exitoso.
+
+PostgreSQL registra el intento fallido.
+
+No debemos interpretarlo como un fallo espontaneo
+del servidor: nosotros lo provocamos deliberadamente.
+
+RESTAURACION:
+
+archive_command original recuperado.
+
+Segmento archivado despues del fallo:
+
+000000010000000000000004
+
+INTERPRETACION:
+
+El archivado volvio a funcionar despues de restaurar
+su configuracion.
+
+Los nombres WAL y los contadores pueden variar
+entre ejecuciones.
+
+
+6. AFTER - COMPROBACION INTERACTIVA
+--------------------------------------------------------------------------------
+
+CONSOLA: Linux.
+
+psql -X
+
+CONSOLA: psql.
+
+SHOW archive_mode;
+
+SHOW archive_command;
+
+SELECT archived_count,
+       failed_count,
+       last_archived_wal,
+       last_failed_wal
+FROM pg_stat_archiver;
+
+COMPROBAR:
+
+archive_mode sigue activo.
+
+archive_command coincide con el BEFORE.
+
+archived_count muestra actividad correcta.
+
+failed_count conserva la evidencia del fallo.
+
+INTERPRETACION:
+
+La existencia de failed_count > 0 no demuestra
+que el archivado siga fallando actualmente.
+
+Hay que correlacionar el parametro efectivo,
+los contadores y los segmentos disponibles.
+
+Salir:
+
+\q
+
+CONSOLA: Linux.
+
+ls -lh "$P5_ROOT/archive"
+
+Los archivos WAL se conservaran para PITR.
+
+
+7. RESTAURACION Y ESTADO FINAL
+--------------------------------------------------------------------------------
+
+El script restaura el archive_command inicial.
+
+Podemos consultar nuevamente:
+
+psql -X -A -t -c 'SHOW archive_command;'
+
+El valor debe coincidir con el observado en BEFORE.
+
+No borrar el archivo WAL ni detener el origen.
+
+ESTADO FINAL:
+
+archive_mode = on.
+
+archive_command = comando funcional original.
+
+WAL archivados = disponibles.
+
+Backup fisico = disponible.
+
+Origen 55431 = funcionando.
+
+
+8. COMPARACION CON ORACLE
+--------------------------------------------------------------------------------
+
+Oracle utiliza ARCHIVELOG para conservar archived redo logs.
+
+PostgreSQL utiliza WAL archiving.
+
+Ambos mecanismos permiten conservar registros necesarios
+para determinadas estrategias de recuperacion.
+
+No son identicos en configuracion, formato ni administracion.
+
+
+9. CONCLUSION DBA
+--------------------------------------------------------------------------------
+
+El archivado WAL preserva segmentos que pueden ser
+necesarios para recuperar transacciones posteriores al backup.
+
+Demostramos funcionamiento exitoso, fallo y restauracion.
+
+LIMITE:
+
+Un segmento WAL aislado no garantiza recuperacion.
+
+Se necesita un backup base valido y una secuencia
+continua de WAL hasta el objetivo solicitado.
+
+REFERENCIA:
+
+https://www.postgresql.org/docs/18/continuous-archiving.html
