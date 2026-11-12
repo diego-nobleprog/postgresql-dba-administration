@@ -1,0 +1,86 @@
+PRACTICA 07.05 - LOCKS, WAIT EVENTS Y DEADLOCKS
+PostgreSQL DBA Administration
+Rendimiento y diagnostico
+
+OBJETIVO
+
+Distinguir un bloqueo simple de un ciclo de espera y comprobar la recuperacion transaccional.
+
+REQUISITOS
+
+Laboratorio preparado. accounts_05 no debe existir.
+Contenedor p7-performance-manual preparado mediante 07.00.
+No ejecutar sobre el contenedor temporal usado durante el desarrollo.
+Cada escenario se ejecuta una sola vez sobre su carga.
+
+ACTIVIDADES DEL SCRIPT
+
+1. Crear dos cuentas con balance 1000.
+2. Mantener una actualizacion abierta en A y bloquear B.
+3. Observar pg_stat_activity, pg_locks y pg_blocking_pids.
+4. Resolver el bloqueo mediante rollback.
+5. Actualizar filas en orden inverso para formar un deadlock.
+6. Comprobar una victima con SQLSTATE 40P01.
+7. Verificar incremento del contador y ausencia de sesiones residuales.
+
+EJECUCION - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p7-performance-manual"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se encontro el contenedor." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    if ($info.Config.Labels.'nobleprog.p7.lab' -ne "true") {
+        throw "Etiqueta incorrecta."
+    }
+    if (-not $info.State.Running) { throw "El contenedor no esta activo." }
+
+    docker exec -u root $name bash /tmp/p7-scripts/05-locks-deadlocks.sh
+    $runCode = $LASTEXITCODE
+
+    $token = [guid]::NewGuid().ToString("N")
+    $destination = Join-Path (Get-Location).Path "temp\p7-05-$token.txt"
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+
+    docker cp "${name}:/tmp/p7-05-results.txt" $destination
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo recuperar la evidencia." }
+
+    if ($runCode -ne 0) {
+        throw "Escenario fallido. Revisar evidencia y no repetir."
+    }
+
+    $lines = @(Get-Content -LiteralPath $destination -Encoding UTF8)
+    if ($lines -notcontains "PASS: ESCENARIO 07.05 COMPLETADO") {
+        throw "Falta la confirmacion final."
+    }
+
+    Write-Host "Evidencia: $destination"
+}
+
+Ejecutar desde la raiz del repositorio.
+No introducir este bloque dentro de psql.
+Leer los resultados intermedios antes de dar el escenario por validado.
+
+RESULTADOS Y VERIFICACIONES
+
+Bloqueo simple resuelto. Un unico error 40P01 esperado, una sesion victima y otra superviviente. Ambas cuentas terminan con balance 1000 y no quedan sesiones A/B.
+
+INTERPRETACION DBA
+
+Una sesion idle in transaction puede conservar locks. Una sesion active puede estar esperando un lock. La victima del deadlock puede ser A o B. El contador se conserva; no se reinician estadisticas.
+
+COMPARACION CON ORACLE
+
+Discutir como se investigaria este mismo problema en Oracle.
+Identificar que evidencia seria necesaria antes de recomendar un cambio.
+No asumir equivalencia de parametros, operadores o comandos entre motores.
+
+CIERRE
+
+El script conserva las tablas y sus evidencias para inspeccion.
+Sus comprobaciones finales describen que recursos restaura.
+Si falla, conservar la salida y diagnosticar antes de repetir.
+El cierre general del cluster se encuentra en 07.00.

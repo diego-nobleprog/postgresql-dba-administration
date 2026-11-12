@@ -1,0 +1,87 @@
+PRACTICA 07.06 - TROUBLESHOOTING Y BENCHMARKING
+PostgreSQL DBA Administration
+Rendimiento y diagnostico
+
+OBJETIVO
+
+Comparar carga concurrente antes y despues de un indice y correlacionarla con recursos, esperas, WAL y checkpoints.
+
+REQUISITOS
+
+07.01 completado y recursos nuevos para 07.06. pgbench disponible en la imagen.
+Contenedor p7-performance-manual preparado mediante 07.00.
+No ejecutar sobre el contenedor temporal usado durante el desarrollo.
+Cada escenario se ejecuta una sola vez sobre su carga.
+
+ACTIVIDADES DEL SCRIPT
+
+1. Copiar orders_01 a una tabla exclusiva del benchmark.
+2. Ejecutar cuatro clientes con calentamiento y medicion.
+3. Alternar sin indice, con indice, con indice y sin indice.
+4. Capturar TPS, latencia, CPU, memoria, I/O y actividad.
+5. Comprobar el indice en el plan y eliminarlo al finalizar.
+6. Actualizar y restaurar 1000 filas auxiliares para observar WAL.
+7. Solicitar un checkpoint y verificar su contador.
+8. Comprobar carga, balances y cierre de conexiones de pgbench.
+
+EJECUCION - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p7-performance-manual"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se encontro el contenedor." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    if ($info.Config.Labels.'nobleprog.p7.lab' -ne "true") {
+        throw "Etiqueta incorrecta."
+    }
+    if (-not $info.State.Running) { throw "El contenedor no esta activo." }
+
+    docker exec -u root $name bash /tmp/p7-scripts/06-troubleshooting-benchmark.sh
+    $runCode = $LASTEXITCODE
+
+    $token = [guid]::NewGuid().ToString("N")
+    $destination = Join-Path (Get-Location).Path "temp\p7-06-$token.txt"
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+
+    docker cp "${name}:/tmp/p7-06-results.txt" $destination
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo recuperar la evidencia." }
+
+    if ($runCode -ne 0) {
+        throw "Escenario fallido. Revisar evidencia y no repetir."
+    }
+
+    $lines = @(Get-Content -LiteralPath $destination -Encoding UTF8)
+    if ($lines -notcontains "PASS: ESCENARIO 07.06 COMPLETADO") {
+        throw "Falta la confirmacion final."
+    }
+
+    Write-Host "Evidencia: $destination"
+}
+
+Ejecutar desde la raiz del repositorio.
+No introducir este bloque dentro de psql.
+Leer los resultados intermedios antes de dar el escenario por validado.
+
+RESULTADOS Y VERIFICACIONES
+
+Cuatro benchmarks sin transacciones fallidas y con metricas positivas. Indice utilizado y posteriormente eliminado. Avance de WAL y aumento de checkpoints solicitados. Datos auxiliares restaurados.
+
+INTERPRETACION DBA
+
+Las muestras incluyen actividad del contenedor y del observador. pg_stat_activity puede incluir trabajadores paralelos: sus filas no equivalen todas a clientes. El avance de WAL puede incluir actividad interna. No se exige una mejora fija de tiempo ni se prueba agotamiento de conexiones.
+
+COMPARACION CON ORACLE
+
+Discutir como se investigaria este mismo problema en Oracle.
+Identificar que evidencia seria necesaria antes de recomendar un cambio.
+No asumir equivalencia de parametros, operadores o comandos entre motores.
+
+CIERRE
+
+El script conserva las tablas y sus evidencias para inspeccion.
+Sus comprobaciones finales describen que recursos restaura.
+Si falla, conservar la salida y diagnosticar antes de repetir.
+El cierre general del cluster se encuentra en 07.00.

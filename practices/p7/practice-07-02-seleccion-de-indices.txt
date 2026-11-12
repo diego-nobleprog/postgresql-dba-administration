@@ -1,0 +1,87 @@
+PRACTICA 07.02 - SELECCION DE INDICES
+PostgreSQL DBA Administration
+Rendimiento y diagnostico
+
+OBJETIVO
+
+Relacionar predicados y operadores con indices B-tree, compuestos, parciales, GIN, GiST y BRIN.
+
+REQUISITOS
+
+Laboratorio preparado. Ejecutar despues de 07.01 para seguir el recorrido.
+Contenedor p7-performance-manual preparado mediante 07.00.
+No ejecutar sobre el contenedor temporal usado durante el desarrollo.
+Cada escenario se ejecuta una sola vez sobre su carga.
+
+ACTIVIDADES DEL SCRIPT
+
+1. Crear index_cases_02 con 240000 filas.
+2. Medir igualdad selectiva mediante B-tree.
+3. Combinar igualdad y rango mediante indice compuesto.
+4. Usar un indice parcial para pedidos pendientes.
+5. Probar pertenencia en arrays con GIN.
+6. Obtener puntos cercanos con GiST.
+7. Consultar un rango temporal correlacionado con BRIN.
+8. Comparar planes, filas, suma de identificadores, tamano y construccion.
+
+EJECUCION - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p7-performance-manual"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se encontro el contenedor." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    if ($info.Config.Labels.'nobleprog.p7.lab' -ne "true") {
+        throw "Etiqueta incorrecta."
+    }
+    if (-not $info.State.Running) { throw "El contenedor no esta activo." }
+
+    docker exec -u root $name bash /tmp/p7-scripts/02-indexes.sh
+    $runCode = $LASTEXITCODE
+
+    $token = [guid]::NewGuid().ToString("N")
+    $destination = Join-Path (Get-Location).Path "temp\p7-02-$token.txt"
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+
+    docker cp "${name}:/tmp/p7-02-results.txt" $destination
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo recuperar la evidencia." }
+
+    if ($runCode -ne 0) {
+        throw "Escenario fallido. Revisar evidencia y no repetir."
+    }
+
+    $lines = @(Get-Content -LiteralPath $destination -Encoding UTF8)
+    if ($lines -notcontains "PASS: ESCENARIO 07.02 COMPLETADO") {
+        throw "Falta la confirmacion final."
+    }
+
+    Write-Host "Evidencia: $destination"
+}
+
+Ejecutar desde la raiz del repositorio.
+No introducir este bloque dentro de psql.
+Leer los resultados intermedios antes de dar el escenario por validado.
+
+RESULTADOS Y VERIFICACIONES
+
+Seis comparaciones BEFORE/AFTER, doce mediciones. Cada caso utiliza su indice y conserva cantidad y suma de identificadores. Los seis indices experimentales se eliminan.
+
+INTERPRETACION DBA
+
+El indice adecuado depende de la consulta y de la distribucion. Inspeccionar los nodos hijos, rechecks y buffers; el nodo raiz no siempre identifica el acceso a la tabla.
+
+COMPARACION CON ORACLE
+
+Discutir como se investigaria este mismo problema en Oracle.
+Identificar que evidencia seria necesaria antes de recomendar un cambio.
+No asumir equivalencia de parametros, operadores o comandos entre motores.
+
+CIERRE
+
+El script conserva las tablas y sus evidencias para inspeccion.
+Sus comprobaciones finales describen que recursos restaura.
+Si falla, conservar la salida y diagnosticar antes de repetir.
+El cierre general del cluster se encuentra en 07.00.

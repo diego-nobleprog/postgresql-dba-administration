@@ -1,0 +1,86 @@
+PRACTICA 07.03 - JOINS, SORT Y AGGREGATE
+PostgreSQL DBA Administration
+Rendimiento y diagnostico
+
+OBJETIVO
+
+Interpretar estrategias de join y observar el uso de archivos temporales al variar work_mem en la sesion.
+
+REQUISITOS
+
+07.01 completado: orders_01 con 200000 filas y sin el indice experimental.
+Contenedor p7-performance-manual preparado mediante 07.00.
+No ejecutar sobre el contenedor temporal usado durante el desarrollo.
+Cada escenario se ejecuta una sola vez sobre su carga.
+
+ACTIVIDADES DEL SCRIPT
+
+1. Verificar orders_01 y crear 10000 clientes.
+2. Observar un join selectivo y un join completo.
+3. Solicitar una demostracion de Merge Join deshabilitando alternativas.
+4. Ordenar 200000 filas con work_mem de 64kB y 64MB.
+5. Agrupar en 10000 clientes con ambas configuraciones.
+6. Inspeccionar metodos de sort, batches y bloques temporales.
+7. Restaurar los cinco parametros de sesion modificados.
+
+EJECUCION - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p7-performance-manual"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se encontro el contenedor." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    if ($info.Config.Labels.'nobleprog.p7.lab' -ne "true") {
+        throw "Etiqueta incorrecta."
+    }
+    if (-not $info.State.Running) { throw "El contenedor no esta activo." }
+
+    docker exec -u root $name bash /tmp/p7-scripts/03-joins-sort-aggregate.sh
+    $runCode = $LASTEXITCODE
+
+    $token = [guid]::NewGuid().ToString("N")
+    $destination = Join-Path (Get-Location).Path "temp\p7-03-$token.txt"
+    New-Item -ItemType Directory -Path ".\temp" -Force | Out-Null
+
+    docker cp "${name}:/tmp/p7-03-results.txt" $destination
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo recuperar la evidencia." }
+
+    if ($runCode -ne 0) {
+        throw "Escenario fallido. Revisar evidencia y no repetir."
+    }
+
+    $lines = @(Get-Content -LiteralPath $destination -Encoding UTF8)
+    if ($lines -notcontains "PASS: ESCENARIO 07.03 COMPLETADO") {
+        throw "Falta la confirmacion final."
+    }
+
+    Write-Host "Evidencia: $destination"
+}
+
+Ejecutar desde la raiz del repositorio.
+No introducir este bloque dentro de psql.
+Leer los resultados intermedios antes de dar el escenario por validado.
+
+RESULTADOS Y VERIFICACIONES
+
+Siete planes capturados. Nested Loop selectivo, Hash Join completo y Merge Join solicitado. El escenario comprueba escritura temporal con poca memoria y ausencia de esa escritura con 64MB para esta carga.
+
+INTERPRETACION DBA
+
+Separar la eleccion natural del optimizador del Merge Join solicitado. work_mem se aplica a operaciones del plan; no representa un limite total de memoria de toda la instancia.
+
+COMPARACION CON ORACLE
+
+Discutir como se investigaria este mismo problema en Oracle.
+Identificar que evidencia seria necesaria antes de recomendar un cambio.
+No asumir equivalencia de parametros, operadores o comandos entre motores.
+
+CIERRE
+
+El script conserva las tablas y sus evidencias para inspeccion.
+Sus comprobaciones finales describen que recursos restaura.
+Si falla, conservar la salida y diagnosticar antes de repetir.
+El cierre general del cluster se encuentra en 07.00.

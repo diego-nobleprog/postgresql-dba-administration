@@ -1,0 +1,221 @@
+PRACTICA 07.00 - PREPARACION Y CIERRE
+PostgreSQL DBA Administration
+Rendimiento y diagnostico
+
+OBJETIVO
+
+Preparar un cluster aislado de PostgreSQL 18 para reproducir los
+escenarios 07.01 a 07.06 mediante los scripts de esta practica.
+
+ARQUITECTURA
+
+Windows PowerShell controla un contenedor Linux.
+Imagen: postgresql-dba:18-p1
+Contenedor guiado: p7-performance-manual
+Contenedor de validacion: p7-performance-validation
+Etiqueta: nobleprog.p7.lab=true
+Scripts: /tmp/p7-scripts
+Datos: /tmp/nobleprog-p7-lab/data
+Socket: /tmp/nobleprog-p7-lab/socket
+Puerto del socket: 5432
+Base: nobleprog_performance_scenarios
+Esquema: performance
+
+No se publican puertos. El contenedor usa --network none.
+La autenticacion local trust corresponde exclusivamente al laboratorio.
+Limites del contenedor: 2 CPU y 4 GiB de memoria.
+shared_buffers: 256MB. work_mem inicial: 4MB.
+max_connections: 30.
+pg_stat_statements se carga al iniciar el cluster.
+
+REQUISITOS
+
+Docker Desktop activo y la imagen disponible.
+Rama p7 del repositorio.
+Todos los archivos de practices/p7/scripts deben estar presentes.
+No se requieren los ejecutores temporales para construir otra instancia.
+
+MODOS
+
+A. Recorrido por escenarios: contenedor p7-performance-manual.
+B. Validacion automatizada: contenedor p7-performance-validation.
+
+Cada modo requiere un contenedor nuevo. No ejecutar ambos recorridos
+sobre la misma carga. Los escenarios rechazan recursos existentes.
+
+1. CREAR EL LABORATORIO PARA RECORRIDO POR ESCENARIOS - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+    $branch = git branch --show-current
+    if ($LASTEXITCODE -ne 0 -or $branch -ne "p7") {
+        throw "Debes estar en p7."
+    }
+
+    $name = "p7-performance-manual"
+    $names = @(docker container ls -a --format '{{.Names}}')
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar Docker." }
+    if ($names -contains $name) { throw "El contenedor ya existe." }
+
+    docker create --name $name --user root --network none --cpus 2 --memory 4g --label nobleprog.p7.lab=true --entrypoint /bin/bash postgresql-dba:18-p1 /tmp/p7-scripts/00-start-container.sh manual
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo crear el contenedor." }
+
+    docker cp ".\practices\p7\scripts" "${name}:/tmp/p7-scripts"
+    if ($LASTEXITCODE -ne 0) { throw "No se pudieron copiar los scripts." }
+
+    docker start $name
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo iniciar el contenedor." }
+
+    $ready = $false
+    for ($attempt = 1; $attempt -le 60; $attempt++) {
+        $logs = @(docker logs $name)
+        if ($LASTEXITCODE -ne 0) { throw "No se pudieron consultar logs." }
+        if ($logs -contains "LABORATORIO MANUAL P7 PREPARADO") {
+            $ready = $true
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    docker logs $name
+    if (-not $ready) { throw "No se confirmo la preparacion." }
+}
+
+La preparacion crea la base, el esquema y pg_stat_statements.
+Las tablas de trabajo se crean en los escenarios correspondientes.
+El lanzador comprueba sintaxis Bash antes de preparar PostgreSQL.
+
+2. ORDEN DEL RECORRIDO
+
+07.01 Diagnostico de consultas.
+07.02 Seleccion de indices.
+07.03 Joins, Sort y Aggregate.
+07.04 Parallel Query.
+07.05 Locks, Wait Events y Deadlocks.
+07.06 Troubleshooting y Benchmarking.
+
+Ejecutar el bloque de cada guia una sola vez, en orden.
+Revisar los resultados antes de continuar.
+07.03 y 07.06 requieren orders_01 de 07.01.
+
+3. CONEXION DE INSPECCION - POWERSHELL
+
+docker exec -it -u postgres p7-performance-manual psql -X -h /tmp/nobleprog-p7-lab/socket -p 5432 -U postgres -d nobleprog_performance_scenarios
+
+Dentro de psql:
+
+\pset pager off
+SELECT current_database(), current_user, version();
+\q
+
+Cerrar las conexiones de inspeccion antes del cierre del laboratorio.
+No repetir desde psql las operaciones que ya ejecuto un escenario.
+
+4. VALIDACION AUTOMATIZADA EN OTRO CONTENEDOR - POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
+
+    $branch = git branch --show-current
+    if ($LASTEXITCODE -ne 0 -or $branch -ne "p7") {
+        throw "Debes estar en p7."
+    }
+
+    $name = "p7-performance-validation"
+    $names = @(docker container ls -a --format '{{.Names}}')
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar Docker." }
+    if ($names -contains $name) { throw "El contenedor ya existe." }
+
+    docker create --name $name --user root --network none --cpus 2 --memory 4g --label nobleprog.p7.lab=true --entrypoint /bin/bash postgresql-dba:18-p1 /tmp/p7-scripts/00-start-container.sh validate
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo crear el contenedor." }
+
+    docker cp ".\practices\p7\scripts" "${name}:/tmp/p7-scripts"
+    if ($LASTEXITCODE -ne 0) { throw "No se pudieron copiar los scripts." }
+
+    docker start -a $name
+    $attachCode = $LASTEXITCODE
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo consultar el estado." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    $token = [guid]::NewGuid().ToString("N")
+    $destination = Join-Path (Get-Location).Path "temp\p7-validation-$token"
+    New-Item -ItemType Directory -Path $destination | Out-Null
+
+    docker cp "${name}:/tmp/nobleprog-p7-lab/." $destination
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo recuperar el laboratorio." }
+
+    if ($attachCode -ne 0 -or $info.State.ExitCode -ne 0) {
+        throw "Validacion fallida. Conservar evidencias y contenedor."
+    }
+
+    $summaryPath = Join-Path $destination "validation-evidence\validation.txt"
+    $lines = @(Get-Content -LiteralPath $summaryPath -Encoding UTF8)
+
+    foreach ($expected in @(
+        "01: PASS", "02: PASS", "03: PASS",
+        "04: PASS", "05: PASS", "06: PASS",
+        "ESCENARIOS COMPLETADOS: 6",
+        "TOTAL FAIL: 0",
+        "RESULTADO: VALIDACION P7 EXITOSA",
+        "=== FIN VALIDACION P7 ==="
+    )) {
+        if ($lines -notcontains $expected) {
+            throw "Falta confirmacion: $expected"
+        }
+    }
+
+    Write-Host "Evidencias y datos conservados: $destination"
+}
+
+El directorio recuperado incluye datos del cluster y puede ser grande.
+La validacion detiene PostgreSQL y conserva el contenedor.
+Revisar los resultados intermedios ademas del resumen.
+
+5. CIERRE DEL RECORRIDO POR ESCENARIOS - POWERSHELL
+
+Cerrar primero las sesiones de inspeccion con \q.
+Este bloque detiene PostgreSQL y conserva el contenedor.
+
+& {
+    $ErrorActionPreference = "Stop"
+    $name = "p7-performance-manual"
+
+    $raw = @(docker inspect $name)
+    if ($LASTEXITCODE -ne 0) { throw "No se encontro el contenedor." }
+    $info = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json)[0]
+
+    if ($info.Config.Labels.'nobleprog.p7.lab' -ne "true") {
+        throw "Etiqueta incorrecta."
+    }
+    if (-not $info.State.Running) { throw "El contenedor no esta activo." }
+
+    docker exec -u root $name bash /tmp/p7-scripts/99-cleanup-lab.sh
+    if ($LASTEXITCODE -ne 0) { throw "No se completo el cierre." }
+
+    docker stop $name
+    if ($LASTEXITCODE -ne 0) { throw "No se detuvo el contenedor." }
+}
+
+El cierre no borra tablas ni reinicia estadisticas.
+Los cambios de configuracion de los escenarios son de sesion.
+Los indices experimentales se eliminan dentro de cada escenario exitoso.
+Los datos y planes persistentes se conservan para inspeccion.
+Repetir desde cero requiere otra instancia nueva.
+
+ESTADO DE VALIDACION
+
+Los escenarios temporales fueron revisados por separado.
+La generacion de estos archivos y su comprobacion de sintaxis no prueban
+la reproduccion funcional de los definitivos.
+Registrar el resultado real de la validacion antes de publicar.
+
+COMPARACION CON ORACLE
+
+Durante el recorrido, discutir como se obtienen planes, estadisticas,
+diagnosticos de esperas y evidencias equivalentes en el entorno Oracle
+conocido por los participantes. No trasladar comandos entre motores.
