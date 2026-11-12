@@ -3,3 +3,4 @@
 practices/p6/scripts/*.sh text eol=lf
 practices/p6/scripts/*.sql text eol=lf
 practices/p6/*.txt text eol=lf
+practices/p7/scripts/*.sh text eol=lf
