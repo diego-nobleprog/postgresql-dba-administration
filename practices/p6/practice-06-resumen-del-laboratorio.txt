@@ -1,0 +1,682 @@
+PRACTICA 06 - RESUMEN DEL LABORATORIO
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
+
+
+OBJETIVO DE ESTE DOCUMENTO
+
+Comprender como fue preparado el laboratorio P6, cuales son
+sus configuraciones mas importantes y por que las necesitamos.
+
+Este documento es una referencia para entender las practicas
+06.01 a 06.05.
+
+No contiene ejercicios adicionales ni requiere ejecutar
+otros scripts de preparacion.
+
+El ambiente completo se crea y elimina mediante la guia 06.00.
+
+
+============================================================
+1. QUE QUEREMOS APRENDER EN ESTE LABORATORIO
+============================================================
+
+El objetivo principal es comprender como PostgreSQL mantiene
+sus tablas y como un DBA puede identificar cuando necesitan
+mantenimiento.
+
+Durante las cinco practicas investigaremos:
+
+06.01 - MVCC Y VACUUM
+
+Por que PostgreSQL conserva versiones antiguas de las filas
+cuando existen transacciones que todavia las necesitan.
+
+06.02 - BLOAT Y VACUUM FULL
+
+Por que eliminar registros no siempre reduce el espacio
+fisico ocupado por una tabla.
+
+06.03 - ANALYZE Y ESTADISTICAS
+
+Como las estadisticas influyen en las decisiones del
+optimizador y por que necesitamos actualizarlas.
+
+06.04 - AUTOVACUUM Y AUTOANALYZE
+
+Como PostgreSQL realiza automaticamente operaciones de
+mantenimiento y como comprobamos que realmente ocurrieron.
+
+06.05 - XID Y MANTENIMIENTO PREVENTIVO
+
+Como PostgreSQL administra la antiguedad transaccional
+y como VACUUM FREEZE contribuye a su mantenimiento.
+
+Todos estos temas estan relacionados.
+
+Las modificaciones de los datos generan versiones de filas.
+VACUUM ayuda a recuperar espacio ocupado por versiones obsoletas.
+ANALYZE actualiza las estadisticas del optimizador.
+Autovacuum automatiza parte de ese mantenimiento.
+VACUUM FREEZE participa en la prevencion de problemas XID.
+
+
+============================================================
+2. COMO ESTA CONSTRUIDO EL AMBIENTE
+============================================================
+
+Trabajamos desde Windows DaDesktop mediante PowerShell 5.1.
+
+El laboratorio utiliza Docker para ejecutar PostgreSQL
+en un entorno Linux independiente.
+
+CONTENEDOR:
+
+p6-maintenance-lab
+
+IMAGEN:
+
+postgresql-dba:18-p1
+
+BASE DE DATOS:
+
+nobleprog_maintenance_scenarios
+
+ESQUEMA:
+
+maintenance
+
+DIRECTORIO DE DATOS:
+
+/tmp/nobleprog-p6-lab/data
+
+DIRECTORIO DE SOCKETS:
+
+/tmp/nobleprog-p6-lab/socket
+
+PUERTO INTERNO:
+
+5546
+
+
+POR QUE UTILIZAMOS UN CONTENEDOR INDEPENDIENTE
+
+Durante las practicas realizaremos operaciones que pueden:
+
+- Generar miles de versiones obsoletas.
+- Bloquear temporalmente el acceso a una tabla.
+- Modificar parametros de mantenimiento.
+- Ejecutar VACUUM FULL y VACUUM FREEZE.
+
+El contenedor independiente nos permite experimentar sin
+afectar al PostgreSQL principal de las otras practicas.
+
+Ademas, el contenedor se crea con:
+
+docker create --network none ...
+
+Esto impide que utilice una red Docker convencional.
+
+PostgreSQL tambien se configura con:
+
+listen_addresses = ''
+
+Por lo tanto, no acepta conexiones TCP/IP.
+
+Nos conectamos mediante el socket Unix interno.
+
+
+COMANDO DE CONEXION DESDE POWERSHELL
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+
+QUE SIGNIFICA CADA ARGUMENTO IMPORTANTE
+
+docker exec -it:
+
+Abre una sesion interactiva dentro del contenedor.
+
+-u postgres:
+
+Ejecuta el cliente con el usuario Linux postgres.
+
+psql -X:
+
+Abre el cliente PostgreSQL sin cargar .psqlrc.
+
+-h:
+
+Indica el directorio del socket Unix.
+
+-p 5546:
+
+Indica el puerto interno del servidor PostgreSQL.
+
+-U postgres:
+
+Indica el rol PostgreSQL utilizado para conectarnos.
+
+-d:
+
+Indica la base de datos.
+
+
+============================================================
+3. QUE CREA EL SCRIPT DE PREPARACION
+============================================================
+
+Los archivos principales son:
+
+practices/p6/scripts/00-start-container.sh
+
+practices/p6/scripts/00-prepare-lab.sh
+
+
+00-start-container.sh
+
+Es el encargado de iniciar la preparacion dentro del
+contenedor.
+
+Comprueba la sintaxis de los scripts Bash y ejecuta
+00-prepare-lab.sh en modo manual.
+
+Despues mantiene el contenedor encendido para permitir
+las conexiones de los participantes.
+
+
+00-prepare-lab.sh
+
+Es el encargado de inicializar PostgreSQL y crear
+todos los objetos necesarios.
+
+Entre sus instrucciones principales encontramos:
+
+initdb -D "$DATA" -U postgres -A trust --no-locale -E UTF8
+
+Esta instruccion inicializa el servidor PostgreSQL.
+
+La autenticacion trust se utiliza exclusivamente en
+este entorno aislado de capacitacion.
+
+No debe trasladarse como recomendacion de seguridad
+a un ambiente productivo.
+
+
+CONFIGURACION DEL SERVIDOR
+
+El script escribe parametros como:
+
+shared_buffers = '32MB'
+max_connections = 20
+autovacuum = on
+track_counts = on
+
+shared_buffers:
+
+Reserva memoria compartida para almacenar bloques
+de datos utilizados por PostgreSQL.
+
+max_connections:
+
+Limita la cantidad de conexiones simultaneas.
+
+autovacuum = on:
+
+Habilita globalmente el mecanismo de mantenimiento
+automatico de PostgreSQL.
+
+track_counts = on:
+
+Habilita la recopilacion de estadisticas de actividad
+que necesita, entre otros mecanismos, Autovacuum.
+
+Estas configuraciones se encuentran en:
+
+00-prepare-lab.sh
+
+
+============================================================
+4. LAS CINCO TABLAS QUE UTILIZAREMOS
+============================================================
+
+El script 00-prepare-lab.sh crea estas tablas:
+
+TABLA                 FILAS INICIALES    PRACTICA
+
+mvcc_work             10000              06.01
+bloat_work            30000              06.02
+distribution          20000              06.03
+auto_work                 0              06.04
+freeze_work            1000              06.05
+
+
+PARA QUE SIRVE CADA UNA
+
+mvcc_work:
+
+Contiene una columna version que incrementaremos
+manualmente para representar cambios logicos.
+
+IMPORTANTE:
+Esa columna NO es el mecanismo interno MVCC.
+Solo nos ayuda a visualizar los resultados.
+
+bloat_work:
+
+Contiene registros con una cantidad mayor de texto
+para facilitar las mediciones de almacenamiento.
+
+distribution:
+
+Contiene dos estados: normal y raro.
+
+Inicialmente existen:
+19900 normales y 100 raros.
+
+Tambien se crea el indice:
+
+CREATE INDEX distribution_estado_idx
+ON maintenance.distribution(estado);
+
+Esto permite estudiar como PostgreSQL decide
+entre utilizar un indice y leer la tabla completa.
+
+auto_work:
+
+Comienza vacia porque nosotros generaremos
+las inserciones y actualizaciones necesarias
+para activar el mantenimiento automatico.
+
+freeze_work:
+
+Comienza con 1000 filas y nos permite estudiar
+los horizontes transaccionales y VACUUM FREEZE.
+
+
+============================================================
+5. CONFIGURACIONES CLAVE QUE DEBEMOS ENTENDER
+============================================================
+
+A. AUTOCOMMIT - PRACTICA 06.01
+
+Esta es una de las caracteristicas mas importantes
+para entender los ejercicios de concurrencia.
+
+Autocommit NO se configura explicitamente en
+00-prepare-lab.sh.
+
+Es el comportamiento predeterminado de psql
+cuando trabajamos sin una transaccion explicita.
+
+Por ejemplo:
+
+UPDATE maintenance.mvcc_work
+SET version = version + 1
+WHERE id <= 2000;
+
+Si ejecutamos esta sentencia fuera de BEGIN,
+psql permite que se confirme automaticamente
+al finalizar correctamente.
+
+Lo mismo ocurre con DELETE.
+
+En la practica 06.01:
+
+SESION A:
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SELECT COUNT(*) FROM maintenance.mvcc_work;
+
+La transaccion permanece abierta hasta COMMIT
+o ROLLBACK.
+
+SESION B:
+
+UPDATE ...
+DELETE ...
+
+Como B no ejecuta BEGIN, sus operaciones
+se confirman individualmente.
+
+Por eso B puede observar datos actualizados,
+mientras A conserva su snapshot anterior.
+
+IMPORTANTE:
+
+Autocommit es un comportamiento del cliente psql.
+No es un parametro que hayamos configurado
+globalmente mediante postgresql.conf.
+
+El aislamiento REPEATABLE READ tampoco se configura
+globalmente en la preparacion: lo seleccionamos
+explicitamente en la transaccion de la practica.
+
+
+B. AUTOVACUUM DESHABILITADO POR TABLA
+
+Aunque configuramos globalmente:
+
+autovacuum = on
+
+En 00-prepare-lab.sh tambien ejecutamos:
+
+ALTER TABLE maintenance.mvcc_work
+SET (autovacuum_enabled=false);
+
+ALTER TABLE maintenance.bloat_work
+SET (autovacuum_enabled=false);
+
+ALTER TABLE maintenance.distribution
+SET (autovacuum_enabled=false);
+
+ALTER TABLE maintenance.auto_work
+SET (autovacuum_enabled=false);
+
+ALTER TABLE maintenance.freeze_work
+SET (autovacuum_enabled=false);
+
+
+POR QUE HACEMOS ESTO
+
+Queremos controlar los experimentos.
+
+Si el mantenimiento automatico ordinario limpiara
+las tablas mientras estamos preparando una
+demostracion, ciertos resultados podrian cambiar.
+
+Por ejemplo:
+
+En 06.01 queremos ejecutar VACUUM manualmente
+antes y despues de cerrar una transaccion.
+
+En 06.02 queremos medir el almacenamiento antes
+y despues de una limpieza controlada.
+
+En 06.03 queremos modificar datos y ejecutar
+ANALYZE en un momento especifico.
+
+En 06.04 habilitaremos Autovacuum manualmente
+para comprobar que comienza a realizar mantenimiento.
+
+IMPORTANTE:
+
+Deshabilitar el autovacuum ordinario de una tabla
+no deshabilita toda la proteccion antiwraparound
+de PostgreSQL.
+
+
+C. ESTADISTICAS INICIALES - PRACTICA 06.03
+
+El script de preparacion ejecuta:
+
+ANALYZE maintenance.mvcc_work;
+
+ANALYZE maintenance.bloat_work;
+
+ANALYZE maintenance.distribution;
+
+
+POR QUE ES IMPORTANTE
+
+ANALYZE genera estadisticas utilizadas por
+el optimizador de PostgreSQL.
+
+Especialmente en distribution, necesitamos
+que PostgreSQL conozca inicialmente que el
+estado raro representa solamente el 0.5%
+de los registros.
+
+Despues modificaremos esa distribucion.
+
+No ejecutaremos ANALYZE inmediatamente, para
+observar como se comporta el optimizador con
+estadisticas que ya no representan los datos.
+
+Finalmente ejecutaremos ANALYZE otra vez
+y compararemos sus estimaciones.
+
+
+D. VACUUM FULL Y BLOQUEOS - PRACTICA 06.02
+
+No configuramos un bloqueo especial durante
+la preparacion del laboratorio.
+
+Los bloqueos aparecen como consecuencia de
+las operaciones que ejecutamos.
+
+Por ejemplo:
+
+BEGIN;
+
+SELECT COUNT(*) FROM maintenance.bloat_work;
+
+La lectura adquiere un AccessShareLock que
+permanece hasta terminar la transaccion.
+
+Si otra sesion ejecuta:
+
+VACUUM FULL maintenance.bloat_work;
+
+PostgreSQL necesita un AccessExclusiveLock.
+
+Como ambos bloqueos son incompatibles,
+VACUUM FULL debe esperar.
+
+Este comportamiento pertenece al mecanismo
+normal de concurrencia de PostgreSQL.
+
+No es una configuracion artificial del ambiente.
+
+
+E. UMBRALES AUTOMATICOS - PRACTICA 06.04
+
+Los umbrales especiales NO se establecen
+durante la preparacion inicial.
+
+Los configuramos dentro de la practica 06.04.
+
+Por ejemplo:
+
+ALTER SYSTEM SET autovacuum_naptime='1s';
+
+Y sobre la tabla auto_work utilizaremos
+umbrales como:
+
+autovacuum_vacuum_threshold=25
+autovacuum_vacuum_scale_factor=0
+
+Estos cambios permiten observar con mayor rapidez
+cuando PostgreSQL considera necesario ejecutar
+mantenimiento automatico.
+
+Posteriormente habilitamos:
+
+ALTER TABLE maintenance.auto_work
+SET (autovacuum_enabled=true);
+
+Asi distinguimos entre tener Autovacuum habilitado
+y comprobar que efectivamente se ejecuto.
+
+Los valores originales se restauran al finalizar
+el escenario.
+
+
+F. XID Y VACUUM FREEZE - PRACTICA 06.05
+
+El laboratorio no provoca artificialmente
+una emergencia de wraparound.
+
+En 06.05 generaremos actividad transaccional
+mediante un archivo SQL:
+
+practices/p6/scripts/05-advance-xid.sql
+
+Este archivo contiene 200 sentencias:
+
+SELECT pg_current_xact_id();
+
+La funcion obtiene un identificador XID para
+la transaccion actual, asignandolo si es necesario.
+
+Despues consultaremos:
+
+SELECT age(relfrozenxid)
+FROM pg_class
+WHERE oid='maintenance.freeze_work'::regclass;
+
+Finalmente ejecutaremos:
+
+VACUUM (FREEZE, VERBOSE)
+maintenance.freeze_work;
+
+Compararemos la edad XID antes y despues.
+
+La generacion de esas 200 transacciones pertenece
+a la practica 06.05, NO a la preparacion inicial.
+
+
+============================================================
+6. DONDE ENCONTRAMOS CADA MECANISMO IMPORTANTE
+============================================================
+
+ARCHIVO: 00-start-container.sh
+
+- Inicia la preparacion.
+- Comprueba la sintaxis Bash.
+- Mantiene el contenedor disponible.
+
+
+ARCHIVO: 00-prepare-lab.sh
+
+- Inicializa PostgreSQL.
+- Establece parametros del servidor.
+- Crea la base y el esquema.
+- Crea las cinco tablas.
+- Deshabilita Autovacuum ordinario por tabla.
+- Inserta los datos iniciales.
+- Crea el indice de distribution.
+- Ejecuta los ANALYZE iniciales.
+- Guarda configuraciones originales.
+
+
+GUIA: practice-06-01-mvcc-y-vacuum.txt
+
+- BEGIN y REPEATABLE READ.
+- Autocommit en la sesion B.
+- UPDATE y DELETE.
+- Snapshots diferentes.
+- VACUUM con versiones retenidas.
+- Reutilizacion del espacio.
+
+
+GUIA: practice-06-02-bloat-y-vacuum-full.txt
+
+- DELETE del 90% de los registros.
+- VACUUM con TRUNCATE FALSE.
+- Medicion del espacio fisico.
+- VACUUM FULL.
+- AccessShareLock y AccessExclusiveLock.
+- lock_timeout.
+
+
+GUIA: practice-06-03-analyze-y-estadisticas.txt
+
+- Distribucion de los datos.
+- pg_stats.
+- EXPLAIN (ANALYZE, BUFFERS).
+- Estimaciones y filas reales.
+- ANALYZE.
+- Cambios del plan de ejecucion.
+
+
+GUIA: practice-06-04-autovacuum-y-autoanalyze.txt
+
+- Parametros globales de mantenimiento.
+- Umbrales por tabla.
+- Generacion de versiones obsoletas.
+- Activacion de Autovacuum.
+- Contadores de mantenimiento automatico.
+- Restauracion de configuraciones.
+
+
+GUIA: practice-06-05-xid-y-mantenimiento-preventivo.txt
+
+- Generacion de XID.
+- relfrozenxid.
+- age().
+- VACUUM FREEZE.
+- datfrozenxid.
+- Diagnostico general de mantenimiento.
+
+
+ARCHIVO: 99-cleanup-lab.sh
+
+- Cierra las sesiones del laboratorio.
+- Restaura opciones originales de las tablas.
+- Restaura la configuracion global.
+- Comprueba la restauracion.
+- Detiene PostgreSQL.
+
+La guia 06.00 ejecuta posteriormente la eliminacion
+del contenedor y sus datos.
+
+
+============================================================
+7. IDEA PRINCIPAL PARA RECORDAR
+============================================================
+
+En P6 distinguiremos tres cosas diferentes:
+
+1. CONFIGURACION DEL AMBIENTE
+
+Lo que dejamos preparado para controlar
+las condiciones iniciales de los ejercicios.
+
+2. COMPORTAMIENTO DE POSTGRESQL
+
+Lo que el motor hace normalmente mediante
+MVCC, transacciones, bloqueos y mantenimiento.
+
+3. CAMBIOS DE CADA PRACTICA
+
+Lo que provocamos deliberadamente para observar,
+medir y explicar un comportamiento especifico.
+
+
+NO DEBEMOS CONFUNDIR ESTOS TRES NIVELES.
+
+Por ejemplo:
+
+Autocommit no fue activado por el ambientado.
+
+VACUUM no elimina una version que sigue siendo necesaria
+solamente porque ejecutemos el comando.
+
+VACUUM FULL no necesita un bloqueo exclusivo porque
+nosotros lo hayamos configurado: es parte de su operacion.
+
+ANALYZE no modifica los datos del negocio:
+actualiza las estadisticas del optimizador.
+
+Autovacuum puede estar habilitado globalmente,
+pero deshabilitado para el mantenimiento ordinario
+de una tabla particular.
+
+VACUUM FREEZE no elimina registros:
+participa en el mantenimiento transaccional.
+
+
+CONCLUSION
+
+El ambiente P6 fue construido para provocar y observar
+comportamientos reales de mantenimiento de PostgreSQL,
+manteniendo controladas las condiciones iniciales.
+
+El objetivo no es memorizar comandos, sino entender
+por que ejecutamos cada operacion, que sucede dentro
+de PostgreSQL y que evidencia permite comprobarlo.
+
+
+FIN DEL RESUMEN DEL LABORATORIO P6
