@@ -1,197 +1,877 @@
 PRACTICA 06.05 - XID Y MANTENIMIENTO PREVENTIVO
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
 
-SITUACION Y PREGUNTA CENTRAL
-
-El DBA debe anticipar acumulacion de versiones, estadisticas atrasadas
-y problemas de antiguedad transaccional.
-¿Que evidencia permite decidir una accion antes de una emergencia?
 
 OBJETIVO
 
-Observar congelacion de XID y construir un diagnostico preventivo.
-No se fuerza un wraparound ni se simula la cercania real a sus limites.
+Comprender que son los identificadores
+de transacciones de PostgreSQL.
 
-PREPARACION Y CONEXION
+Observar la antiguedad transaccional
+de una tabla antes y despues de VACUUM FREEZE.
 
-Seguir el recorrido de 06.00 a 06.04.
-freeze_work debe conservar sus 1000 filas y no haber recibido VACUUM FREEZE.
+Aplicar los conocimientos de las practicas
+anteriores para realizar un diagnostico DBA.
 
-PowerShell:
+
+SITUACION
+
+PostgreSQL utiliza identificadores de transacciones
+para administrar la visibilidad de los datos.
+
+Con el paso de las transacciones,
+cierta informacion requiere mantenimiento.
+
+Queremos responder:
+
+- Que es un XID?
+- Que significa age(relfrozenxid)?
+- Para que sirve VACUUM FREEZE?
+- Por que la edad de una tabla puede disminuir?
+- Que indicadores debe revisar un DBA?
+
+
+CONCEPTOS NECESARIOS
+
+XID (TRANSACTION ID):
+
+Identificador utilizado por PostgreSQL
+para gestionar informacion transaccional.
+
+No debe confundirse con el PID del proceso
+ni con una marca de tiempo.
+
+
+WRAPAROUND:
+
+Los identificadores transaccionales tradicionales
+utilizan un espacio numerico limitado.
+
+PostgreSQL debe administrar su antiguedad
+para evitar problemas por reutilizacion
+ciclica de identificadores.
+
+
+RELFROZENXID:
+
+Valor de catalogo que representa un horizonte
+de antiguedad transaccional para una relacion.
+
+Ayuda a identificar el mantenimiento pendiente
+de las versiones almacenadas en esa tabla.
+
+
+AGE():
+
+Calcula la distancia transaccional
+respecto de un identificador XID.
+
+No devuelve segundos, minutos ni horas.
+
+
+VACUUM FREEZE:
+
+Solicita una estrategia agresiva de congelacion.
+
+Permite marcar versiones elegibles como
+congeladas y avanzar los horizontes de
+mantenimiento cuando corresponde.
+
+
+DATFROZENXID:
+
+Horizonte transaccional de una base de datos.
+
+Depende del conjunto de relaciones relevantes,
+no exclusivamente de una tabla.
+
+
+PREPARACION
+
+Utilizar el laboratorio de 06.00.
+
+Haber realizado las practicas anteriores
+es conveniente para el diagnostico final.
+
+Tabla principal:
+maintenance.freeze_work
+
+Estado inicial:
+1000 registros.
+
+No ejecutar 05-freeze-mantenimiento.sh
+durante el recorrido manual.
+
+Utilizaremos una terminal PowerShell
+y una sesion interactiva psql.
+
+
+CONEXION - POWERSHELL
 
 docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
 
-psql:
+DENTRO DE PSQL
 
 \pset pager off
-SET application_name='p6_manual_freeze';
 
-1. GENERAR UNA EDAD OBSERVABLE
+SET application_name = 'p6_manual_freeze';
 
-\o /tmp/nobleprog-p6-lab/evidence/manual-xid-advance.txt
+
+============================================================
+PASO 1. GENERAR ACTIVIDAD TRANSACCIONAL
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos producir actividad transaccional
+para observar posteriormente una edad XID.
+
+No intentaremos provocar una emergencia
+real de wraparound.
+
+
+PRIMERO, CONOCER LA FUNCION
+
+-- Obtener un identificador transaccional.
+SELECT pg_current_xact_id();
+
+
+EXPLICACION
+
+pg_current_xact_id():
+
+Devuelve el identificador de la transaccion actual.
+
+Si todavia no tiene uno asignado,
+puede asignarle uno.
+
+
+GENERAR 200 TRANSACCIONES
+
+La preparacion 06.00 copio al contenedor
+el siguiente archivo:
+
+/tmp/p6-scripts/05-advance-xid.sql
+
+Contiene 200 sentencias independientes:
+
+SELECT pg_current_xact_id();
+
+No necesitamos escribirlas manualmente.
+
+
+COMANDOS DENTRO DE PSQL
+
+-- Redirigir temporalmente los resultados
+-- para evitar mostrar 200 lineas en pantalla.
+\o /dev/null
+
+-- Ejecutar las 200 sentencias del archivo.
 \i /tmp/p6-scripts/05-advance-xid.sql
+
+-- Restaurar la salida normal de psql.
 \o
 
-El archivo contiene 200 llamadas a pg_current_xact_id().
-Sin BEGIN exterior, cada sentencia trabaja en su transaccion autocommit.
-La funcion asigna un identificador a la transaccion que lo necesita.
 
-No usar solamente SELECT 1 para intentar consumir XID: una consulta
-de lectura no requiere necesariamente un identificador transaccional.
+EXPLICACION
 
-La salida se conserva en manual-xid-advance.txt.
-Los participantes deben distinguir asignacion de XID de numero de consultas.
+\o:
 
-2. BEFORE: MEDIR EL HORIZONTE DE LA TABLA
+Redirige la salida de las consultas de psql.
 
-SELECT age(relfrozenxid) AS xid_age_before
+Utilizamos /dev/null porque el cliente psql
+se ejecuta dentro del contenedor Linux.
+
+No necesitamos mostrar todos los identificadores.
+
+
+\i:
+
+Ejecuta las instrucciones de un archivo SQL.
+
+La ruta corresponde al interior del contenedor.
+
+No es una ruta de Windows.
+
+
+POR QUE NO UTILIZAMOS BEGIN
+
+Queremos que cada sentencia trabaje
+en una transaccion independiente.
+
+Como psql usa autocommit por defecto,
+las sentencias se confirman individualmente.
+
+Eso permite avanzar identificadores XID.
+
+
+IMPORTANTE
+
+Ejecutar muchas consultas SELECT 1 no necesariamente
+consume identificadores de transaccion.
+
+Aqui utilizamos especificamente
+pg_current_xact_id() para obtenerlos.
+
+
+============================================================
+PASO 2. MEDIR LA EDAD TRANSACCIONAL DE LA TABLA
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos consultar la antiguedad XID
+antes de ejecutar el mantenimiento.
+
+
+COMANDO
+
+-- Consultar el horizonte XID de freeze_work.
+SELECT
+    relname,
+    relfrozenxid,
+    age(relfrozenxid) AS xid_age,
+    relpages,
+    relallvisible,
+    relallfrozen,
+    pg_relation_size(oid) AS heap_bytes
 FROM pg_class
-WHERE oid='maintenance.freeze_work'::regclass \gset
+WHERE oid = 'maintenance.freeze_work'::regclass;
 
-SELECT relname,relfrozenxid,age(relfrozenxid) AS xid_age,
-       relpages,relallvisible,relallfrozen,
-       pg_relation_size(oid) AS heap_bytes
-FROM pg_class WHERE oid='maintenance.freeze_work'::regclass;
 
-Referencia temporal: edad 238.
-La edad es una distancia transaccional, no segundos ni horas.
-El valor exacto varia con otras transacciones de la instancia.
+EXPLICACION DE LAS COLUMNAS
 
-relpages es informacion de catalogo y puede estar atrasada.
-Antes de mantenimiento se observaron 0 paginas en ese campo aunque habia
-1000 filas. pg_relation_size permite consultar el tamano fisico actual.
+relname:
 
-3. CONGELAR Y MEDIR AFTER
+Nombre de la tabla.
 
-VACUUM (FREEZE, VERBOSE) maintenance.freeze_work;
+relfrozenxid:
 
-SELECT relname,relfrozenxid,age(relfrozenxid) AS xid_age,
-       relpages,relallvisible,relallfrozen,
-       age(relfrozenxid) < :'xid_age_before'::integer AS age_reduced
-FROM pg_class WHERE oid='maintenance.freeze_work'::regclass;
+Horizonte transaccional almacenado
+en el catalogo de la relacion.
 
-SELECT count(*) FROM maintenance.freeze_work;
+xid_age:
 
-Evidencia temporal:
-- edad de 238 a 0.
-- 9 paginas, todas all-frozen.
-- 1000 filas conservadas.
+Distancia transaccional calculada
+mediante age(relfrozenxid).
 
-FREEZE realiza una congelacion agresiva. relfrozenxid representa un
-horizonte de la relacion; su avance no elimina las filas del negocio.
-No interpretar el valor de una columna xmin aislada como una prueba
-completa del estado interno de congelacion.
+relpages:
 
-El proceso de mantenimiento es intencionalmente persistente:
-no se intenta retroceder relfrozenxid. Los datos iniciales se recuperan
-recreando el laboratorio, no manipulando identificadores internos.
+Estimacion registrada en el catalogo
+sobre la cantidad de paginas de la tabla.
 
-4. DIFERENCIAR HORIZONTES DE TABLA Y BASE
+relallvisible:
 
-SELECT datname,datfrozenxid,age(datfrozenxid) AS xid_age,
-       current_setting('autovacuum_freeze_max_age') AS freeze_max_age
-FROM pg_database WHERE datallowconn
+Paginas registradas como visibles
+para todas las transacciones.
+
+relallfrozen:
+
+Paginas registradas como completamente
+congeladas en el mapa correspondiente.
+
+heap_bytes:
+
+Tamano actual del almacenamiento principal.
+
+
+RESULTADO DE REFERENCIA
+
+En la validacion original:
+
+xid_age = 238.
+
+El valor exacto puede variar.
+
+
+INTERPRETACION
+
+La tabla tiene un horizonte transaccional
+cuya antiguedad es de 238 XID en esa referencia.
+
+NO significa:
+
+238 segundos.
+
+238 minutos.
+
+238 transacciones abiertas.
+
+Significa una distancia expresada
+en identificadores transaccionales.
+
+
+IMPORTANTE
+
+Anotar el valor de xid_age.
+
+Lo compararemos despues de VACUUM FREEZE.
+
+
+============================================================
+PASO 3. EJECUTAR VACUUM FREEZE
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos solicitar mantenimiento agresivo
+sobre la antiguedad transaccional de la tabla.
+
+
+COMANDO
+
+-- Ejecutar mantenimiento con congelacion.
+VACUUM (FREEZE, VERBOSE)
+maintenance.freeze_work;
+
+
+EXPLICACION
+
+VACUUM:
+
+Realiza mantenimiento de la relacion.
+
+FREEZE:
+
+Solicita congelar agresivamente las versiones
+que cumplan las condiciones necesarias.
+
+VERBOSE:
+
+Muestra informacion detallada
+sobre las operaciones realizadas.
+
+
+POR QUE NECESITAMOS CONGELACION
+
+PostgreSQL utiliza XID para determinar
+aspectos de visibilidad de las filas.
+
+No puede depender indefinidamente
+de identificadores antiguos.
+
+La congelacion permite evitar que
+versiones suficientemente antiguas
+requieran conservar su antiguedad
+transaccional original para siempre.
+
+
+QUE NO SIGNIFICA FREEZE
+
+No significa borrar registros.
+
+No significa bloquear permanentemente
+la tabla para impedir cambios.
+
+No significa detener nuevas transacciones.
+
+No significa reiniciar el contador
+global de identificadores XID.
+
+
+============================================================
+PASO 4. COMPARAR EL ESTADO ANTES Y DESPUES
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que el mantenimiento
+avanzo el horizonte de la tabla
+sin eliminar sus registros.
+
+
+COMANDO
+
+-- Consultar nuevamente la edad y las paginas.
+SELECT
+    relname,
+    relfrozenxid,
+    age(relfrozenxid) AS xid_age,
+    relpages,
+    relallvisible,
+    relallfrozen
+FROM pg_class
+WHERE oid = 'maintenance.freeze_work'::regclass;
+
+
+RESULTADO ORIGINAL DE REFERENCIA
+
+ANTES:
+
+xid_age = 238.
+
+DESPUES:
+
+xid_age = 0.
+
+
+QUE SIGNIFICA
+
+VACUUM FREEZE permitio avanzar
+el horizonte transaccional de la tabla.
+
+La distancia respecto de ese horizonte
+se redujo considerablemente.
+
+
+COMPROBAR LOS REGISTROS
+
+-- Verificar que los datos del negocio
+-- permanecen disponibles.
+SELECT COUNT(*) AS filas
+FROM maintenance.freeze_work;
+
+
+RESULTADO ESPERADO
+
+filas
+-----
+1000
+
+
+POR QUE IMPORTA
+
+El mantenimiento transaccional
+no elimino las filas del negocio.
+
+La tabla sigue conteniendo
+sus 1000 registros originales.
+
+
+COMPARAR LAS PAGINAS
+
+Observar nuevamente:
+
+relpages.
+
+relallvisible.
+
+relallfrozen.
+
+En la referencia original se observaron
+9 paginas registradas como all-frozen,
+coincidiendo con el total registrado.
+
+Esto respalda que se completo la
+congelacion esperada en el experimento.
+
+
+IMPORTANTE
+
+No exigir xid_age exactamente cero
+en absolutamente todas las ejecuciones.
+
+El valor puede avanzar si ocurren
+nuevas transacciones despues del mantenimiento.
+
+La comparacion importante es que la edad
+se haya reducido frente al BEFORE.
+
+
+============================================================
+PASO 5. COMPARAR LA TABLA CON LA BASE COMPLETA
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos entender que una tabla congelada
+no significa que toda la base ya tenga
+el mismo horizonte transaccional.
+
+
+COMANDO
+
+-- Consultar la antiguedad transaccional
+-- de las bases de datos.
+SELECT
+    datname,
+    datfrozenxid,
+    age(datfrozenxid) AS xid_age,
+    current_setting('autovacuum_freeze_max_age')
+        AS freeze_max_age
+FROM pg_database
+WHERE datallowconn
 ORDER BY age(datfrozenxid) DESC;
 
-La tabla recien congelada puede tener edad 0 y la base una edad mayor.
-El horizonte de la base depende del conjunto de relaciones relevantes,
-no solamente de la tabla elegida para la demostracion.
 
-El parametro freeze_max_age es un umbral de mantenimiento automatico,
-no una expresion directa del tiempo restante hasta wraparound.
-Las 200 transacciones de este laboratorio no reproducen una emergencia.
+EXPLICACION
 
-5. REVISAR TABLAS Y MANTENIMIENTO
+datname:
 
-SELECT c.relname,age(c.relfrozenxid) AS xid_age,
-       c.relpages,c.relallvisible,c.relallfrozen,
-       s.n_live_tup,s.n_dead_tup,
-       s.last_vacuum,s.last_autovacuum,
-       s.last_analyze,s.last_autoanalyze
+Nombre de la base de datos.
+
+datfrozenxid:
+
+Horizonte XID de la base.
+
+age(datfrozenxid):
+
+Edad transaccional de ese horizonte.
+
+autovacuum_freeze_max_age:
+
+Parametro que participa en la programacion
+de mantenimiento antiwraparound.
+
+
+POR QUE LA BASE PUEDE TENER MAYOR EDAD
+
+Porque existen muchas relaciones
+dentro de una base de datos.
+
+Congelar freeze_work no significa
+congelar todas las demas tablas.
+
+Por eso el horizonte general puede
+seguir siendo mas antiguo.
+
+
+IMPORTANTE
+
+autovacuum_freeze_max_age no es
+un contador de segundos restantes.
+
+Tampoco significa que al alcanzar
+ese numero ocurra inmediatamente
+una perdida de datos.
+
+Es un parametro de mantenimiento preventivo.
+
+
+QUE DEMOSTRAMOS
+
+La edad transaccional puede medirse
+a nivel de relacion y de base.
+
+Ambos indicadores ayudan al DBA,
+pero representan horizontes distintos.
+
+
+============================================================
+PASO 6. REALIZAR UN DIAGNOSTICO PREVENTIVO
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos aplicar lo aprendido en P6.
+
+Revisaremos las tablas y justificaremos
+que tipo de mantenimiento seria apropiado.
+
+
+PRIMERA CONSULTA - TABLAS
+
+-- Consultar el estado de mantenimiento
+-- de las cinco tablas del laboratorio.
+SELECT
+    c.relname,
+    age(c.relfrozenxid) AS xid_age,
+    s.n_live_tup,
+    s.n_dead_tup,
+    s.last_vacuum,
+    s.last_autovacuum,
+    s.last_analyze,
+    s.last_autoanalyze
 FROM pg_class c
-JOIN pg_namespace n ON n.oid=c.relnamespace
-LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid
-WHERE n.nspname='maintenance' AND c.relkind='r'
+JOIN pg_namespace n
+    ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables s
+    ON s.relid = c.oid
+WHERE n.nspname = 'maintenance'
+  AND c.relkind = 'r'
 ORDER BY age(c.relfrozenxid) DESC;
 
-Interpretar junto con el historial de esta practica:
-- distribution puede conservar unas 17900 versiones obsoletas:
-  recibio UPDATE y ANALYZE, pero no VACUUM.
-- auto_work debe mostrar las ejecuciones automaticas observadas en 06.04.
-- freeze_work permite comprobar la congelacion reciente.
-- n_live_tup de mvcc_work puede diferir de COUNT(*).
 
-Una estadistica estimada no demuestra perdida de datos.
-Una fecha nula no demuestra por si sola una averia: considerar creacion,
-carga, reinicios o reinicio de contadores y mantenimiento realizado.
+EXPLICACION
 
-6. BUSCAR RETENCIONES Y ACTIVIDAD
+relname:
 
-SELECT pid,application_name,state,
-       clock_timestamp()-xact_start AS transaction_age,
-       backend_xmin,age(backend_xmin) AS xmin_age
-FROM pg_stat_activity WHERE xact_start IS NOT NULL
+Identifica cada tabla.
+
+xid_age:
+
+Muestra la antiguedad transaccional.
+
+n_live_tup:
+
+Estimacion de filas vivas.
+
+n_dead_tup:
+
+Estimacion de versiones obsoletas.
+
+last_vacuum:
+
+Ultimo VACUUM manual registrado.
+
+last_autovacuum:
+
+Ultimo VACUUM automatico registrado.
+
+last_analyze:
+
+Ultimo ANALYZE manual.
+
+last_autoanalyze:
+
+Ultimo ANALYZE automatico.
+
+
+COMO INTERPRETARLO
+
+mvcc_work:
+
+Ya demostro retencion de versiones
+por una transaccion antigua.
+
+bloat_work:
+
+Ya demostro diferencia entre
+VACUUM y VACUUM FULL.
+
+distribution:
+
+Puede conservar versiones obsoletas
+generadas durante el UPDATE de 06.03.
+
+auto_work:
+
+Debe mostrar mantenimiento automatico
+observado durante 06.04.
+
+freeze_work:
+
+Debe reflejar la congelacion reciente
+realizada en este escenario.
+
+
+SEGUNDA CONSULTA - TRANSACCIONES ABIERTAS
+
+-- Identificar transacciones actualmente activas.
+SELECT
+    pid,
+    application_name,
+    state,
+    clock_timestamp() - xact_start AS transaction_age,
+    backend_xmin,
+    age(backend_xmin) AS xmin_age
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
 ORDER BY xact_start;
 
-SELECT gid,prepared,owner,database FROM pg_prepared_xacts;
 
-SELECT slot_name,slot_type,active,xmin,catalog_xmin,restart_lsn
+EXPLICACION
+
+xact_start:
+
+Momento en que comenzo la transaccion.
+
+transaction_age:
+
+Tiempo transcurrido desde ese inicio.
+
+backend_xmin:
+
+Horizonte XID que puede estar asociado
+con la necesidad de conservar versiones.
+
+xmin_age:
+
+Antiguedad transaccional de ese horizonte.
+
+
+POR QUE REVISAMOS ESTO
+
+Las transacciones antiguas pueden
+dificultar la limpieza de ciertas
+versiones obsoletas.
+
+No significa que toda transaccion abierta
+este provocando un problema.
+
+Debemos interpretar su estado,
+duracion y horizonte.
+
+
+IMPORTANTE
+
+La consulta de diagnostico tambien puede
+mostrar su propia transaccion mientras
+se esta ejecutando.
+
+No confundir una actividad normal
+con una transaccion abandonada.
+
+
+TERCERA CONSULTA - TRANSACCIONES PREPARADAS
+
+-- Consultar transacciones preparadas.
+SELECT
+    gid,
+    prepared,
+    owner,
+    database
+FROM pg_prepared_xacts;
+
+
+EXPLICACION
+
+Esta vista permite observar
+transacciones preparadas mediante
+el mecanismo de dos fases.
+
+Dependiendo de su estado, pueden
+mantener recursos o horizontes
+transaccionales relevantes.
+
+En la evidencia original no habia
+transacciones preparadas.
+
+
+CUARTA CONSULTA - REPLICATION SLOTS
+
+-- Consultar slots de replicacion.
+SELECT
+    slot_name,
+    slot_type,
+    active,
+    xmin,
+    catalog_xmin,
+    restart_lsn
 FROM pg_replication_slots;
 
-Resultado de referencia: ninguna transaccion preparada ni slot.
-Estas consultas amplian el diagnostico; no prueban aqui el comportamiento
-de prepared transactions o replicacion, porque no se crearon esos escenarios.
 
-Revisar transacciones prolongadas, estado y horizontes antes de decidir.
-No cancelar sesiones o eliminar slots unicamente por aparecer en la lista.
+EXPLICACION
 
-7. ACTIVIDAD GUIADA DE DIAGNOSTICO
+Los replication slots se utilizan
+para conservar informacion necesaria
+para determinados consumidores.
 
-Los participantes deben entregar una conclusion para cada pregunta:
+Algunos pueden retener horizontes XID
+o WAL dependiendo de su tipo y estado.
 
-a) ¿Hay versiones obsoletas? ¿Son estimaciones o conteos exactos?
-b) ¿Existe una transaccion que pueda impedir la limpieza?
-c) ¿Las estadisticas representan la distribucion actual?
-d) ¿Se demostraron ejecuciones automaticas mediante contadores y fechas?
-e) ¿Que relaciones presentan mayor edad de XID en esta instancia?
-f) ¿Conviene VACUUM, ANALYZE, investigar una retencion o evaluar
-   una reescritura con ventana y espacio de trabajo?
+En la evidencia original no habia slots.
 
-Toda recomendacion debe indicar evidencia, accion propuesta, impacto
-esperado y comprobacion posterior.
-El laboratorio no establece umbrales universales de alertas para produccion.
+No debemos eliminar slots por el simple
+hecho de encontrarlos en esta vista.
+
+
+ACTIVIDAD DE DIAGNOSTICO
+
+Con las consultas anteriores,
+responder estas preguntas:
+
+1. Que tablas muestran versiones obsoletas?
+
+2. Los valores son estimaciones o conteos exactos?
+
+3. Existe alguna transaccion antigua
+   que debamos investigar?
+
+4. Se observo realmente el mantenimiento
+   automatico en auto_work?
+
+5. Cual tabla muestra la mayor edad XID?
+
+6. Que mantenimiento recomendariamos
+   y que evidencia respalda la decision?
+
+
+POSIBLES RECOMENDACIONES
+
+VACUUM:
+
+Cuando existen versiones obsoletas
+que pueden recuperarse.
+
+ANALYZE:
+
+Cuando necesitamos actualizar
+estadisticas del planificador.
+
+INVESTIGAR TRANSACCIONES:
+
+Cuando encontramos sesiones antiguas
+que podrian retener versiones.
+
+VACUUM FULL:
+
+Solamente cuando existe justificacion
+para una reescritura y podemos planificar
+su impacto sobre el acceso concurrente.
+
+MANTENIMIENTO XID:
+
+Cuando la antiguedad transaccional
+requiere atencion preventiva.
+
+
+MUY IMPORTANTE
+
+No ejecutar acciones destructivas
+solamente porque aparezcan indicadores.
+
+Una recomendacion DBA debe incluir:
+
+- Evidencia observada.
+- Problema o riesgo identificado.
+- Accion recomendada.
+- Impacto esperado.
+- Comprobacion posterior.
+
+
+CONCLUSION FINAL
+
+PostgreSQL utiliza XID para administrar
+aspectos de la visibilidad transaccional.
+
+El mantenimiento mediante VACUUM FREEZE
+permite gestionar su antiguedad.
+
+Los DBA deben observar horizontes XID,
+versiones obsoletas, estadisticas
+y transacciones activas.
+
+El objetivo es anticipar problemas,
+no reaccionar cuando ya existe
+una emergencia.
+
 
 COMPARACION CON ORACLE
 
-El identificador XID, la congelacion y la proteccion antiwraparound
-pertenecen al mecanismo transaccional de PostgreSQL.
-No equiparar su edad con SCN, undo retention ni una rutina Oracle
-de mantenimiento que pueda sustituir VACUUM FREEZE.
+Oracle tambien requiere monitoreo
+transaccional y mantenimiento preventivo.
 
-La comparacion util es operativa: ambos entornos requieren observar
-transacciones, almacenamiento y estadisticas con sus herramientas propias.
+Sin embargo, la congelacion XID
+y la proteccion contra wraparound
+son mecanismos propios de PostgreSQL.
 
-CONCLUSION Y CIERRE
+No debemos confundir age(relfrozenxid)
+con SCN ni con UNDO retention.
 
-Los participantes deben separar prevencion de emergencia, interpretar
-las edades sin convertirlas a tiempo y justificar acciones de mantenimiento.
+La comparacion es operativa:
+ambos motores requieren monitoreo,
+pero sus mecanismos internos son distintos.
 
-Salir con \q.
-Ejecutar el cierre controlado de 06.00 para restaurar configuracion,
-verificar el estado final, preservar evidencias y eliminar el contenedor
-del recorrido guiado.
 
-ALTERNATIVA AUTOMATIZADA
+FINALIZACION
 
-En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+Salir de psql:
 
-docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/05-freeze-mantenimiento.sh
-if ($LASTEXITCODE -ne 0) { throw "Fallo 05-freeze-mantenimiento.sh." }
+\q
 
-La restauracion y detencion se realizan posteriormente con
-99-cleanup-lab.sh, como indica 06.00.
+La practica 06.05 completa el recorrido P6.
 
-FUENTES
+Para eliminar el laboratorio, utilizar
+la seccion 2 de la guia 06.00.
 
-https://www.postgresql.org/docs/18/transaction-id.html
-https://www.postgresql.org/docs/18/routine-vacuuming.html
-https://www.postgresql.org/docs/18/monitoring-stats.html
+Esa limpieza restaura configuraciones,
+detiene PostgreSQL y elimina el contenedor
+independiente de P6.
+
+No necesitamos manipular manualmente
+los identificadores XID para restaurarlos.
+
+
+FIN DE LA PRACTICA 06.05\n

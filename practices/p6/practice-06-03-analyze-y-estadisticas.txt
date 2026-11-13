@@ -1,158 +1,689 @@
 PRACTICA 06.03 - ANALYZE Y ESTADISTICAS
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
 
-SITUACION Y PREGUNTA CENTRAL
-
-Un valor antes infrecuente pasa a representar casi toda una tabla.
-¿El planificador sigue estimando con una distribucion anterior?
 
 OBJETIVO
 
-Relacionar distribucion, estadisticas y estimaciones de cardinalidad.
-Distinguir mejora de estimaciones, cambio de plan y tiempo de ejecucion.
+Comprender como PostgreSQL utiliza estadisticas
+para elegir los planes de ejecucion de SQL.
 
-PREPARACION Y CONEXION
+Demostrar que las estadisticas desactualizadas
+pueden producir estimaciones incorrectas.
 
-Seguir el recorrido guiado de 06.00.
-distribution debe tener 20000 filas: 100 raro y 19900 normal.
-La preparacion ya ejecuto ANALYZE sobre la distribucion inicial.
-Autovacuum ordinario permanece deshabilitado para controlar la prueba.
+Observar que cambia despues de ejecutar ANALYZE.
 
-PowerShell:
+
+SITUACION
+
+Tenemos una tabla con 20000 registros.
+
+Inicialmente casi todos tienen estado = 'normal'.
+
+Solo una pequena cantidad tiene estado = 'raro'.
+
+Despues modificaremos la distribucion de los datos.
+
+Queremos responder:
+
+- Como conoce PostgreSQL la distribucion?
+- Que sucede si los datos cambian considerablemente?
+- Por que el optimizador puede elegir otro plan?
+- Para que sirve ANALYZE?
+- ANALYZE tambien elimina versiones obsoletas?
+
+
+CONCEPTOS NECESARIOS
+
+OPTIMIZADOR O PLANIFICADOR:
+
+Es el componente de PostgreSQL encargado de
+decidir como ejecutar una consulta SQL.
+
+Puede elegir distintas estrategias para acceder
+a las tablas y procesar los resultados.
+
+
+ESTADISTICAS:
+
+Informacion resumida sobre los datos de las tablas.
+
+Ayudan a estimar cuantas filas cumpliran
+una condicion y que operaciones conviene utilizar.
+
+
+CARDINALIDAD ESTIMADA:
+
+Cantidad de filas que PostgreSQL calcula que
+producira una operacion.
+
+No necesariamente coincide con el numero real.
+
+
+INDEX SCAN:
+
+Acceso que utiliza un indice para localizar filas.
+
+Puede ser conveniente cuando esperamos encontrar
+una porcion pequena de la tabla.
+
+No significa que siempre sea la opcion mas rapida.
+
+
+SEQ SCAN:
+
+Lectura secuencial de la tabla.
+
+Puede ser conveniente cuando necesitamos
+recuperar una proporcion importante de sus filas.
+
+
+EXPLAIN:
+
+Permite consultar el plan estimado de una sentencia.
+
+EXPLAIN ANALYZE:
+
+Ejecuta realmente la sentencia y muestra
+estadisticas de su ejecucion.
+
+En esta practica solamente ejecutaremos SELECT.
+
+
+ANALYZE:
+
+Recopila estadisticas sobre los datos de las tablas.
+
+Estas estadisticas ayudan a generar mejores
+estimaciones para consultas posteriores.
+
+
+PREPARACION
+
+Utilizar el laboratorio de 06.00.
+
+Tabla:
+maintenance.distribution
+
+Estado inicial:
+
+20000 registros.
+
+19900 con estado = 'normal'.
+100 con estado = 'raro'.
+
+La preparacion ya ejecuto ANALYZE.
+
+La tabla tiene un indice sobre estado.
+
+No ejecutar 03-analyze-estadisticas.sh
+durante la practica manual.
+
+
+CONEXION - POWERSHELL
 
 docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
 
-psql:
+DENTRO DE PSQL
 
 \pset pager off
-SET application_name='p6_manual_analyze';
 
-1. CONSULTAR LA DISTRIBUCION Y SUS ESTADISTICAS
+SET application_name = 'p6_manual_analyze';
 
-SELECT estado,count(*)
-FROM maintenance.distribution GROUP BY estado ORDER BY estado;
 
-SELECT attname,n_distinct,most_common_vals,most_common_freqs
+============================================================
+PASO 1. CONOCER LOS DATOS Y SUS ESTADISTICAS
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos conocer como estan distribuidos
+los datos antes de modificarlos.
+
+
+COMANDO
+
+-- Contar registros por estado.
+SELECT
+    estado,
+    COUNT(*) AS cantidad
+FROM maintenance.distribution
+GROUP BY estado
+ORDER BY estado;
+
+
+RESULTADO ESPERADO
+
+estado  | cantidad
+--------+---------
+normal  | 19900
+raro    | 100
+
+
+INTERPRETACION
+
+De los 20000 registros:
+
+99.5 por ciento son normales.
+
+0.5 por ciento son raros.
+
+La condicion estado = 'raro' actualmente
+selecciona una parte muy pequena de la tabla.
+
+
+CONSULTAR ESTADISTICAS
+
+-- Mostrar la informacion conocida
+-- por el planificador para esta columna.
+SELECT
+    attname,
+    n_distinct,
+    most_common_vals,
+    most_common_freqs
 FROM pg_stats
-WHERE schemaname='maintenance'
-AND tablename='distribution' AND attname='estado';
+WHERE schemaname = 'maintenance'
+  AND tablename = 'distribution'
+  AND attname = 'estado';
 
-Resultado inicial esperado:
-- normal: 19900; raro: 100.
-- Dos valores distintos.
-- Frecuencias aproximadas: normal 0.995 y raro 0.005.
 
-pg_stats describe informacion utilizada por el planificador.
-No es la misma informacion que los contadores de actividad de
-pg_stat_user_tables. Ambos tipos de estadisticas responden preguntas distintas.
+EXPLICACION
 
-2. CAMBIAR LA DISTRIBUCION
+pg_stats:
 
-UPDATE maintenance.distribution SET estado='raro'
+Vista que presenta estadisticas recopiladas
+por ANALYZE para uso del planificador.
+
+attname:
+
+Columna a la cual pertenecen las estadisticas.
+
+n_distinct:
+
+Estimacion sobre cantidad de valores diferentes.
+
+most_common_vals:
+
+Valores mas frecuentes encontrados.
+
+most_common_freqs:
+
+Frecuencias aproximadas de esos valores.
+
+
+RESULTADO ESPERADO
+
+Dos valores diferentes.
+
+Frecuencias aproximadas:
+
+normal = 0.995
+raro = 0.005
+
+
+QUE DEMOSTRAMOS
+
+PostgreSQL dispone de informacion que indica
+que raro es un valor poco frecuente.
+
+Esa informacion puede influir en la eleccion
+del plan de ejecucion.
+
+
+============================================================
+PASO 2. CAMBIAR RADICALMENTE LA DISTRIBUCION
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos modificar los datos sin ejecutar ANALYZE.
+
+De esta manera el planificador puede continuar
+utilizando estadisticas de la distribucion anterior.
+
+
+COMANDO
+
+-- Convertir 17900 registros normales
+-- en registros con estado raro.
+UPDATE maintenance.distribution
+SET estado = 'raro'
 WHERE id BETWEEN 101 AND 18000;
 
-SELECT estado,count(*)
-FROM maintenance.distribution GROUP BY estado ORDER BY estado;
 
-Se actualizan 17900 filas. Ahora raro tiene 18000 y normal 2000.
-El total permanece en 20000.
-El UPDATE cambia los datos; no sustituye una recopilacion de estadisticas
-de distribucion mediante ANALYZE.
+RESULTADO ESPERADO
 
-3. OBSERVAR EL PLAN ANTES DE ANALYZE
+UPDATE 17900
 
+
+EXPLICACION
+
+Los primeros 100 registros ya eran raros.
+
+Ahora modificamos otros 17900.
+
+Por lo tanto:
+
+100 + 17900 = 18000 registros raros.
+
+
+COMPROBACION
+
+-- Consultar la nueva distribucion real.
+SELECT
+    estado,
+    COUNT(*) AS cantidad
+FROM maintenance.distribution
+GROUP BY estado
+ORDER BY estado;
+
+
+RESULTADO ESPERADO
+
+estado  | cantidad
+--------+---------
+normal  | 2000
+raro    | 18000
+
+
+INTERPRETACION
+
+Ahora:
+
+90 por ciento de las filas son raras.
+
+10 por ciento son normales.
+
+La distribucion cambio por completo.
+
+Sin embargo, todavia NO ejecutamos ANALYZE.
+
+
+IMPORTANTE
+
+El UPDATE cambia los datos reales.
+
+No reemplaza automaticamente las estadisticas
+de distribucion del optimizador.
+
+Por eso pueden quedar estimaciones desactualizadas.
+
+
+============================================================
+PASO 3. OBSERVAR EL PLAN ANTES DE ANALYZE
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comparar lo que PostgreSQL estima
+con las filas que realmente devuelve.
+
+
+COMANDO
+
+-- Mostrar el plan y ejecutar la consulta.
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM maintenance.distribution WHERE estado='raro';
+SELECT *
+FROM maintenance.distribution
+WHERE estado = 'raro';
 
-EXPLAIN ANALYZE ejecuta realmente la consulta. Aqui se usa un SELECT.
-Comparar rows estimadas con actual rows, teniendo en cuenta loops.
 
-Evidencia temporal:
-- Index Scan.
-- 189 filas estimadas.
-- 18000 filas reales, loops=1.
+EXPLICACION
 
-La estimacion no tuvo que ser exactamente 100: el planificador puede ajustar
-estimaciones con informacion del tamano actual. Lo relevante es la gran
-diferencia frente a la distribucion real.
+EXPLAIN:
 
-Registrar nodo, filas estimadas, filas reales y buffers.
-Los tiempos incluyen condiciones de esa ejecucion y no son un benchmark.
+Muestra las operaciones que eligio el planificador.
 
-4. ACTUALIZAR ESTADISTICAS
+ANALYZE:
 
+Ejecuta la consulta y agrega resultados reales.
+
+BUFFERS:
+
+Agrega informacion sobre los bloques utilizados.
+
+
+QUE DEBEMOS BUSCAR
+
+En la salida encontraremos conceptos como:
+
+Index Scan.
+Seq Scan.
+cost.
+rows.
+actual rows.
+loops.
+Buffers.
+
+
+COMO INTERPRETAR ROWS
+
+rows:
+
+Estimacion del planificador.
+
+actual rows:
+
+Cantidad observada durante la ejecucion.
+
+loops:
+
+Numero de veces que se ejecuto ese nodo.
+
+En planes con varios loops, los valores reales
+pueden representarse como promedios por ejecucion.
+
+En nuestra referencia el nodo principal
+tuvo loops = 1.
+
+
+RESULTADO DE REFERENCIA
+
+Antes de ANALYZE:
+
+Plan: Index Scan.
+
+Filas estimadas: 189.
+
+Filas reales: 18000.
+
+
+POR QUE ES IMPORTANTE
+
+PostgreSQL esperaba encontrar aproximadamente
+189 filas.
+
+Pero realmente encontro 18000.
+
+La diferencia es muy grande.
+
+El planificador estaba utilizando informacion
+que ya no representaba correctamente
+la distribucion actual.
+
+
+POR QUE APARECE INDEX SCAN
+
+La estadistica anterior indicaba que raro
+era un valor poco frecuente.
+
+En esas condiciones, utilizar el indice
+podia parecer conveniente.
+
+Sin embargo, ahora raro representa casi
+toda la tabla.
+
+
+QUE NO DEBEMOS CONCLUIR
+
+No significa que Index Scan siempre sea malo.
+
+Tampoco significa que PostgreSQL deba utilizar
+obligatoriamente Seq Scan.
+
+El plan depende de estadisticas, costos,
+configuracion y caracteristicas de los datos.
+
+
+============================================================
+PASO 4. ACTUALIZAR LAS ESTADISTICAS
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos permitir que PostgreSQL vuelva
+a estudiar la distribucion actual.
+
+
+COMANDO
+
+-- Actualizar estadisticas de la tabla.
 ANALYZE VERBOSE maintenance.distribution;
 
-SELECT attname,n_distinct,most_common_vals,most_common_freqs
+
+RESULTADO ESPERADO
+
+ANALYZE
+
+
+EXPLICACION
+
+ANALYZE:
+
+Recopila estadisticas de la tabla.
+
+VERBOSE:
+
+Muestra informacion sobre la recopilacion.
+
+El objetivo no es modificar las filas.
+
+Es actualizar la informacion que utiliza
+el planificador.
+
+
+COMPROBAR LAS ESTADISTICAS
+
+-- Consultar nuevamente las frecuencias.
+SELECT
+    attname,
+    n_distinct,
+    most_common_vals,
+    most_common_freqs
 FROM pg_stats
-WHERE schemaname='maintenance'
-AND tablename='distribution' AND attname='estado';
+WHERE schemaname = 'maintenance'
+  AND tablename = 'distribution'
+  AND attname = 'estado';
 
-Resultado esperado: raro aproximadamente 0.9 y normal 0.1.
-ANALYZE observa los datos y actualiza estadisticas; no es el procedimiento
-encargado de retirar las versiones obsoletas del UPDATE.
 
-5. COMPARAR EL PLAN
+RESULTADO ESPERADO
 
+Frecuencias aproximadas:
+
+raro = 0.9
+
+normal = 0.1
+
+
+QUE SIGNIFICA
+
+PostgreSQL ahora reconoce que raro
+representa aproximadamente el 90 por ciento
+de la tabla.
+
+El optimizador dispone de una descripcion
+mucho mas representativa de los datos.
+
+
+============================================================
+PASO 5. COMPARAR NUEVAMENTE EL PLAN
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar si las nuevas estadisticas
+mejoran la estimacion de filas.
+
+
+COMANDO
+
+-- Ejecutar exactamente la misma consulta
+-- que utilizamos antes de ANALYZE.
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM maintenance.distribution WHERE estado='raro';
+SELECT *
+FROM maintenance.distribution
+WHERE estado = 'raro';
 
-SELECT count(*) FROM maintenance.distribution WHERE estado='raro';
 
-Evidencia temporal:
-- Seq Scan.
-- 18000 estimadas y 18000 reales.
-- Los datos devueltos no cambiaron por ejecutar ANALYZE.
+RESULTADO DE REFERENCIA
 
-Evaluar el error absoluto:
-abs(estimadas - reales)
+DESPUES DE ANALYZE:
 
-En la evidencia paso de 17811 a 0.
-No exigir siempre el mismo nodo ni una reduccion de tiempo.
-El plan depende de costos, configuracion, distribucion y almacenamiento.
+Plan: Seq Scan.
 
-La funcion del script automatizado obtiene el plan en JSON.
-En PostgreSQL 18.6 Actual Rows se observo como 18000.00.
-La conversion validada usa numeric antes de bigint. En esta medicion el
-nodo superior tiene loops=1; no extrapolar redondeos a promedios por loop.
+Filas estimadas: 18000.
 
-6. DIFERENCIAR ANALISIS Y LIMPIEZA
+Filas reales: 18000.
 
-SELECT n_live_tup,n_dead_tup,last_analyze,last_autoanalyze
+
+COMPARACION
+
+ANTES:
+
+Estimadas = 189
+Reales = 18000
+Plan = Index Scan
+
+DESPUES:
+
+Estimadas = 18000
+Reales = 18000
+Plan = Seq Scan
+
+
+QUE CAMBIO
+
+La cantidad de registros reales no cambio
+por ejecutar ANALYZE.
+
+Lo que mejoro fue la estimacion.
+
+El planificador ahora reconoce que la consulta
+recuperara una gran proporcion de la tabla.
+
+Por eso puede resultar conveniente un Seq Scan.
+
+
+COMPROBAR LOS DATOS
+
+-- Confirmar que ANALYZE no modifico los registros.
+SELECT COUNT(*) AS filas_raras
+FROM maintenance.distribution
+WHERE estado = 'raro';
+
+
+RESULTADO ESPERADO
+
+filas_raras
+-----------
+18000
+
+
+EXPLICACION
+
+ANALYZE actualizo informacion estadistica.
+
+No cambio el valor estado de las filas.
+
+
+============================================================
+COMPROBACION ADICIONAL. ANALYZE NO ES VACUUM
+============================================================
+
+QUE QUEREMOS ACLARAR
+
+Durante el UPDATE generamos versiones anteriores
+de 17900 filas.
+
+ANALYZE actualiza estadisticas del optimizador.
+
+No es el procedimiento encargado de limpiar
+esas versiones obsoletas.
+
+
+COMANDO
+
+-- Consultar estimaciones y fechas de mantenimiento.
+SELECT
+    n_live_tup,
+    n_dead_tup,
+    last_analyze,
+    last_autoanalyze
 FROM pg_stat_user_tables
-WHERE relid='maintenance.distribution'::regclass;
+WHERE relid = 'maintenance.distribution'::regclass;
 
-La evidencia temporal conservo unas 17900 versiones obsoletas despues
-de ANALYZE. Es coherente con haber actualizado estadisticas sin VACUUM.
-Los contadores son estimados; el conteo real se obtiene mediante SELECT.
 
-No agregar una limpieza intermedia para ocultar este resultado:
-forma parte de la diferencia que se quiere explicar.
+EXPLICACION
+
+n_live_tup:
+
+Estimacion de filas vivas.
+
+n_dead_tup:
+
+Estimacion de versiones obsoletas.
+
+last_analyze:
+
+Fecha de la ultima ejecucion manual de ANALYZE.
+
+last_autoanalyze:
+
+Fecha de la ultima ejecucion automatica de ANALYZE.
+
+
+RESULTADO DE REFERENCIA
+
+En la validacion original se observaron
+aproximadamente 17900 versiones obsoletas.
+
+Esto es coherente con las modificaciones
+que realizamos.
+
+
+IMPORTANTE
+
+n_dead_tup es una estimacion.
+
+No debe interpretarse como un conteo exacto
+garantizado de versiones fisicas.
+
+
+CONCLUSION FINAL
+
+Las estadisticas influyen en las decisiones
+del optimizador.
+
+Cuando cambia mucho la distribucion de los datos,
+las estimaciones pueden dejar de ser representativas.
+
+ANALYZE permite actualizar esas estadisticas.
+
+Una mejor estimacion puede producir un plan distinto.
+
+Pero no garantiza siempre un cambio de plan
+ni una mejora determinada del tiempo de ejecucion.
+
 
 COMPARACION CON ORACLE
 
-DBMS_STATS permite recopilar estadisticas del optimizador de Oracle.
-La comparacion con ANALYZE ayuda a entender cardinalidades y distribucion.
-Las opciones de muestreo, histogramas y gestion de planes no son identicas.
-Una mejor estimacion no garantiza por si sola un menor tiempo de respuesta.
+Oracle tambien utiliza estadisticas para
+su optimizador basado en costos.
 
-CONCLUSION Y CIERRE
+En Oracle, DBMS_STATS es una referencia
+funcional para recopilar estadisticas.
 
-Los participantes deben justificar cuando recopilar estadisticas despues
-de cambios significativos en la distribucion y separar ese trabajo de
-la limpieza fisica de versiones.
+En PostgreSQL utilizamos ANALYZE.
 
-Salir con \q y continuar con 06.04.
-La tabla conserva los cambios para el diagnostico preventivo posterior.
+Los conceptos son comparables, pero sus
+implementaciones no son identicas.
 
-ALTERNATIVA AUTOMATIZADA
 
-En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+FINALIZACION
 
-docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/03-analyze-estadisticas.sh
-if ($LASTEXITCODE -ne 0) { throw "Fallo 03-analyze-estadisticas.sh." }
+Salir de psql:
 
-FUENTES
+\q
 
-https://www.postgresql.org/docs/18/sql-analyze.html
-https://www.postgresql.org/docs/18/using-explain.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/arpls/DBMS_STATS.html
+No es necesario restaurar la distribucion
+antes de continuar con 06.04.
+
+La practica 06.05 utilizara esta tabla
+para su diagnostico general.
+
+Para repetir el escenario con sus datos
+y estadisticas iniciales, recrear el
+laboratorio siguiendo 06.00.
+
+
+FIN DE LA PRACTICA 06.03\n

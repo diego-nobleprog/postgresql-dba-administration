@@ -1,170 +1,976 @@
 PRACTICA 06.01 - MVCC Y VACUUM
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
 
-SITUACION Y PREGUNTA CENTRAL
-
-Una tabla recibe cambios mientras otra sesion conserva una lectura anterior.
-¿Por que VACUUM no puede retirar inmediatamente todas las versiones antiguas?
 
 OBJETIVO
 
-Distinguir filas visibles, versiones obsoletas y espacio reutilizable.
-Observar el efecto de una transaccion prolongada sobre la limpieza.
+Comprender por que PostgreSQL conserva versiones antiguas de
+las filas cuando existen transacciones que todavia las necesitan.
+
+Demostrar como VACUUM elimina versiones obsoletas y permite
+reutilizar espacio de almacenamiento.
+
+
+SITUACION
+
+Imaginemos una tabla que contiene 10000 registros.
+
+Un usuario comienza a consultar la informacion y mantiene
+su transaccion abierta.
+
+Mientras tanto, otro usuario modifica y elimina registros.
+
+Queremos responder estas preguntas:
+
+- Por que ambos usuarios pueden observar datos diferentes?
+- Que sucede con las versiones anteriores de las filas?
+- Por que VACUUM no puede eliminarlas inmediatamente?
+- Que cambia cuando termina la transaccion antigua?
+- Podemos reutilizar el espacio recuperado?
+
+
+CONCEPTOS QUE NECESITAMOS CONOCER
+
+MVCC (Multi-Version Concurrency Control):
+
+Es el mecanismo que permite manejar diferentes versiones
+de los registros para ofrecer lecturas consistentes.
+
+Cuando una transaccion modifica o elimina una fila,
+PostgreSQL no siempre puede descartar inmediatamente
+la version anterior.
+
+Puede necesitar conservarla mientras existan
+transacciones capaces de verla.
+
+
+SNAPSHOT:
+
+Representa una vista de las transacciones cuyos cambios
+son visibles para una consulta.
+
+En REPEATABLE READ, PostgreSQL conserva el snapshot
+establecido por la primera consulta que lo requiere
+durante toda la transaccion.
+
+Por eso una transaccion puede continuar observando
+una version anterior de los datos, aunque otras
+transacciones ya hayan confirmado modificaciones.
+
+
+VACUUM:
+
+Es un mecanismo de mantenimiento de PostgreSQL.
+
+Entre sus tareas se encuentra identificar y recuperar
+espacio ocupado por versiones obsoletas de las filas.
+
+No puede retirar una version si todavia es necesaria
+para la visibilidad de alguna transaccion.
+
+El VACUUM convencional permite principalmente reutilizar
+espacio dentro de la tabla. No garantiza reducir el
+tamano del archivo fisico.
+
+
+AUTOCOMMIT:
+
+Cuando utilizamos psql fuera de una transaccion explicita
+BEGIN, cada sentencia SQL se confirma automaticamente
+si termina correctamente.
+
+Esto es importante porque las modificaciones de la
+sesion B deben quedar confirmadas para que podamos
+compararlas con la vista anterior de A.
+
 
 PREPARACION
 
-Usar el laboratorio de 06.00 con su carga inicial.
-Esta guia corresponde al recorrido interactivo.
-No ejecutar tambien 01-mvcc-vacuum.sh sobre la misma carga.
+El laboratorio debe estar creado mediante la guia 06.00.
 
-Abrir dos terminales PowerShell y conectar A y B con:
+Contenedor:
+p6-maintenance-lab
+
+Base de datos:
+nobleprog_maintenance_scenarios
+
+Tabla:
+maintenance.mvcc_work
+
+Estado inicial esperado:
+
+10000 filas.
+Todas tienen version = 0.
+
+El laboratorio deshabilito el autovacuum ordinario
+de esta tabla para que no interfiera con la demostracion.
+
+Utilizaremos dos terminales PowerShell independientes.
+
+IMPORTANTE:
+
+Las sesiones A y B deben permanecer abiertas durante
+el ejercicio.
+
+No ejecutar COMMIT en A hasta que la guia lo indique.
+
+No ejecutar el script automatizado 01-mvcc-vacuum.sh
+sobre la misma tabla mientras hacemos estos pasos.
+
+
+ABRIR LA TERMINAL A
+
+Desde PowerShell ejecutar:
 
 docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
 
-En ambas sesiones:
+Una vez dentro de psql:
 
 \pset pager off
 
-1. ESTABLECER UN SNAPSHOT - PSQL A
+Abrir otra terminal PowerShell independiente.
 
-SET application_name='p6_manual_A';
+
+ABRIR LA TERMINAL B
+
+Ejecutar el mismo comando:
+
+docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
+
+Una vez dentro de psql:
+
+\pset pager off
+
+A partir de este momento, TODOS los comandos SQL
+se ejecutan dentro de psql en la sesion indicada.
+
+No cerrar ninguna terminal hasta el final.
+
+
+============================================================
+PASO 1. OBSERVAR LOS 10000 REGISTROS ORIGINALES
+============================================================
+
+SESION A - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos establecer una vista consistente de los datos
+y conservarla mientras otra sesion modifica la tabla.
+
+
+COMANDOS
+
+-- Identificar la conexion A en PostgreSQL.
+SET application_name = 'p6_manual_A';
+
+-- Iniciar una transaccion con aislamiento REPEATABLE READ.
 BEGIN ISOLATION LEVEL REPEATABLE READ;
-SELECT count(*),sum(version) FROM maintenance.mvcc_work;
 
-Resultado esperado: 10000 filas y suma de versiones 0.
-Mantener abierta esta transaccion. El primer SELECT establece el snapshot.
-REPEATABLE READ permite comparar las dos consultas de A con la misma vista.
+-- Consultar los registros visibles para esta transaccion.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
 
-2. CAMBIAR Y CONFIRMAR DATOS - PSQL B
 
-SET application_name='p6_manual_B';
+RESULTADO ESPERADO
 
+filas_visibles | suma_versiones
+---------------+--------------
+10000          | 0
+
+
+EXPLICACION
+
+COUNT(*):
+
+Cuenta las filas visibles para esta consulta.
+
+Obtenemos 10000 porque todavia no hemos realizado
+ninguna modificacion.
+
+
+SUM(version):
+
+Suma los valores de la columna version.
+
+Todas las filas comienzan con version = 0.
+
+Por lo tanto:
+
+10000 filas con valor cero producen suma_versiones = 0.
+
+La columna version es un dato de ejemplo que creamos
+para el ejercicio.
+
+NO representa directamente el mecanismo interno
+de versiones MVCC de PostgreSQL.
+
+
+POR QUE UTILIZAMOS REPEATABLE READ
+
+Porque necesitamos que A mantenga la misma vista
+de los datos durante toda su transaccion.
+
+El SELECT anterior establece su snapshot.
+
+Si B confirma cambios mientras A permanece abierta,
+A continuara observando las versiones visibles
+en su snapshot inicial.
+
+
+MUY IMPORTANTE
+
+NO ejecutar COMMIT.
+
+NO ejecutar ROLLBACK.
+
+NO cerrar la terminal A.
+
+La transaccion debe permanecer abierta.
+
+Ahora continuamos en la terminal B.
+
+
+============================================================
+PASO 2. MODIFICAR LOS DATOS DESDE OTRA SESION
+============================================================
+
+SESION B - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos modificar datos desde B mientras A conserva
+una vista anterior.
+
+Despues comprobaremos que ambas sesiones pueden
+observar resultados diferentes.
+
+
+COMANDOS
+
+-- Identificar la conexion B.
+SET application_name = 'p6_manual_B';
+
+-- Actualizar las primeras 2000 filas.
+-- Pasaran de version = 0 a version = 1.
 UPDATE maintenance.mvcc_work
-SET version=version+1 WHERE id<=2000;
+SET version = version + 1
+WHERE id <= 2000;
 
+-- Eliminar otras 2000 filas.
+-- Son diferentes de las que acabamos de actualizar.
 DELETE FROM maintenance.mvcc_work
 WHERE id BETWEEN 2001 AND 4000;
 
-SELECT count(*),sum(version) FROM maintenance.mvcc_work;
+-- Consultar el estado actual visible desde B.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
 
-B trabaja con autocommit fuera de BEGIN.
-Resultado: UPDATE 2000, DELETE 2000, 8000 filas visibles y suma 2000.
-Las actualizaciones generan versiones nuevas; las anteriores y las filas
-eliminadas todavia pueden ser necesarias para A.
 
-3. IDENTIFICAR EL HORIZONTE RETENIDO - PSQL B
+RESULTADOS ESPERADOS
 
-SELECT pid,application_name,state,backend_xmin,
-       age(backend_xmin) AS xmin_age,
-       clock_timestamp()-xact_start AS transaction_age
-FROM pg_stat_activity
-WHERE application_name='p6_manual_A';
+Primera operacion:
 
-A debe aparecer idle in transaction y con backend_xmin no nulo.
-Esto identifica una transaccion que conserva un horizonte de visibilidad.
-Su duracion es una senal de diagnostico; no se debe terminar una sesion
-de negocio sin analizar su funcion y el efecto de la cancelacion.
+UPDATE 2000
 
-VACUUM (VERBOSE, INDEX_CLEANUP ON) maintenance.mvcc_work;
+Segunda operacion:
 
-SELECT n_live_tup,n_dead_tup,vacuum_count
-FROM pg_stat_user_tables
-WHERE relid='maintenance.mvcc_work'::regclass;
+DELETE 2000
 
-Evidencia temporal: 4000 versiones dead but not yet removable.
-VACUUM se ejecuto, pero no pudo retirar versiones necesarias para A.
-Su ejecucion exitosa no significa que todas las versiones fueran removibles.
+Consulta final:
 
-4. VERIFICAR LA VISTA ANTERIOR Y LIBERARLA - PSQL A
+filas_visibles | suma_versiones
+---------------+--------------
+8000           | 2000
 
-SELECT count(*),sum(version) FROM maintenance.mvcc_work;
+
+EXPLICACION DEL UPDATE
+
+Teniamos 10000 filas.
+
+El UPDATE modifico las primeras 2000.
+
+Cada una tenia version = 0.
+
+Ahora esas 2000 filas contienen version = 1.
+
+Por eso la suma de versiones aumenta a 2000.
+
+Desde el punto de vista de MVCC, un UPDATE puede
+generar una nueva version fisica de cada fila.
+
+La version anterior no necesariamente puede
+eliminarse inmediatamente.
+
+
+EXPLICACION DEL DELETE
+
+Despues eliminamos las filas cuyos identificadores
+se encuentran entre 2001 y 4000.
+
+Son exactamente 2000 filas adicionales.
+
+La tabla tenia 10000 filas visibles.
+
+Eliminamos 2000.
+
+Por eso B observa:
+
+10000 - 2000 = 8000 filas.
+
+El DELETE no resto valores a suma_versiones
+porque las filas eliminadas tenian version = 0.
+
+
+POR QUE B PUEDE VER ESTOS CAMBIOS
+
+Porque B no ejecuto BEGIN.
+
+Por lo tanto, trabaja con autocommit.
+
+Cada UPDATE y DELETE exitoso quedo confirmado
+al terminar su ejecucion.
+
+
+QUE SUCEDE CON A
+
+Aunque B confirmo las modificaciones, A conserva
+el snapshot establecido en el paso anterior.
+
+A todavia puede necesitar las versiones originales
+de los registros.
+
+
+COMPROBACION ADICIONAL
+
+Volver momentaneamente a la SESION A.
+
+Ejecutar solamente:
+
+-- Consultar nuevamente sin cerrar la transaccion.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO EN A
+
+filas_visibles | suma_versiones
+---------------+--------------
+10000          | 0
+
+
+INTERPRETACION
+
+Tenemos dos resultados diferentes:
+
+SESION A:
+10000 filas, suma 0.
+
+SESION B:
+8000 filas, suma 2000.
+
+Esto NO significa que los cambios de B hayan fallado.
+
+Los cambios ya estan confirmados.
+
+La diferencia ocurre porque A y B trabajan
+con snapshots distintos.
+
+A conserva su snapshot de REPEATABLE READ.
+
+B consulta el estado confirmado mas reciente
+visible para sus nuevas sentencias.
+
+
+QUE DEMOSTRAMOS
+
+MVCC permite conservar versiones anteriores para
+mantener lecturas consistentes.
+
+Un UPDATE o DELETE confirmado no obliga a una
+transaccion antigua a cambiar inmediatamente
+su vista de los datos.
+
+
+IMPORTANTE
+
+La transaccion A debe seguir abierta.
+
+Todavia NO ejecutar COMMIT en A.
+
+Continuamos nuevamente en B.
+
+
+============================================================
+PASO 3. EJECUTAR VACUUM MIENTRAS A SIGUE ABIERTA
+============================================================
+
+SESION B - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que VACUUM puede ejecutarse
+sin conseguir eliminar todas las versiones obsoletas
+cuando otra transaccion todavia las necesita.
+
+
+COMANDO
+
+-- Ejecutar mantenimiento sobre la tabla.
+-- VERBOSE muestra informacion detallada de la limpieza.
+VACUUM (VERBOSE, INDEX_CLEANUP ON)
+maintenance.mvcc_work;
+
+
+QUE SIGNIFICA ESTE COMANDO
+
+VACUUM:
+
+Solicita el mantenimiento de la tabla.
+
+
+VERBOSE:
+
+Pide mostrar informacion sobre las operaciones
+de mantenimiento realizadas.
+
+Necesitamos esa informacion para interpretar
+las versiones que pudieron o no pudieron retirarse.
+
+
+INDEX_CLEANUP ON:
+
+Solicita que VACUUM realice la limpieza correspondiente
+de los indices cuando sea aplicable.
+
+No es necesario modificar ningun indice manualmente.
+
+
+RESULTADO ESPERADO
+
+PostgreSQL emitira informacion de mantenimiento.
+
+En la evidencia original de esta practica se observaron
+4000 versiones obsoletas que todavia no podian retirarse.
+
+La salida puede contener texto similar a:
+
+4000 are dead but not yet removable
+
+La redaccion y otros valores pueden variar.
+
+El resultado importante es identificar que quedaron
+versiones obsoletas pendientes de eliminacion.
+
+
+POR QUE EXISTEN 4000 VERSIONES OBSOLETAS
+
+Recordemos las operaciones anteriores.
+
+UPDATE:
+
+Modificamos 2000 filas.
+
+Las versiones anteriores de esas filas pueden
+seguir siendo necesarias para A.
+
+DELETE:
+
+Eliminamos otras 2000 filas.
+
+Esas versiones tambien pueden seguir siendo
+necesarias para A.
+
+En este escenario:
+
+2000 versiones anteriores del UPDATE.
+
+2000 versiones correspondientes al DELETE.
+
+TOTAL: 4000 versiones que A todavia necesita
+para mantener su snapshot.
+
+
+POR QUE VACUUM NO LAS ELIMINO
+
+Porque A mantiene una transaccion REPEATABLE READ
+abierta desde antes de las modificaciones.
+
+A todavia puede consultar las versiones originales.
+
+Si PostgreSQL las retirara prematuramente,
+no podria conservar correctamente esa vista.
+
+
+SIGNIFICA QUE VACUUM FALLO
+
+NO.
+
+VACUUM puede terminar correctamente.
+
+Simplemente no puede retirar versiones que todavia
+deben conservarse por las reglas de visibilidad.
+
+Este es uno de los motivos por los que las
+transacciones prolongadas pueden dificultar
+el mantenimiento de PostgreSQL.
+
+
+QUE DEMOSTRAMOS
+
+Una ejecucion exitosa de VACUUM no significa
+que todas las versiones obsoletas hayan sido
+retiradas.
+
+La posibilidad de limpiarlas depende tambien
+de las transacciones que siguen activas.
+
+
+IMPORTANTE
+
+No cerrar A todavia.
+
+En el siguiente paso terminaremos su transaccion
+y repetiremos VACUUM.
+
+
+============================================================
+PASO 4. CERRAR LA TRANSACCION A Y REPETIR VACUUM
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que, una vez finalizada la
+transaccion antigua, PostgreSQL puede retirar
+las versiones que antes tenia que conservar.
+
+
+PRIMERA PARTE - SESION A
+
+Ejecutar:
+
+-- Comprobar por ultima vez el snapshot anterior.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO
+
+filas_visibles | suma_versiones
+---------------+--------------
+10000          | 0
+
+
+EXPLICACION
+
+Aunque B ya confirmo las modificaciones y ejecuto
+VACUUM, A sigue observando su snapshot anterior.
+
+Ahora vamos a terminar esa transaccion.
+
+
+COMANDO EN A
+
+-- Confirmar y finalizar la transaccion A.
 COMMIT;
 
-A debe seguir viendo 10000 y 0 antes del COMMIT.
-B ya veia 8000 y 2000: las consultas tienen snapshots distintos.
-El COMMIT termina la necesidad de conservar la vista de A.
 
-5. LIMPIAR LAS VERSIONES YA REMOVIBLES - PSQL B
+RESULTADO ESPERADO
 
-VACUUM (VERBOSE, INDEX_CLEANUP ON) maintenance.mvcc_work;
+COMMIT
 
-SELECT count(*),sum(version) FROM maintenance.mvcc_work;
-SELECT n_live_tup,n_dead_tup,vacuum_count
-FROM pg_stat_user_tables
-WHERE relid='maintenance.mvcc_work'::regclass;
 
-Resultado esperado: 8000 filas reales y ninguna version obsoleta pendiente
-en este experimento sin otras transacciones reteniendo snapshots.
-La evidencia temporal confirmo la eliminacion de 4000 versiones.
+QUE SUCEDIO
 
-COUNT(*) mide las filas visibles para esa consulta.
-n_live_tup y n_dead_tup son estimaciones y pueden diferir del conteo.
-Los informes de VACUUM tambien pueden incorporar estimaciones al omitir
-paginas; no interpretar una diferencia aislada como perdida de filas.
+A ya no necesita conservar el snapshot anterior.
 
-6. COMPROBAR LA REUTILIZACION - PSQL B
+Al terminar la transaccion, desaparece la necesidad
+de mantener esas versiones exclusivamente para A.
 
-SELECT pg_relation_size('maintenance.mvcc_work') AS heap_before \gset
 
+COMPROBACION EN A
+
+-- Esta consulta se ejecuta despues del COMMIT.
+-- Ahora utiliza una nueva vista de los datos.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO
+
+filas_visibles | suma_versiones
+---------------+--------------
+8000           | 2000
+
+
+EXPLICACION
+
+A ahora observa los cambios confirmados por B.
+
+Esto sucede porque el snapshot anterior termino
+con el COMMIT.
+
+
+SEGUNDA PARTE - SESION B
+
+Regresar a la terminal B.
+
+Ejecutar:
+
+-- Repetir VACUUM despues de terminar la transaccion A.
+VACUUM (VERBOSE, INDEX_CLEANUP ON)
+maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO
+
+PostgreSQL ejecutara nuevamente VACUUM.
+
+Esta vez las versiones obsoletas de nuestro
+experimento ya no son necesarias para A.
+
+En la validacion original se confirmo la limpieza
+de las 4000 versiones que estaban retenidas.
+
+La salida VERBOSE debe revisarse para identificar
+las versiones retiradas y cualquier version que
+todavia no resulte removible.
+
+
+COMPROBACION FINAL EN B
+
+-- Verificar que las filas visibles no cambiaron.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO
+
+filas_visibles | suma_versiones
+---------------+--------------
+8000           | 2000
+
+
+POR QUE SIGUEN EXISTIENDO 8000 FILAS
+
+VACUUM no revierte los UPDATE.
+
+VACUUM tampoco recupera filas eliminadas
+como si estuvieramos ejecutando ROLLBACK.
+
+Los cambios confirmados permanecen.
+
+Lo que hace VACUUM es retirar versiones fisicas
+que ya no son necesarias y recuperar espacio
+para reutilizacion.
+
+
+QUE DEMOSTRAMOS
+
+ANTES:
+
+VACUUM no podia retirar las versiones retenidas
+por A.
+
+DESPUES:
+
+A termino su transaccion.
+
+VACUUM pudo limpiar las versiones que ya no
+eran necesarias.
+
+
+============================================================
+PASO 5. COMPROBAR QUE EL ESPACIO SE PUEDE REUTILIZAR
+============================================================
+
+SESION B - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos observar si PostgreSQL puede insertar
+nuevas filas utilizando espacio que VACUUM
+recupero dentro del archivo de la tabla.
+
+No necesitamos borrar ni reconstruir la tabla.
+
+
+PRIMERA PARTE - MEDIR EL TAMANO ACTUAL
+
+-- Consultar el tamano fisico del heap de la tabla.
+SELECT
+    pg_relation_size('maintenance.mvcc_work') AS bytes_antes,
+    pg_size_pretty(
+        pg_relation_size('maintenance.mvcc_work')
+    ) AS tamano_legible;
+
+
+EXPLICACION
+
+pg_relation_size():
+
+Devuelve el tamano en bytes del almacenamiento
+principal de la relacion consultada.
+
+En este caso estamos midiendo el heap de la tabla.
+
+No estamos sumando el tamano de sus indices.
+
+
+pg_size_pretty():
+
+Convierte la cantidad de bytes a una representacion
+mas facil de leer, utilizando unidades de almacenamiento.
+
+
+RESULTADO DE REFERENCIA
+
+En la validacion original se observaron:
+
+3645440 bytes.
+
+No significa que todas las ejecuciones deban
+producir exactamente el mismo valor.
+
+IMPORTANTE:
+
+Anotar el valor obtenido en bytes_antes.
+
+Lo compararemos despues de insertar nuevos registros.
+
+
+SEGUNDA PARTE - INSERTAR 2000 FILAS NUEVAS
+
+-- Insertar nuevos identificadores del 10001 al 12000.
+-- Todos comenzaran con version = 0.
 INSERT INTO maintenance.mvcc_work
-SELECT g,0,repeat(md5(g::text),8)
+SELECT
+    g,
+    0,
+    repeat(md5(g::text),8)
 FROM generate_series(10001,12000) AS g;
 
-SELECT count(*) FROM maintenance.mvcc_work;
 
-SELECT :'heap_before'::bigint AS before_bytes,
-       pg_relation_size('maintenance.mvcc_work') AS after_bytes,
-       pg_relation_size('maintenance.mvcc_work')
-           <= :'heap_before'::bigint AS reused_without_growth;
+RESULTADO ESPERADO
 
-Resultado esperado: 10000 filas y reused_without_growth=true.
-En la prueba temporal el heap permanecio en 3645440 bytes.
-El valor exacto es una referencia de esa ejecucion, no una constante universal.
+INSERT 0 2000
 
-La limpieza habilito espacio interno para nuevas filas.
-Reutilizar espacio no exige reducir el archivo de la tabla.
 
-7. PRUEBA NEGATIVA CONTROLADA - PSQL B
+EXPLICACION
 
-BEGIN;
-VACUUM maintenance.mvcc_work;
+Antes de insertar teniamos 8000 filas visibles.
 
-Se espera: VACUUM cannot run inside a transaction block.
-Consultar el detalle del ultimo error y cerrar la transaccion fallida:
+Ahora agregamos 2000 nuevas.
 
-\errverbose
-ROLLBACK;
+Por lo tanto:
 
-SQLSTATE esperado: 25001.
-Es una restriccion demostrada, no un fallo funcional del laboratorio.
-El ROLLBACK es necesario antes de continuar usando esa transaccion.
+8000 + 2000 = 10000 filas.
+
+
+QUE SIGNIFICA GENERATE_SERIES
+
+generate_series(10001,12000):
+
+Genera los numeros consecutivos desde 10001
+hasta 12000.
+
+Los utilizamos como identificadores de las
+nuevas filas.
+
+De esta manera evitamos conflictos con los
+identificadores que ya permanecen en la tabla.
+
+
+QUE SIGNIFICA MD5 Y REPEAT
+
+md5(g::text):
+
+Genera una cadena de texto a partir del
+identificador de cada fila.
+
+repeat(...,8):
+
+Repite esa cadena ocho veces.
+
+Estos valores solamente sirven para que las filas
+tengan una cantidad de datos representativa.
+
+No estamos utilizando MD5 para seguridad,
+autenticacion ni almacenamiento de contrasenas.
+
+
+TERCERA PARTE - VERIFICAR LOS DATOS
+
+-- Comprobar el total de filas despues del INSERT.
+SELECT
+    COUNT(*) AS filas_visibles,
+    SUM(version) AS suma_versiones
+FROM maintenance.mvcc_work;
+
+
+RESULTADO ESPERADO
+
+filas_visibles | suma_versiones
+---------------+--------------
+10000          | 2000
+
+
+EXPLICACION
+
+Volvimos a tener 10000 filas visibles.
+
+La suma de versiones sigue siendo 2000 porque
+las nuevas filas comienzan con version = 0.
+
+Las primeras 2000 filas actualizadas conservan
+version = 1.
+
+
+CUARTA PARTE - MEDIR NUEVAMENTE EL TAMANO
+
+-- Consultar el tamano fisico despues del INSERT.
+SELECT
+    pg_relation_size('maintenance.mvcc_work') AS bytes_despues,
+    pg_size_pretty(
+        pg_relation_size('maintenance.mvcc_work')
+    ) AS tamano_legible;
+
+
+COMPARACION
+
+Comparar:
+
+bytes_antes
+contra
+bytes_despues
+
+
+RESULTADO DE REFERENCIA
+
+En la validacion original:
+
+ANTES:    3645440 bytes
+DESPUES:  3645440 bytes
+
+No hubo crecimiento del heap en esa ejecucion.
+
+
+QUE SIGNIFICA ESTE RESULTADO
+
+PostgreSQL pudo almacenar las nuevas filas
+reutilizando espacio disponible dentro del
+archivo existente.
+
+No fue necesario ampliar el heap para almacenar
+esos 2000 registros.
+
+
+Y SI LOS TAMANOS NO SON IDENTICOS
+
+El tamano exacto puede variar dependiendo
+de las condiciones del almacenamiento.
+
+VACUUM habilita la reutilizacion del espacio,
+pero no garantiza que una insercion posterior
+deba conservar exactamente el mismo tamano.
+
+Si el archivo crece, debemos revisar el espacio
+libre disponible y como fueron ubicadas
+las nuevas filas.
+
+No debemos inventar un resultado para que coincida
+con la referencia del ejercicio.
+
+
+QUE DEMOSTRAMOS
+
+VACUUM puede recuperar espacio interno ocupado
+por versiones que ya no son necesarias.
+
+Ese espacio puede utilizarse para nuevas filas.
+
+Esto es diferente de reducir el tamano fisico
+del archivo de la tabla.
+
+
+============================================================
+CONCLUSION FINAL
+============================================================
+
+Durante la practica observamos lo siguiente:
+
+1. Una transaccion REPEATABLE READ puede conservar
+   una vista anterior de los datos.
+
+2. Otra sesion puede modificar y confirmar datos
+   sin que la primera pierda inmediatamente su vista.
+
+3. PostgreSQL conserva versiones anteriores para
+   garantizar esa consistencia mediante MVCC.
+
+4. VACUUM no puede retirar versiones que todavia
+   son necesarias para transacciones activas.
+
+5. Al finalizar la transaccion antigua, VACUUM puede
+   recuperar espacio ocupado por versiones obsoletas.
+
+6. El espacio recuperado puede reutilizarse para
+   almacenar nuevas filas.
+
 
 COMPARACION CON ORACLE
 
-Ambos motores ofrecen lecturas consistentes mediante versiones.
-Oracle reconstruye vistas consistentes utilizando undo.
-En este escenario PostgreSQL conserva versiones en el almacenamiento de
-la tabla y VACUUM retira las que ya no son necesarias.
-No trasladar directamente conceptos de undo retention a parametros de VACUUM.
+Ambos motores proporcionan lecturas consistentes.
 
-CONCLUSION Y CONTINUIDAD
+Oracle utiliza informacion de UNDO para reconstruir
+versiones anteriores necesarias para las consultas.
 
-Los participantes deben explicar por que el primer VACUUM no pudo limpiar
-todo, por que el segundo si y como se reutilizo el espacio.
+PostgreSQL conserva versiones de las filas dentro
+del almacenamiento de la tabla y utiliza VACUUM
+para realizar su limpieza cuando es seguro hacerlo.
 
-Cerrar A y B con \q. Continuar con 06.02 sin recrear el laboratorio.
-La restauracion global y el cierre estan en 06.00.
+Los mecanismos son distintos, aunque ambos
+permiten mantener consistencia durante la concurrencia.
 
-ALTERNATIVA AUTOMATIZADA
 
-Sobre una carga nueva, en lugar de las operaciones anteriores:
+FINALIZACION
 
-docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/01-mvcc-vacuum.sh
+En la terminal A:
 
-Comprobar el codigo de salida en PowerShell:
-if ($LASTEXITCODE -ne 0) { throw "Fallo 01-mvcc-vacuum.sh." }
+\q
 
-FUENTES
+En la terminal B:
 
-https://www.postgresql.org/docs/18/transaction-iso.html
-https://www.postgresql.org/docs/18/monitoring-stats.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html
+\q
+
+Esto cierra las conexiones a PostgreSQL.
+
+El contenedor permanece encendido.
+
+No es necesario recrear todo el laboratorio
+para continuar con la practica 06.02, porque
+utiliza otra tabla.
+
+Si queremos repetir la practica 06.01 desde
+el estado inicial exacto, podemos limpiar y
+recrear el laboratorio siguiendo la guia 06.00.
+
+No ejecutar nuevamente los UPDATE, DELETE e INSERT
+sobre los datos ya modificados esperando obtener
+los resultados de una carga inicial.
+
+
+FIN DE LA PRACTICA 06.01\n

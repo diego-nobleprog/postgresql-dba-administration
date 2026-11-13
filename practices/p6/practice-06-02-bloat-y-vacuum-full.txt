@@ -1,169 +1,770 @@
 PRACTICA 06.02 - BLOAT Y VACUUM FULL
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
 
-SITUACION Y PREGUNTA CENTRAL
-
-Una tabla pierde el 90 por ciento de sus filas, pero conserva un archivo
-grande. ¿Conviene reutilizar ese espacio o reescribir la tabla?
 
 OBJETIVO
 
-Comparar limpieza y reescritura, medir almacenamiento y observar el impacto
-de una solicitud AccessExclusiveLock sobre otras sesiones.
+Comprender por que una tabla puede seguir ocupando espacio
+aunque hayamos eliminado la mayoria de sus registros.
+
+Demostrar la diferencia entre VACUUM y VACUUM FULL.
+
+Observar por que VACUUM FULL puede bloquear otras sesiones.
+
+
+SITUACION
+
+Tenemos una tabla con 30000 registros.
+
+Eliminaremos 27000, equivalentes al 90 por ciento.
+
+Queremos responder:
+
+- Por que el archivo puede conservar su tamano?
+- Que hace VACUUM con el espacio recuperado?
+- En que se diferencia VACUUM FULL?
+- Por que VACUUM FULL necesita un bloqueo exclusivo?
+- Que sucede con otros usuarios mientras espera?
+
+
+CONCEPTOS NECESARIOS
+
+BLOAT:
+
+Es el espacio ocupado por estructuras o versiones de filas
+que ya no representan informacion util para las consultas
+y que puede hacer que una relacion ocupe mas de lo necesario.
+
+No todo espacio libre dentro de una tabla es necesariamente
+un problema: puede reutilizarse posteriormente.
+
+
+VACUUM:
+
+Identifica versiones obsoletas que pueden retirarse
+y permite reutilizar espacio dentro de la tabla.
+
+Normalmente no necesita reescribir todo el archivo.
+
+Bajo ciertas condiciones puede truncar paginas vacias
+al final del archivo y devolver ese espacio al sistema.
+
+
+VACUUM FULL:
+
+Reescribe fisicamente la tabla en un archivo nuevo
+y compacto.
+
+Puede reducir significativamente su tamano.
+
+Necesita un bloqueo AccessExclusiveLock, por lo que
+impide el acceso concurrente normal durante la operacion.
+
+
+ACCESS SHARE LOCK:
+
+Es un bloqueo de tabla que adquieren normalmente
+las consultas SELECT.
+
+Es compatible con otras lecturas.
+
+Pero entra en conflicto con AccessExclusiveLock.
+
+
+ACCESS EXCLUSIVE LOCK:
+
+Es el bloqueo mas restrictivo de PostgreSQL.
+
+Mientras esta concedido, impide otras operaciones
+sobre la misma tabla, incluso SELECT.
+
+
+LOCK_TIMEOUT:
+
+Es un limite al tiempo que una sentencia puede
+permanecer esperando adquirir un bloqueo.
+
+Si se supera, PostgreSQL cancela esa sentencia.
+
+Un lock_timeout NO significa necesariamente que
+haya ocurrido un deadlock.
+
 
 PREPARACION
 
-Laboratorio de 06.00, siguiendo el recorrido guiado.
-bloat_work debe conservar las 30000 filas originales.
-No ejecutar tambien el script automatizado sobre estas mismas tablas.
+Utilizar el laboratorio creado en la practica 06.00.
 
-Abrir tres terminales PowerShell y conectar A, B y C:
+Tabla:
+maintenance.bloat_work
+
+Estado inicial:
+30000 filas.
+
+No ejecutar el script automatizado 02-bloat-vacuum-full.sh
+sobre la misma tabla durante esta practica.
+
+Necesitaremos tres terminales PowerShell.
+
+Para conectarse desde cada una:
 
 docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
 
-En cada psql:
+Dentro de cada psql ejecutar:
 
 \pset pager off
 
-1. MEDIR ANTES DE ELIMINAR - PSQL B
+Mantener abiertas las sesiones A, B y C.
 
-SET application_name='p6_manual_B';
+IMPORTANTE:
 
-SELECT pg_relation_size('maintenance.bloat_work') AS heap_before,
-       pg_relation_filenode('maintenance.bloat_work') AS node_before \gset
+Primero trabajaremos con los tamanos de la tabla.
 
-SELECT count(*) FROM maintenance.bloat_work;
+Despues utilizaremos las tres sesiones para demostrar
+el comportamiento de los bloqueos.
 
-Resultado esperado: 30000.
-Las variables psql conservan los valores en B: mantener esa conexion.
 
-DELETE FROM maintenance.bloat_work WHERE id%10<>0;
-VACUUM (VERBOSE, TRUNCATE FALSE) maintenance.bloat_work;
+============================================================
+PASO 1. MEDIR LA TABLA ANTES DE ELIMINAR REGISTROS
+============================================================
 
-SELECT count(*) FROM maintenance.bloat_work;
+SESION B - PSQL
 
-SELECT :'heap_before'::bigint AS initial_heap,
-       pg_relation_size('maintenance.bloat_work') AS current_heap,
-       pg_indexes_size('maintenance.bloat_work') AS indexes_bytes,
-       pg_total_relation_size('maintenance.bloat_work') AS total_bytes;
+QUE QUEREMOS DEMOSTRAR
 
-Resultado: 27000 eliminadas y 3000 restantes.
-TRUNCATE FALSE impide el truncado del extremo del heap en esta medicion.
-En la evidencia temporal el heap conservo 17555456 bytes.
+Queremos conocer la cantidad de registros y el espacio
+fisico que ocupa la tabla antes de modificarla.
 
-Esto demuestra espacio que puede reutilizarse, pero no calcula por si solo
-un porcentaje exacto de bloat. Los bytes incluyen estructura y otros costos.
-VACUUM normal puede truncar paginas finales vacias en otras condiciones.
 
-2. MANTENER UN LECTOR ABIERTO - PSQL A
+COMANDOS
 
-SET application_name='p6_manual_A';
+-- Identificar la conexion B.
+SET application_name = 'p6_manual_B';
+
+-- Contar los registros originales.
+SELECT COUNT(*) AS filas_originales
+FROM maintenance.bloat_work;
+
+-- Consultar el tamano del heap y su archivo fisico.
+SELECT
+    pg_relation_size('maintenance.bloat_work') AS heap_bytes,
+    pg_size_pretty(
+        pg_relation_size('maintenance.bloat_work')
+    ) AS tamano_legible,
+    pg_relation_filenode('maintenance.bloat_work') AS filenode;
+
+
+RESULTADO ESPERADO
+
+filas_originales
+---------------
+30000
+
+En la evidencia original:
+
+heap_bytes = 17555456
+
+El valor puede variar entre ejecuciones.
+
+
+EXPLICACION
+
+COUNT(*) cuenta los registros visibles.
+
+pg_relation_size() consulta los bytes que ocupa
+el almacenamiento principal de la tabla.
+
+En esta medicion no estamos sumando los indices.
+
+pg_size_pretty() representa el tamano en unidades
+mas faciles de leer.
+
+pg_relation_filenode() identifica el archivo fisico
+asociado al almacenamiento de la tabla.
+
+Este ultimo valor nos servira para identificar
+una reescritura durante VACUUM FULL.
+
+
+IMPORTANTE
+
+Anotar:
+
+- heap_bytes.
+- filenode.
+
+No necesitamos guardar variables en psql.
+
+Los compararemos visualmente con los resultados
+de los siguientes pasos.
+
+
+============================================================
+PASO 2. ELIMINAR EL 90 POR CIENTO Y EJECUTAR VACUUM
+============================================================
+
+SESION B - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que eliminar registros no significa
+reducir automaticamente el archivo fisico.
+
+
+COMANDOS
+
+-- Eliminar todos los registros cuyo id no sea
+-- multiplo de diez.
+DELETE FROM maintenance.bloat_work
+WHERE id % 10 <> 0;
+
+
+RESULTADO ESPERADO
+
+DELETE 27000
+
+
+EXPLICACION
+
+El operador % obtiene el residuo de una division.
+
+Con id % 10 <> 0 conservamos solamente los
+identificadores divisibles entre diez.
+
+De cada diez registros, conservamos uno.
+
+Por lo tanto:
+
+30000 - 27000 = 3000 registros.
+
+
+COMPROBACION
+
+-- Consultar los registros restantes.
+SELECT COUNT(*) AS filas_restantes
+FROM maintenance.bloat_work;
+
+
+RESULTADO ESPERADO
+
+filas_restantes
+--------------
+3000
+
+
+AHORA EJECUTAMOS VACUUM
+
+-- Recuperar espacio reutilizable sin truncar
+-- las paginas vacias del final del archivo.
+VACUUM (VERBOSE, TRUNCATE FALSE)
+maintenance.bloat_work;
+
+
+EXPLICACION
+
+VACUUM:
+
+Realiza mantenimiento y permite recuperar espacio
+ocupado por versiones obsoletas.
+
+VERBOSE:
+
+Muestra informacion detallada del mantenimiento.
+
+TRUNCATE FALSE:
+
+Evita que VACUUM intente reducir el extremo final
+del heap durante este experimento.
+
+Utilizamos esta opcion para observar mas claramente
+la diferencia entre recuperar espacio interno
+y reducir el archivo fisico.
+
+
+COMPROBAR EL TAMANO
+
+-- Medir nuevamente el heap.
+SELECT
+    COUNT(*) AS filas,
+    pg_relation_size('maintenance.bloat_work') AS heap_bytes
+FROM maintenance.bloat_work;
+
+
+RESULTADO DE REFERENCIA
+
+filas = 3000
+
+heap_bytes = 17555456
+
+
+QUE SIGNIFICA
+
+Eliminamos el 90 por ciento de los registros.
+
+Sin embargo, el archivo mantuvo aproximadamente
+el mismo tamano.
+
+Esto sucede porque VACUUM puede dejar espacio
+disponible dentro del archivo para futuras operaciones.
+
+Ese espacio no necesita devolverse inmediatamente
+al sistema operativo.
+
+
+QUE NO DEMUESTRA
+
+No hemos calculado un porcentaje exacto de bloat.
+
+Tampoco podemos concluir que VACUUM nunca reduzca
+archivos: utilizamos TRUNCATE FALSE deliberadamente.
+
+
+CONCLUSION PARCIAL
+
+VACUUM recupera principalmente espacio interno
+reutilizable.
+
+Ahora comprobaremos como VACUUM FULL puede
+reescribir y compactar la tabla.
+
+
+============================================================
+PASO 3. MANTENER UNA LECTURA ABIERTA EN A
+============================================================
+
+SESION A - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos mantener una transaccion que este utilizando
+la tabla mientras otra sesion intenta VACUUM FULL.
+
+
+COMANDOS
+
+-- Identificar la conexion A.
+SET application_name = 'p6_manual_A';
+
+-- Iniciar una transaccion.
 BEGIN ISOLATION LEVEL REPEATABLE READ;
-SELECT count(*) FROM maintenance.bloat_work;
 
-Resultado esperado: 3000. Mantener la transaccion abierta.
-El SELECT mantiene un AccessShareLock hasta finalizar la transaccion.
+-- Consultar los registros.
+SELECT COUNT(*) AS filas
+FROM maintenance.bloat_work;
 
-3. COMPARAR VACUUM Y FULL - PSQL B
 
-VACUUM (VERBOSE, TRUNCATE FALSE) maintenance.bloat_work;
+RESULTADO ESPERADO
 
-Debe terminar aunque A mantenga su lectura.
+filas
+-----
+3000
 
-VACUUM (FULL, VERBOSE) maintenance.bloat_work;
 
-Esta segunda orden debe quedar esperando. No cancelarla todavia.
-Pasar a C mientras B espera.
+EXPLICACION
 
-4. EXAMINAR LA ESPERA - PSQL C
+El SELECT adquiere un bloqueo AccessShareLock.
 
-SET application_name='p6_manual_C';
+Como estamos dentro de una transaccion explicita,
+ese bloqueo permanece hasta que ejecutemos
+COMMIT o ROLLBACK.
 
-SELECT a.pid,a.application_name,a.state,
-       l.mode,l.granted,pg_blocking_pids(a.pid) AS blocking_pids
-FROM pg_stat_activity a
-JOIN pg_locks l ON l.pid=a.pid
-WHERE l.relation='maintenance.bloat_work'::regclass
-ORDER BY a.application_name,l.mode;
+Esto no significa que A haya modificado datos.
 
-Identificar:
-- A con AccessShareLock concedido.
-- B solicitando AccessExclusiveLock, todavia no concedido.
-- Un PID bloqueador asociado a la espera de B.
+Simplemente mantiene una operacion de lectura
+dentro de una transaccion activa.
 
-No confundir un bloqueo solicitado con uno ya obtenido.
 
-SHOW lock_timeout \gset p6_before_
-SET lock_timeout='700ms';
-SELECT count(*) FROM maintenance.bloat_work;
+MUY IMPORTANTE
 
-Se espera una cancelacion por lock timeout.
-Aunque C solo quiera leer, queda detras de la solicitud exclusiva pendiente.
+NO ejecutar COMMIT.
 
-\errverbose
-SET lock_timeout = :'p6_before_lock_timeout';
+NO cerrar la terminal A.
+
+Dejar abierta esta transaccion.
+
+Continuar en B.
+
+
+============================================================
+PASO 4. INTENTAR VACUUM FULL DESDE B
+============================================================
+
+SESION B - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos observar que VACUUM FULL necesita un
+bloqueo incompatible con la lectura mantenida por A.
+
+
+COMANDO
+
+-- Intentar compactar fisicamente la tabla.
+VACUUM (FULL, VERBOSE)
+maintenance.bloat_work;
+
+
+COMPORTAMIENTO ESPERADO
+
+La sentencia NO deberia finalizar inmediatamente.
+
+La terminal B quedara esperando.
+
+
+POR QUE SUCEDE
+
+VACUUM FULL necesita AccessExclusiveLock.
+
+A mantiene AccessShareLock.
+
+Ambos bloqueos son incompatibles.
+
+PostgreSQL no puede conceder el bloqueo exclusivo
+mientras A conserve el suyo.
+
+
+ESTO SIGNIFICA QUE POSTGRESQL FALLO
+
+NO.
+
+PostgreSQL esta coordinando correctamente
+el acceso concurrente a la tabla.
+
+B esperara hasta que el bloqueo incompatible
+sea liberado.
+
+
+IMPORTANTE
+
+Dejar B esperando.
+
+NO presionar Ctrl+C.
+
+NO ejecutar COMMIT en A todavia.
+
+Continuar en C.
+
+
+============================================================
+PASO 5. OBSERVAR COMO SE BLOQUEA OTRA LECTURA
+============================================================
+
+SESION C - PSQL
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que una nueva lectura tambien
+puede esperar cuando existe una solicitud exclusiva
+pendiente.
+
+
+COMANDOS
+
+-- Identificar esta conexion.
+SET application_name = 'p6_manual_C';
+
+-- Consultar las sesiones y sus bloqueadores.
+SELECT
+    pid,
+    application_name,
+    state,
+    wait_event_type,
+    wait_event,
+    pg_blocking_pids(pid) AS bloqueadores
+FROM pg_stat_activity
+WHERE application_name IN (
+    'p6_manual_A',
+    'p6_manual_B',
+    'p6_manual_C'
+)
+ORDER BY application_name;
+
+
+QUE DEBEMOS OBSERVAR
+
+Sesion A:
+
+Mantiene su transaccion abierta.
+
+Sesion B:
+
+Esta esperando obtener el bloqueo exclusivo.
+
+La columna bloqueadores de B puede mostrar
+el PID de A.
+
+Sesion C:
+
+Esta ejecutando nuestra consulta de diagnostico.
+
+
+EXPLICACION DE LAS COLUMNAS
+
+pid:
+
+Identificador del proceso PostgreSQL.
+
+application_name:
+
+Nombre que asignamos a cada conexion.
+
+state:
+
+Estado de la sesion.
+
+wait_event_type:
+
+Categoria de la espera.
+
+wait_event:
+
+Recurso o evento relacionado con la espera.
+
+pg_blocking_pids():
+
+Devuelve los procesos que bloquean a una sesion.
+
+Los valores numericos de PID pueden cambiar.
+
+
+PROVOCAR UNA LECTURA CON TIMEOUT
+
+-- Abrir una transaccion para limitar temporalmente
+-- el tiempo de espera sin modificar la configuracion
+-- permanente de esta sesion.
+BEGIN;
+
+-- Permitir solamente 700 milisegundos esperando
+-- adquirir un bloqueo.
+SET LOCAL lock_timeout = '700ms';
+
+-- Intentar leer la misma tabla.
+SELECT COUNT(*)
+FROM maintenance.bloat_work;
+
+
+RESULTADO ESPERADO
+
+ERROR: canceling statement due to lock timeout
+
+
+POR QUE UNA LECTURA TAMBIEN ESPERA
+
+La sesion A conserva un bloqueo de lectura.
+
+La sesion B ya solicito un bloqueo exclusivo
+que debe esperar a que termine A.
+
+La nueva lectura C puede quedar esperando detras
+de la solicitud exclusiva pendiente de B.
+
+Esto evita que nuevas solicitudes compatibles
+con A mantengan indefinidamente sin turno a B.
+
+
+QUE SIGNIFICA EL ERROR
+
+La consulta de C no consiguio el bloqueo necesario
+antes de alcanzar los 700 milisegundos.
+
+PostgreSQL cancelo esa sentencia.
+
+NO se trata de un deadlock.
+
+Estamos demostrando espera y timeout.
+
+
+RESTAURAR LA SESION C
+
+-- Como ocurrio un error dentro de BEGIN,
+-- debemos finalizar la transaccion abortada.
+ROLLBACK;
+
+-- Comprobar que la configuracion temporal
+-- ya no permanece activa.
 SHOW lock_timeout;
 
-SQLSTATE esperado: 55P03.
-La restauracion devuelve lock_timeout al valor de esa sesion antes del cambio.
-No es una prueba de deadlock: se demuestra espera y timeout.
 
-5. LIBERAR EL LECTOR - PSQL A
+EXPLICACION
 
+SET LOCAL solo modifica el parametro durante
+la transaccion actual.
+
+ROLLBACK finaliza esa transaccion y restaura
+el valor que existia previamente.
+
+En el laboratorio inicial normalmente sera 0,
+lo que significa que no existe un timeout
+de bloqueo configurado.
+
+
+IMPORTANTE
+
+No cerrar C todavia.
+
+Ahora liberaremos la transaccion A.
+
+
+============================================================
+PASO 6. LIBERAR A Y COMPROBAR VACUUM FULL
+============================================================
+
+PRIMERA PARTE - SESION A
+
+Ejecutar:
+
+-- Finalizar la transaccion que retenia
+-- el bloqueo de lectura.
 COMMIT;
 
-B debe continuar y terminar VACUUM FULL.
-No evaluar los tamanos mientras B siga ejecutando o esperando.
 
-6. COMPROBAR LA REESCRITURA - PSQL B
+RESULTADO ESPERADO
 
-SELECT count(*) FROM maintenance.bloat_work;
+COMMIT
 
-SELECT :'heap_before'::bigint AS initial_heap,
-       pg_relation_size('maintenance.bloat_work') AS full_heap,
-       :'node_before'::oid AS initial_filenode,
-       pg_relation_filenode('maintenance.bloat_work') AS full_filenode,
-       pg_relation_filenode('maintenance.bloat_work')
-           <> :'node_before'::oid AS rewritten;
 
-Resultado esperado: 3000 filas, un heap menor y rewritten=true.
-Referencia temporal: heap de 17555456 a 1761280 bytes.
-El filenode cambio de 16397 a 16442 en esa instancia; sus numeros pueden variar.
+QUE SUCEDE AHORA
 
-VACUUM FULL construye una nueva copia y requiere espacio adicional mientras
-coexisten la copia anterior y la nueva. Su bloqueo exige planificar la
-interrupcion del acceso a la tabla.
+A libera el AccessShareLock.
 
-INTERPRETACION DBA
+B puede obtener AccessExclusiveLock.
 
-Si la carga volvera a crecer, el espacio interno puede ser util.
-Si existe una reduccion permanente importante, evaluar una reescritura,
-su espacio de trabajo y el tiempo de indisponibilidad.
-Un archivo grande aislado no justifica programar FULL de forma rutinaria.
+VACUUM FULL puede continuar con la reescritura.
+
+
+SEGUNDA PARTE - SESION B
+
+Volver a B.
+
+Esperar a que termine la sentencia anterior.
+
+
+RESULTADO ESPERADO
+
+VACUUM
+
+
+QUE SIGNIFICA
+
+PostgreSQL termino la reescritura.
+
+La tabla fue compactada fisicamente.
+
+El bloqueo exclusivo ya puede liberarse.
+
+
+COMPROBAR LOS REGISTROS
+
+-- Confirmar que las filas restantes
+-- continuan disponibles.
+SELECT COUNT(*) AS filas_restantes
+FROM maintenance.bloat_work;
+
+
+RESULTADO ESPERADO
+
+filas_restantes
+--------------
+3000
+
+
+COMPROBAR EL NUEVO TAMANO
+
+-- Medir el archivo despues de VACUUM FULL.
+SELECT
+    pg_relation_size('maintenance.bloat_work') AS heap_bytes,
+    pg_size_pretty(
+        pg_relation_size('maintenance.bloat_work')
+    ) AS tamano_legible,
+    pg_relation_filenode('maintenance.bloat_work') AS filenode;
+
+
+RESULTADO DE REFERENCIA
+
+ANTES DE FULL:
+
+17555456 bytes.
+
+DESPUES DE FULL:
+
+1761280 bytes.
+
+
+INTERPRETACION
+
+La tabla conserva sus 3000 registros.
+
+Sin embargo, ahora ocupa mucho menos espacio.
+
+Esto se debe a que VACUUM FULL reescribio
+la tabla, compactando sus datos.
+
+
+COMPARAR FILENODE
+
+Recordemos el filenode anotado en el paso 1.
+
+Ahora debemos observar un identificador diferente.
+
+Esto respalda que PostgreSQL reescribio
+fisicamente el almacenamiento de la relacion.
+
+El numero exacto de filenode no importa.
+
+
+POR QUE NO USAR SIEMPRE VACUUM FULL
+
+Porque necesita bloquear la tabla.
+
+Ademas, durante la reescritura puede requerir
+espacio adicional para la nueva copia.
+
+Por eso debe planificarse cuidadosamente.
+
+
+CONCLUSION FINAL
+
+VACUUM:
+
+Permite recuperar espacio para reutilizarlo.
+
+VACUUM FULL:
+
+Reescribe la tabla y puede devolver espacio
+al sistema operativo.
+
+Pero VACUUM FULL necesita un bloqueo exclusivo
+que puede afectar a otros usuarios.
+
 
 COMPARACION CON ORACLE
 
-Oracle dispone de mecanismos de gestion de segmentos, como segment shrink
-para objetos y condiciones compatibles. Sirven como referencia conceptual
-para recuperar espacio, pero sus requisitos y bloqueos son diferentes.
-No equiparar un shrink online de Oracle con VACUUM FULL de PostgreSQL.
+Oracle dispone de mecanismos de administracion
+de segmentos y operaciones como segment shrink
+bajo condiciones determinadas.
 
-CONCLUSION Y CIERRE
+Conceptualmente permiten administrar y recuperar
+espacio, pero no deben considerarse equivalentes
+exactos de VACUUM FULL.
 
-Los participantes deben distinguir limpieza, reutilizacion y devolucion
-de espacio, e identificar el costo de la solicitud exclusiva.
+Los requisitos, bloqueos y mecanismos fisicos
+son diferentes.
 
-Cerrar A, B y C con \q. Continuar con 06.03.
-El cierre completo del laboratorio esta en 06.00.
 
-ALTERNATIVA AUTOMATIZADA
+FINALIZACION
 
-En lugar del recorrido manual, siguiendo el orden de scripts de 06.00:
+Salir de las tres terminales:
 
-docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/02-bloat-vacuum-full.sh
-if ($LASTEXITCODE -ne 0) { throw "Fallo 02-bloat-vacuum-full.sh." }
+\q
 
-FUENTES
+El contenedor permanece encendido.
 
-https://www.postgresql.org/docs/18/sql-vacuum.html
-https://www.postgresql.org/docs/18/explicit-locking.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-space-for-schema-objects.html
+La siguiente practica utiliza otra tabla.
+
+No es necesario recrear el laboratorio.
+
+Para repetir desde el estado inicial,
+limpiar y recrear mediante 06.00.
+
+
+FIN DE LA PRACTICA 06.02\n

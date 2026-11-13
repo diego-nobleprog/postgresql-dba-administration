@@ -1,68 +1,320 @@
 PRACTICA 06.04 - AUTOVACUUM Y AUTOANALYZE
+Modulo 5: Mantenimiento y Autovacuum
+PostgreSQL DBA Administration
 
-SITUACION Y PREGUNTA CENTRAL
-
-Una tabla acumula cambios sin mantenimiento manual.
-¿Como demostramos que los procesos automaticos se ejecutaron realmente?
 
 OBJETIVO
 
-Relacionar configuracion, umbrales, cambios y evidencia de ejecucion.
-Aplicar BEFORE, cambio, AFTER, restauracion y verificacion final.
+Comprender como PostgreSQL realiza mantenimiento
+automatico de las tablas.
+
+Demostrar que Autovacuum y Autoanalyze realmente
+se ejecutaron, utilizando contadores y fechas.
+
+Restaurar los parametros originales del laboratorio.
+
+
+SITUACION
+
+Tenemos una tabla inicialmente vacia.
+
+Generaremos miles de operaciones para producir
+trabajo de mantenimiento.
+
+Queremos responder:
+
+- Que hace Autovacuum?
+- Que hace Autoanalyze?
+- Como sabe PostgreSQL cuando ejecutarlos?
+- Podemos controlar sus umbrales?
+- Como verificamos que realmente trabajaron?
+
+
+CONCEPTOS NECESARIOS
+
+AUTOVACUUM:
+
+Es el mecanismo automatico de PostgreSQL
+para realizar tareas de mantenimiento.
+
+Entre ellas se encuentra la limpieza de
+versiones obsoletas de las tablas.
+
+Tambien participa en la prevencion de
+problemas por antiguedad de XID.
+
+
+AUTOANALYZE:
+
+Es la ejecucion automatica de ANALYZE.
+
+Actualiza estadisticas utilizadas
+por el optimizador de consultas.
+
+
+AUTOVACUUM_NAPTIME:
+
+Controla el intervalo minimo aproximado
+entre activaciones del lanzador de Autovacuum.
+
+No es una garantia de ejecucion inmediata
+sobre una tabla determinada.
+
+
+THRESHOLD:
+
+Es un umbral utilizado para determinar
+cuando una tabla necesita mantenimiento.
+
+Puede combinar una cantidad fija
+con un factor proporcional al tamano.
+
+
+SCALE FACTOR:
+
+Factor utilizado para calcular una cantidad
+adicional de cambios en funcion de
+las caracteristicas de la tabla.
+
+
+PG_STAT_USER_TABLES:
+
+Vista que contiene indicadores de actividad
+y mantenimiento de tablas de usuario.
+
+Permite consultar ejecuciones manuales
+y automaticas de VACUUM y ANALYZE.
+
 
 PREPARACION
 
-Seguir el recorrido guiado de 06.00; auto_work debe estar vacia.
-No ejecutar VACUUM ni ANALYZE manuales sobre esa tabla durante esta prueba.
-Mantener la misma sesion psql para conservar las tablas temporales BEFORE.
+Utilizar el laboratorio de 06.00.
 
-PowerShell:
+Tabla:
+maintenance.auto_work
+
+Estado inicial:
+0 registros.
+
+Autovacuum ordinario deshabilitado
+para esta tabla.
+
+No ejecutar VACUUM ni ANALYZE manuales
+sobre auto_work durante el experimento.
+
+Utilizaremos una terminal psql y,
+al finalizar, una terminal PowerShell
+para restaurar el archivo de configuracion.
+
+
+CONEXION - POWERSHELL
 
 docker exec -it -u postgres p6-maintenance-lab psql -X -h /tmp/nobleprog-p6-lab/socket -p 5546 -U postgres -d nobleprog_maintenance_scenarios
 
-psql:
+DENTRO DE PSQL
 
 \pset pager off
-SET application_name='p6_manual_auto';
 
-1. BEFORE: CONSERVAR Y CONSULTAR
+SET application_name = 'p6_manual_auto';
 
-CREATE TEMP TABLE p6_guc_before AS
-SELECT name,setting,unit,source FROM pg_settings
-WHERE name IN ('autovacuum_naptime','log_autovacuum_min_duration');
 
+============================================================
+PASO 1. CONSULTAR Y CONSERVAR EL ESTADO ORIGINAL
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Antes de modificar parametros, necesitamos
+conocer y conservar su valor original.
+
+Esto nos permitira comprobar la restauracion.
+
+
+COMANDO
+
+-- Guardar temporalmente los valores originales
+-- de los parametros que modificaremos.
+CREATE TEMP TABLE p6_settings_before AS
+SELECT
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN (
+    'autovacuum_naptime',
+    'log_autovacuum_min_duration'
+);
+
+
+EXPLICACION
+
+CREATE TEMP TABLE:
+
+Crea una tabla temporal asociada a nuestra
+sesion actual de PostgreSQL.
+
+La utilizamos para guardar los valores BEFORE.
+
+No es una tabla permanente del negocio.
+
+Se eliminara automaticamente al terminar
+esta conexion.
+
+
+CONSULTAR EL BEFORE
+
+-- Mostrar los valores originales.
+SELECT *
+FROM p6_settings_before
+ORDER BY name;
+
+
+RESULTADO DE REFERENCIA
+
+autovacuum_naptime = 60 segundos.
+
+log_autovacuum_min_duration = 600000 milisegundos.
+
+
+GUARDAR LAS OPCIONES DE LA TABLA
+
+-- Conservar las opciones actuales de auto_work.
 CREATE TEMP TABLE p6_options_before AS
-SELECT reloptions FROM pg_class
-WHERE oid='maintenance.auto_work'::regclass;
+SELECT reloptions
+FROM pg_class
+WHERE oid = 'maintenance.auto_work'::regclass;
 
-TABLE p6_guc_before;
-TABLE p6_options_before;
+-- Mostrar las opciones originales.
+SELECT *
+FROM p6_options_before;
 
-SELECT count(*) FROM maintenance.auto_work;
 
-SELECT current_setting('autovacuum') AS autovacuum,
-       current_setting('track_counts') AS track_counts;
+RESULTADO ESPERADO
 
-Esperado: tabla vacia; ambos parametros globales on.
-La opcion inicial de auto_work debe ser autovacuum_enabled=false.
-La guia 00 ya conserva postgresql.auto.conf y las opciones anteriores
-a todos los cambios del laboratorio.
+autovacuum_enabled=false.
 
-2. ACELERAR LA OBSERVACION Y VERIFICAR
 
-ALTER SYSTEM SET autovacuum_naptime='1s';
-ALTER SYSTEM SET log_autovacuum_min_duration='0';
+COMPROBAR EL ESTADO GENERAL
+
+-- Confirmar que los mecanismos globales
+-- necesarios estan habilitados.
+SELECT
+    current_setting('autovacuum') AS autovacuum,
+    current_setting('track_counts') AS track_counts;
+
+-- Confirmar que auto_work esta vacia.
+SELECT COUNT(*) AS filas
+FROM maintenance.auto_work;
+
+
+RESULTADO ESPERADO
+
+autovacuum = on.
+
+track_counts = on.
+
+filas = 0.
+
+
+INTERPRETACION
+
+Autovacuum esta habilitado globalmente.
+
+Sin embargo, el mantenimiento ordinario
+de auto_work fue deshabilitado durante
+la preparacion del laboratorio.
+
+Ahora podemos controlar cuando empezara
+a procesarse esta tabla.
+
+
+============================================================
+PASO 2. ACELERAR EL CICLO DE OBSERVACION
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos reducir el tiempo de espera
+para observar las tareas automaticas.
+
+
+COMANDOS
+
+-- Reducir temporalmente el intervalo
+-- del lanzador de Autovacuum a un segundo.
+ALTER SYSTEM SET autovacuum_naptime = '1s';
+
+-- Registrar las operaciones automaticas
+-- independientemente de su duracion.
+ALTER SYSTEM SET log_autovacuum_min_duration = '0';
+
+-- Solicitar una recarga de configuracion.
 SELECT pg_reload_conf();
+
+
+EXPLICACION
+
+ALTER SYSTEM:
+
+Modifica la configuracion persistente
+administrada por PostgreSQL.
+
+pg_reload_conf():
+
+Solicita que PostgreSQL recargue
+los parametros que admiten recarga.
+
+Un resultado true significa que se solicito
+la recarga; debemos comprobar posteriormente
+que los valores efectivos cambiaron.
+
+
+COMPROBAR EL AFTER
+
+-- Dar un breve margen a la recarga.
 SELECT pg_sleep(1);
 
-SELECT name,setting,unit,source FROM pg_settings
-WHERE name IN ('autovacuum_naptime','log_autovacuum_min_duration');
+-- Consultar los valores efectivos.
+SELECT
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN (
+    'autovacuum_naptime',
+    'log_autovacuum_min_duration'
+)
+ORDER BY name;
 
-Esperado: naptime=1 s y duracion minima de log=0 ms.
-La recarga solicitada debe comprobarse consultando el valor efectivo.
-Estos ajustes aceleran y hacen observable el laboratorio; no constituyen
-una recomendacion de configuracion para produccion.
 
+RESULTADO ESPERADO
+
+autovacuum_naptime = 1 segundo.
+
+log_autovacuum_min_duration = 0.
+
+
+IMPORTANTE
+
+Estos ajustes son temporales para la capacitacion.
+
+No representan una configuracion recomendada
+para cualquier ambiente productivo.
+
+
+============================================================
+PASO 3. CONFIGURAR UMBRALES DE MANTENIMIENTO
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos facilitar que PostgreSQL identifique
+la necesidad de mantenimiento con pocos cambios.
+
+
+COMANDO
+
+-- Configurar umbrales sobre nuestra tabla.
 ALTER TABLE maintenance.auto_work SET (
     autovacuum_enabled=false,
     autovacuum_vacuum_threshold=25,
@@ -72,71 +324,361 @@ ALTER TABLE maintenance.auto_work SET (
     autovacuum_analyze_scale_factor=0
 );
 
-SELECT reloptions FROM pg_class
-WHERE oid='maintenance.auto_work'::regclass;
 
-Los umbrales por tabla prevalecen sobre sus valores globales.
-No esperar que pg_settings muestre las opciones particulares de la tabla.
+EXPLICACION DE CADA PARAMETRO
 
-Para actualizaciones/eliminaciones, PostgreSQL 18 aplica un umbral basado
-en base + factor * reltuples, limitado por vacuum_max_threshold cuando
-este limite esta habilitado. Aqui el factor cero deja el umbral en 25.
-Autoanalyze usa su base y factor para los cambios desde el ultimo ANALYZE.
-El valor -1 deshabilita el disparador de VACUUM por inserciones en esta tabla.
+autovacuum_enabled=false:
 
-3. GENERAR TRABAJO CON EL MANTENIMIENTO ORDINARIO DESHABILITADO
+Mantiene deshabilitado temporalmente
+el mantenimiento automatico ordinario.
 
+Lo habilitaremos despues de generar cambios.
+
+
+autovacuum_vacuum_threshold=25:
+
+Define una cantidad base de modificaciones
+relevantes para VACUUM.
+
+
+autovacuum_vacuum_scale_factor=0:
+
+Elimina la parte proporcional del umbral
+para este experimento.
+
+
+autovacuum_vacuum_insert_threshold=-1:
+
+Deshabilita el disparador de VACUUM basado
+solamente en inserciones para esta tabla.
+
+
+autovacuum_analyze_threshold=25:
+
+Define una cantidad base de cambios
+para solicitar Autoanalyze.
+
+
+autovacuum_analyze_scale_factor=0:
+
+Elimina la parte proporcional del calculo
+del umbral de Autoanalyze.
+
+
+QUE SIGNIFICA EN ESTE LABORATORIO
+
+Cuando los cambios relevantes superen
+aproximadamente 25, tendremos condiciones
+para solicitar mantenimiento.
+
+El lanzamiento real no tiene que suceder
+en el mismo instante.
+
+
+COMPROBAR LOS CAMBIOS
+
+-- Consultar opciones particulares de la tabla.
+SELECT reloptions
+FROM pg_class
+WHERE oid = 'maintenance.auto_work'::regclass;
+
+
+IMPORTANTE
+
+Estas opciones son propias de auto_work.
+
+No debemos buscarlas como si fueran
+los parametros globales de pg_settings.
+
+
+============================================================
+PASO 4. GENERAR CAMBIOS CON AUTOVACUUM DESHABILITADO
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos generar suficientes modificaciones
+antes de permitir mantenimiento automatico.
+
+
+PRIMERA OPERACION
+
+-- Insertar 12000 registros.
 INSERT INTO maintenance.auto_work
-SELECT g,0,repeat(md5(g::text),8)
+SELECT
+    g,
+    0,
+    repeat(md5(g::text),8)
 FROM generate_series(1,12000) AS g;
 
+
+RESULTADO ESPERADO
+
+INSERT 0 12000
+
+
+SEGUNDA OPERACION
+
+-- Actualizar la mitad de los registros.
 UPDATE maintenance.auto_work
-SET version=version+1 WHERE id<=6000;
+SET version = version + 1
+WHERE id <= 6000;
 
-SELECT pg_sleep(3);
 
-SELECT n_live_tup,n_dead_tup,n_mod_since_analyze,
-       vacuum_count,analyze_count,autovacuum_count,autoanalyze_count
-FROM pg_stat_user_tables
-WHERE relid='maintenance.auto_work'::regclass;
+RESULTADO ESPERADO
 
-Esperado: versiones obsoletas por encima de 25 y contadores automaticos 0.
-Los manuales tambien deben permanecer en 0.
-Las estadisticas se publican con demora: una lectura inmediata puede quedar
-atrasada. Repetir la consulta antes de interpretar un valor inesperado.
+UPDATE 6000
 
-Deshabilitar mantenimiento ordinario no elimina las medidas automaticas
-de proteccion contra wraparound. Ese limite conceptual no se provoca aqui.
 
-4. HABILITAR Y OBSERVAR
+EXPLICACION
 
-ALTER TABLE maintenance.auto_work SET (autovacuum_enabled=true);
+Tenemos 12000 filas visibles.
 
-SELECT n_live_tup,n_dead_tup,n_mod_since_analyze,
-       vacuum_count,analyze_count,autovacuum_count,autoanalyze_count,
-       last_autovacuum,last_autoanalyze
-FROM pg_stat_user_tables
-WHERE relid='maintenance.auto_work'::regclass;
-\watch 1
+Modificamos 6000.
 
-Observar durante un maximo de 90 segundos y salir del seguimiento con Ctrl+C.
-Se espera al menos una ejecucion de cada proceso y fechas no nulas.
-La referencia temporal obtuvo:
-- autovacuum_count=1; autoanalyze_count=1.
-- vacuum_count=0; analyze_count=0.
-- n_dead_tup=0; n_mod_since_analyze=0.
+El UPDATE genera nuevas versiones de esas filas.
 
-Si no se observa dentro del plazo, registrar el escenario como pendiente
-de diagnostico. No ejecutar VACUUM manual para aparentar un exito automatico.
+Por lo tanto, existen versiones anteriores
+que eventualmente pueden necesitar limpieza.
 
-SELECT count(*) AS rows,sum(version) AS version_sum
+
+COMPROBAR LOS DATOS
+
+-- Verificar las filas y los cambios logicos.
+SELECT
+    COUNT(*) AS filas,
+    SUM(version) AS suma_versiones
 FROM maintenance.auto_work;
 
-Resultado real esperado: 12000 y 6000.
-Los procesos automaticos no deben cambiar el contenido logico de los datos.
 
-5. RESTAURAR LAS OPCIONES DEL INICIO DE ESTE ESCENARIO
+RESULTADO ESPERADO
 
+filas = 12000.
+
+suma_versiones = 6000.
+
+
+CONSULTAR ESTADISTICAS
+
+-- Dar tiempo a que se publiquen estadisticas.
+SELECT pg_sleep(3);
+
+-- Consultar el estado de mantenimiento.
+SELECT
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    vacuum_count,
+    analyze_count,
+    autovacuum_count,
+    autoanalyze_count
+FROM pg_stat_user_tables
+WHERE relid = 'maintenance.auto_work'::regclass;
+
+
+EXPLICACION
+
+n_live_tup:
+
+Estimacion de filas vivas.
+
+n_dead_tup:
+
+Estimacion de versiones obsoletas.
+
+n_mod_since_analyze:
+
+Estimacion de cambios desde el ultimo ANALYZE.
+
+vacuum_count:
+
+Ejecuciones manuales de VACUUM.
+
+analyze_count:
+
+Ejecuciones manuales de ANALYZE.
+
+autovacuum_count:
+
+Ejecuciones automaticas de VACUUM.
+
+autoanalyze_count:
+
+Ejecuciones automaticas de ANALYZE.
+
+
+RESULTADO ESPERADO
+
+Los contadores automaticos siguen en cero.
+
+n_dead_tup debe reflejar suficientes
+versiones obsoletas para superar el umbral.
+
+Los valores pueden tardar en actualizarse.
+
+Si aparecen estadisticas atrasadas,
+repetir la consulta antes de concluir.
+
+
+============================================================
+PASO 5. HABILITAR Y OBSERVAR EL MANTENIMIENTO
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos comprobar que PostgreSQL realmente
+ejecuta VACUUM y ANALYZE automaticamente.
+
+
+COMANDO
+
+-- Permitir mantenimiento automatico
+-- ordinario sobre auto_work.
+ALTER TABLE maintenance.auto_work
+SET (autovacuum_enabled=true);
+
+
+AHORA OBSERVAREMOS LOS CONTADORES
+
+-- Consultar las ejecuciones automaticas.
+SELECT
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    vacuum_count,
+    analyze_count,
+    autovacuum_count,
+    autoanalyze_count,
+    last_autovacuum,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relid = 'maintenance.auto_work'::regclass;
+
+
+RESULTADO INICIAL
+
+Es posible que los contadores todavia
+se encuentren en cero.
+
+Eso no significa necesariamente que exista un error.
+
+El mantenimiento automatico no tiene
+una hora exacta garantizada de ejecucion.
+
+
+SEGUIMIENTO
+
+Ejecutar nuevamente la consulta anterior y,
+justo despues, ejecutar:
+
+\watch 1
+
+
+QUE HACE WATCH
+
+Repite la ultima consulta cada segundo.
+
+Permite observar como evolucionan
+los contadores de mantenimiento.
+
+Esperar hasta observar:
+
+autovacuum_count mayor que cero.
+
+autoanalyze_count mayor que cero.
+
+last_autovacuum con una fecha.
+
+last_autoanalyze con una fecha.
+
+Detener el seguimiento con Ctrl+C.
+
+Usar como referencia un maximo de 90 segundos.
+
+
+RESULTADO ORIGINAL DE REFERENCIA
+
+autovacuum_count = 1.
+
+autoanalyze_count = 1.
+
+vacuum_count = 0.
+
+analyze_count = 0.
+
+n_dead_tup = 0.
+
+n_mod_since_analyze = 0.
+
+
+QUE SIGNIFICA
+
+PostgreSQL ejecuto operaciones de mantenimiento
+automatico sobre la tabla.
+
+No tuvimos que ejecutar VACUUM manual.
+
+Tampoco ejecutamos ANALYZE manual.
+
+Los contadores y fechas respaldan
+que realmente ocurrieron esas operaciones.
+
+
+IMPORTANTE
+
+No exigir exactamente un contador igual a uno.
+
+Podrian ocurrir otras ejecuciones.
+
+La condicion importante es observar
+al menos una ejecucion de cada mecanismo.
+
+Si no sucede dentro del periodo indicado,
+se debe investigar.
+
+No ejecutar mantenimiento manual para
+aparentar un resultado automatico.
+
+
+COMPROBAR LOS DATOS
+
+-- Verificar que el contenido logico permanece.
+SELECT
+    COUNT(*) AS filas,
+    SUM(version) AS suma_versiones
+FROM maintenance.auto_work;
+
+
+RESULTADO ESPERADO
+
+filas = 12000.
+
+suma_versiones = 6000.
+
+
+CONCLUSION PARCIAL
+
+Autovacuum y Autoanalyze realizaron
+mantenimiento sin modificar el contenido
+logico de los registros del ejercicio.
+
+
+============================================================
+PASO 6. RESTAURAR LA CONFIGURACION ORIGINAL
+============================================================
+
+QUE QUEREMOS DEMOSTRAR
+
+Queremos devolver los parametros y las opciones
+de la tabla a su estado anterior.
+
+No debemos dejar ajustes de laboratorio
+sin restaurar.
+
+
+PRIMERA PARTE - PSQL
+
+-- Eliminar los umbrales especiales que configuramos.
 ALTER TABLE maintenance.auto_work RESET (
     autovacuum_vacuum_threshold,
     autovacuum_vacuum_scale_factor,
@@ -144,71 +686,182 @@ ALTER TABLE maintenance.auto_work RESET (
     autovacuum_analyze_threshold,
     autovacuum_analyze_scale_factor
 );
-ALTER TABLE maintenance.auto_work SET (autovacuum_enabled=false);
 
-SELECT c.reloptions,
-       c.reloptions IS NOT DISTINCT FROM b.reloptions AS restored
-FROM pg_class c CROSS JOIN p6_options_before b
-WHERE c.oid='maintenance.auto_work'::regclass;
+-- Restaurar la opcion original de la tabla.
+ALTER TABLE maintenance.auto_work
+SET (autovacuum_enabled=false);
 
-Esperado: restored=true.
-La opcion false corresponde al estado controlado de la preparacion.
-El cierre final restablece las opciones anteriores al laboratorio completo.
 
-6. RESTAURAR LA CONFIGURACION GLOBAL - OTRA TERMINAL POWERSHELL
+COMPROBAR LA RESTAURACION
 
-Mantener abierta la sesion psql anterior y ejecutar:
+-- Comparar las opciones actuales con el BEFORE.
+SELECT
+    c.reloptions AS opciones_actuales,
+    b.reloptions AS opciones_originales,
+    c.reloptions IS NOT DISTINCT FROM b.reloptions
+        AS restaurado
+FROM pg_class c
+CROSS JOIN p6_options_before b
+WHERE c.oid = 'maintenance.auto_work'::regclass;
+
+
+RESULTADO ESPERADO
+
+restaurado = true.
+
+
+EXPLICACION
+
+RESET elimina las opciones especificas
+agregadas para nuestro experimento.
+
+SET devuelve autovacuum_enabled
+al valor inicial de esta tabla.
+
+La comparacion demuestra que recuperamos
+las mismas opciones registradas al comenzar.
+
+
+SEGUNDA PARTE - POWERSHELL
+
+Dejar abierta la sesion psql anterior.
+
+Abrir otra terminal PowerShell.
+
+Ejecutar:
 
 & {
     $ErrorActionPreference = "Stop"
+
+    # Restaurar el archivo de configuracion global
+    # que guardo la preparacion del laboratorio.
     docker exec -u postgres p6-maintenance-lab cp /tmp/nobleprog-p6-lab/evidence/postgresql.auto.conf.before /tmp/nobleprog-p6-lab/data/postgresql.auto.conf
+
     if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo restaurar postgresql.auto.conf."
+        throw "No se pudo restaurar la configuracion."
     }
+
+    Write-Output "CONFIGURACION ORIGINAL REPUESTA"
 }
 
-Regresar a la misma sesion psql:
 
+EXPLICACION
+
+La preparacion 06.00 guardo una copia original
+de postgresql.auto.conf.
+
+Ahora la devolvemos a su ubicacion original.
+
+Esto permite restaurar la configuracion
+sin adivinar los valores anteriores.
+
+El archivo pertenece al PostgreSQL aislado de P6.
+
+
+TERCERA PARTE - REGRESAR A PSQL
+
+-- Solicitar que PostgreSQL recargue
+-- los parametros originales.
 SELECT pg_reload_conf();
+
+-- Dar tiempo a que se aplique la recarga.
 SELECT pg_sleep(1);
 
-SELECT p.name,b.setting AS before_value,p.setting AS after_value,
-       p.setting=b.setting AS restored
-FROM pg_settings p JOIN p6_guc_before b ON b.name=p.name
+-- Comparar parametros actuales y originales.
+SELECT
+    p.name,
+    b.setting AS valor_original,
+    p.setting AS valor_actual,
+    p.setting = b.setting AS restaurado
+FROM pg_settings p
+JOIN p6_settings_before b
+    ON p.name = b.name
 ORDER BY p.name;
 
-Esperado: ambas comparaciones true.
-Se repone el archivo guardado por 00.00, no solamente valores elegidos de
-memoria. No realizar cambios ajenos al laboratorio entre ambas etapas.
+
+RESULTADO ESPERADO
+
+Los dos parametros muestran:
+
+restaurado = true.
+
+
+QUE DEMOSTRAMOS
+
+ANTES:
+
+Conservamos los valores originales.
+
+CAMBIO:
+
+Aceleramos el mantenimiento automatico.
+
+AFTER:
+
+Comprobamos que los procesos trabajaron.
+
+RESTAURACION:
+
+Devolvimos parametros y opciones originales.
+
+VERIFICACION:
+
+Comprobamos que coinciden con BEFORE.
+
+
+IMPORTANTE
+
+Restaurar la configuracion no borra
+los datos ni revierte el mantenimiento realizado.
+
+La tabla conserva sus 12000 registros.
+
+La limpieza final del laboratorio
+se realiza mediante la guia 06.00.
+
+
+CONCLUSION FINAL
+
+Autovacuum y Autoanalyze permiten que
+PostgreSQL realice mantenimiento automaticamente.
+
+Los umbrales determinan cuando una tabla
+se convierte en candidata.
+
+La ejecucion real depende de la disponibilidad
+de procesos y otras condiciones.
+
+Para demostrar que una tarea realmente ocurrio,
+debemos revisar contadores y fechas.
+
+No basta con comprobar que autovacuum esta en on.
+
 
 COMPARACION CON ORACLE
 
-Oracle puede recopilar estadisticas automaticamente mediante tareas de
-mantenimiento. Autoanalyze es la referencia funcional para esa comparacion.
-Autovacuum tambien limpia versiones y participa en la proteccion de XID;
-no equivale solamente a la recoleccion automatica de estadisticas de Oracle.
+Oracle dispone de mecanismos automaticos
+de recopilacion de estadisticas.
 
-CONCLUSION Y CIERRE
+Autoanalyze ofrece una referencia funcional
+para esa comparacion.
 
-Los participantes deben distinguir configuracion habilitada de ejecucion
-demostrada y reconocer que los umbrales no garantizan un instante exacto
-de inicio. La disponibilidad de trabajadores y otras condiciones influyen.
+Autovacuum tambien participa en limpieza
+de versiones y prevencion de problemas XID.
 
-Salir con \q y continuar con 06.05.
-El cierre y la restauracion completa del entorno estan en 06.00.
+Por tanto, no equivale solamente a
+la recopilacion automatica de estadisticas
+que realiza Oracle.
 
-ALTERNATIVA AUTOMATIZADA
 
-En lugar de este recorrido, siguiendo la ruta de scripts de 06.00:
+FINALIZACION
 
-docker exec -u postgres p6-maintenance-lab /bin/bash /tmp/p6-scripts/04-autovacuum-autoanalyze.sh
-if ($LASTEXITCODE -ne 0) { throw "Fallo 04-autovacuum-autoanalyze.sh." }
+Salir de psql:
 
-Esa ruta conserva los ajustes hasta ejecutar 99-cleanup-lab.sh.
-La auditoria completa aplica su restauracion automaticamente al finalizar.
+\q
 
-FUENTES
+El laboratorio permanece encendido.
 
-https://www.postgresql.org/docs/18/runtime-config-vacuum.html
-https://www.postgresql.org/docs/18/routine-vacuuming.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/gathering-optimizer-statistics.html
+Continuar con 06.05.
+
+
+FIN DE LA PRACTICA 06.04\n
