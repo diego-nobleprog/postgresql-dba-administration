@@ -1,0 +1,354 @@
+PRACTICA 07.02 - CONCURRENCIA, WAL Y REPLICACION
+Modulos 6 y 7: Performance Tuning y Replicacion
+PostgreSQL DBA Administration
+
+REGLA PARA COPIAR COMANDOS
+
+Ejecutar SQL dentro de psql y comandos Docker en PowerShell.
+No copiar los prompts ni las explicaciones.
+
+Los metacomandos de psql se ejecutan INDIVIDUALMENTE.
+Esto incluye \q, \set y la sentencia que termina con \gset.
+Pegar esa instruccion sola, pulsar Enter y esperar el prompt
+antes de pegar la siguiente consulta.
+
+Los bloques que contienen solamente SQL pueden pegarse completos.
+Un prompt con * indica una transaccion abierta.
+Un prompt con - indica una sentencia incompleta.
+Si hay texto accidental pendiente, pulsar Ctrl+C y esperar
+el prompt antes de pegar nuevamente el SQL.
+
+
+OBJETIVO
+
+Relacionar una transaccion abierta con visibilidad de datos,
+bloqueos, wait events y aplicacion de WAL en la replica.
+
+SITUACION
+
+Un empleado registra un pago y no confirma todavia.
+Otro intenta modificar el mismo pedido.
+Mientras tanto, un supervisor consulta los totales.
+
+La pregunta central es:
+Si una operacion espera, el problema siempre es una consulta lenta?
+
+CONCEPTOS NECESARIOS
+
+Transaccion: grupo de operaciones que termina con COMMIT
+o ROLLBACK.
+
+MVCC: permite lecturas consistentes mediante versiones.
+Una lectura ordinaria no ve cambios no confirmados de otra sesion.
+
+Lock: coordina operaciones concurrentes.
+Wait event: indica en que esta esperando un proceso.
+
+WAL: registro utilizado para recuperacion y replicacion.
+Puede generarse y transmitirse antes del COMMIT.
+Eso no hace visibles los cambios no confirmados en el standby.
+
+Streaming asincrono: el principal no espera el replay del
+standby para confirmar cada transaccion.
+
+Replication slot: conserva WAL necesario para el consumidor,
+dentro de los limites configurados. No significa retraso cero
+ni ausencia garantizada de perdida de datos.
+
+REQUISITO
+
+07.01 completada.
+Total inicial del escenario: 900.
+Indice conservado.
+
+============================================================
+1. PREPARAR TRES SESIONES SOBRE EL SERVIDOR A
+============================================================
+
+Abrir TRES terminales PowerShell.
+En cada una ejecutar la conexion al SERVIDOR A de 07.00.
+
+Dentro de cada conexion, asignar su nombre.
+
+SESION A - PSQL SOBRE SERVIDOR A
+
+SET application_name='p7_sesion_A';
+
+SESION B - PSQL SOBRE SERVIDOR A
+
+SET application_name='p7_sesion_B';
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SET application_name='p7_sesion_C';
+
+La SESION C sera el observador.
+No confundir SESION B con SERVIDOR B.
+
+============================================================
+2. BEFORE - GUARDAR LA POSICION WAL
+============================================================
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SELECT pg_current_wal_lsn() AS wal_inicio \gset
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 900.
+
+La variable wal_inicio queda guardada en esta conexion psql.
+Conservar la SESION C hasta la comparacion final.
+
+============================================================
+3. CAMBIO SIN COMMIT
+============================================================
+
+SESION A - PSQL SOBRE SERVIDOR A
+
+BEGIN;
+
+UPDATE negocio.pedidos
+SET estado='PAGADO'
+WHERE id=101;
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 1100.
+
+NO ejecutar COMMIT todavia.
+
+INTERPRETACION
+
+A ve su propio cambio: 900 + 200.
+La transaccion sigue abierta y conserva el bloqueo.
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 900.
+
+Abrir una CUARTA terminal conectada al SERVIDOR B.
+
+SERVIDOR B - PSQL
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 900.
+
+No es necesario provocar retraso:
+el cambio no esta confirmado y no debe hacerse visible.
+
+============================================================
+4. GENERAR LA ESPERA
+============================================================
+
+SESION B - PSQL SOBRE SERVIDOR A
+
+SET statement_timeout='5min';
+
+UPDATE negocio.pedidos
+SET estado='PAGADO'
+WHERE id=101;
+
+RESULTADO ESPERADO
+
+El UPDATE queda esperando; no vuelve inmediatamente el prompt.
+
+No ejecutar otros comandos en esta sesion mientras espera.
+Continuar en la SESION C.
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SELECT pid,application_name,state,wait_event_type,wait_event,
+       pg_blocking_pids(pid) AS bloqueadores
+FROM pg_stat_activity
+WHERE application_name IN ('p7_sesion_A','p7_sesion_B')
+ORDER BY application_name;
+
+RESULTADO ESPERADO
+
+A: idle in transaction.
+B: active, wait_event_type Lock.
+B identifica el PID de A entre sus bloqueadores.
+Es habitual observar wait_event transactionid.
+
+Consultar los locks:
+
+SELECT l.pid,l.locktype,l.mode,l.granted
+FROM pg_locks l
+JOIN pg_stat_activity a USING(pid)
+WHERE a.application_name IN ('p7_sesion_A','p7_sesion_B')
+ORDER BY l.pid,l.granted;
+
+INTERPRETACION
+
+granted=false significa que ese bloqueo esta solicitado
+y aun no fue concedido.
+
+El indice de 07.01 ayuda a localizar datos.
+No permite saltarse un bloqueo incompatible.
+
+Esto es una espera por lock, NO un deadlock:
+no existe un ciclo de dependencias.
+
+RETO PARA LOS PARTICIPANTES
+
+Identificar quien bloquea y justificarlo con los PID.
+No concluir que A esta esperando a B porque B siga activo.
+
+Si se agotan los cinco minutos:
+cancelar y revisar el estado antes de continuar.
+Si A sigue abierta, ejecutar ROLLBACK en A, salir de las
+sesiones y revisar la incidencia; no repetir cambios a ciegas.
+
+============================================================
+5. COMMIT Y TOTAL 1100
+============================================================
+
+SESION A - PSQL SOBRE SERVIDOR A
+
+COMMIT;
+
+SESION B - PSQL SOBRE SERVIDOR A
+
+Esperar a que aparezca UPDATE 1.
+El UPDATE estaba fuera de BEGIN y se confirma automaticamente.
+
+RESET statement_timeout;
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 1100.
+
+La sesion B asigno otra vez PAGADO.
+No sumo 200 adicionales: modifico el mismo estado del pedido.
+
+DESDE UNA TERMINAL POWERSHELL ADICIONAL
+
+& {
+    $ErrorActionPreference = "Stop"
+    docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/00-sync-replica.sh
+    if ($LASTEXITCODE -ne 0) { throw "No se confirmo la sincronizacion." }
+}
+
+SERVIDOR B - PSQL
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 1100.
+
+============================================================
+6. NUEVO PEDIDO Y TOTAL 1200
+============================================================
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+INSERT INTO negocio.pedidos
+VALUES(105,2,'2026-01-15','PAGADO',100);
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 1200.
+
+Volver a ejecutar el bloque PowerShell de sincronizacion
+del apartado anterior.
+
+SERVIDOR B - PSQL
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO: 1200.
+
+La espera explicita hace reproducible la comprobacion.
+Sin ella, ambos valores podrian coincidir inmediatamente
+o B podria mostrar temporalmente un estado anterior.
+
+============================================================
+7. AFTER - WAL Y ESTADO DE LA REPLICACION
+============================================================
+
+SESION C - PSQL SOBRE SERVIDOR A
+
+SELECT pg_wal_lsn_diff(
+    pg_current_wal_lsn(), :'wal_inicio'::pg_lsn
+) AS avance_wal_bytes;
+
+SELECT application_name,state,sync_state,sent_lsn,replay_lsn
+FROM pg_stat_replication;
+
+SELECT slot_name,slot_type,active,restart_lsn
+FROM pg_replication_slots;
+
+SELECT * FROM pg_stat_checkpointer;
+
+RESULTADO ESPERADO
+
+Avance WAL positivo.
+Conexion de B en streaming, sync_state async.
+Slot integrado_b fisico y activo.
+
+El avance WAL incluye la actividad registrada durante
+el intervalo; no es el tamano exacto del pedido 105.
+
+pg_stat_checkpointer ofrece contadores acumulados.
+Esta consulta no demuestra que una escritura concreta
+haya provocado un checkpoint.
+
+SERVIDOR B - PSQL
+
+SELECT status,sender_host,sender_port
+FROM pg_stat_wal_receiver;
+
+RESULTADO ESPERADO
+
+streaming, 127.0.0.1, 5547.
+
+============================================================
+8. CIERRE Y CONEXION CON 07.03
+============================================================
+
+En A y B comprobar el total reciente 1200.
+No borrar el pedido 105 ni retirar el indice.
+
+Salir con \q de las CUATRO conexiones.
+Esto cierra las sesiones del ejercicio y elimina los
+ajustes de sesion; el indice y datos se conservan.
+
+COMPARACION CON ORACLE
+
+En ambos motores una transaccion puede impedir el avance
+de otra operacion incompatible.
+
+Las vistas, tipos de espera y mecanismos internos difieren.
+pg_stat_activity y pg_locks se usan aqui para observar PostgreSQL.
+No trasladar literalmente sus nombres a Oracle.
+
+El transporte y aplicacion de redo en Data Guard aportan
+una referencia conceptual para distinguir envio y aplicacion
+de WAL en PostgreSQL.
+
+FUENTES
+
+https://www.postgresql.org/docs/18/monitoring-stats.html
+https://www.postgresql.org/docs/18/warm-standby.html
+https://docs.oracle.com/en/database/oracle/oracle-database/19/sbydb/managing-oracle-data-guard-physical-standby-databases.html

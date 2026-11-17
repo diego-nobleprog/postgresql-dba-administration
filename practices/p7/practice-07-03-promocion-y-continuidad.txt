@@ -1,0 +1,270 @@
+PRACTICA 07.03 - PROMOCION Y CONTINUIDAD
+Modulos 6 y 7: Performance Tuning y Replicacion
+PostgreSQL DBA Administration
+
+REGLA PARA COPIAR COMANDOS
+
+Ejecutar SQL dentro de psql y comandos Docker en PowerShell.
+No copiar los prompts ni las explicaciones.
+
+Los metacomandos de psql se ejecutan INDIVIDUALMENTE.
+Esto incluye \q, \set y la sentencia que termina con \gset.
+Pegar esa instruccion sola, pulsar Enter y esperar el prompt
+antes de pegar la siguiente consulta.
+
+Los bloques que contienen solamente SQL pueden pegarse completos.
+Un prompt con * indica una transaccion abierta.
+Un prompt con - indica una sentencia incompleta.
+Si hay texto accidental pendiente, pulsar Ctrl+C y esperar
+el prompt antes de pegar nuevamente el SQL.
+
+
+OBJETIVO
+
+Promover el standby cuando A deja de estar disponible,
+comprobar los datos y conservar la optimizacion del reporte.
+
+SITUACION
+
+Tenemos ventas pagadas por 1200 en A y B.
+El principal deja de responder.
+Necesitamos registrar otro pedido y continuar consultando.
+
+CONCEPTOS NECESARIOS
+
+Promocion: finaliza la recuperacion de B y permite escrituras.
+
+Failover: uso de un standby para asumir el servicio cuando
+el principal no esta disponible.
+
+Switchover: intercambio planificado de roles.
+No se completa en este ejercicio: A no se convierte
+automaticamente en standby de B.
+
+Aislamiento del antiguo principal:
+impedir que vuelva a aceptar escrituras independientes.
+
+Este ejercicio simula la indisponibilidad con una parada
+controlada. No reproduce un corte electrico ni una particion
+de red. La replicacion asincrona puede perder cambios
+no recibidos en otras condiciones de falla.
+
+REQUISITO
+
+07.02 completada, indice conservado.
+Total 1200 sincronizado en ambas instancias.
+Sesiones del escenario anterior cerradas.
+
+============================================================
+1. BEFORE - VERIFICAR LOS ROLES
+============================================================
+
+Abrir una conexion a A y otra a B mediante 07.00.
+
+EN CADA SERVIDOR - PSQL
+
+SELECT inet_server_port(),pg_is_in_recovery();
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+A: 5547, f, total 1200.
+B: 5548, t, total 1200.
+
+Salir de ambas conexiones con \q.
+
+============================================================
+2. SIMULAR INDISPONIBILIDAD DE A
+============================================================
+
+POWERSHELL
+
+& {
+    $ErrorActionPreference = "Stop"
+    docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/03-stop-primary.sh
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se confirmo la parada segura. No promover B."
+    }
+}
+
+QUE HACE
+
+Verifica los directorios y roles.
+Comprueba el total 1200 y espera el replay de B.
+Detiene exclusivamente PostgreSQL A.
+Comprueba que A no responde.
+Deja B encendido y todavia en recuperacion.
+
+RESULTADO ESPERADO
+
+A DETENIDO; B AUN ES STANDBY. AHORA PUEDE PROMOVERSE B.
+
+No detuvimos el contenedor: B vive dentro del mismo contenedor.
+
+============================================================
+3. PROMOVER B
+============================================================
+
+Abrir una conexion al SERVIDOR B desde PowerShell:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5548 -U postgres -d nobleprog_integrado -v ON_ERROR_STOP=1 -P pager=off
+
+SERVIDOR B - PSQL
+
+SELECT pg_is_in_recovery();
+
+RESULTADO ESPERADO: t.
+
+SELECT pg_promote(true,30);
+
+RESULTADO ESPERADO: t.
+
+SELECT pg_is_in_recovery();
+
+RESULTADO ESPERADO: f.
+
+INTERPRETACION
+
+B salio de recuperacion.
+Ahora puede aceptar escrituras como principal.
+No reiniciar el antiguo A como principal independiente.
+
+============================================================
+4. VERIFICAR DATOS E INDICE
+============================================================
+
+SERVIDOR B - PSQL
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx');
+
+RESULTADO ESPERADO
+
+Total 1200.
+Indice presente.
+
+El cambio de rol no obliga a reconstruir el indice.
+B ya habia recibido ese objeto mediante la replica fisica.
+
+============================================================
+5. CONTINUAR CON UNA NUEVA VENTA
+============================================================
+
+SERVIDOR B - PSQL
+
+INSERT INTO negocio.pedidos
+VALUES(106,1,'2026-01-15','PAGADO',300);
+
+SELECT count(*) AS pagados,sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+Seis pedidos pagados.
+Total 1500.
+
+Consultar el resumen:
+
+SELECT c.nombre,
+       count(*) AS pedidos_pagados,
+       sum(p.total) AS total
+FROM negocio.clientes c
+JOIN negocio.pedidos p ON p.cliente_id=c.id
+WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
+GROUP BY c.id,c.nombre
+ORDER BY c.nombre;
+
+RESULTADO ESPERADO
+
+Ana:   3 pedidos, 650.
+Luis:  2 pedidos, 600.
+Maria: 1 pedido,  250.
+Total: 1500.
+
+============================================================
+6. AFTER - REVISAR EL REPORTE OPTIMIZADO
+============================================================
+
+SERVIDOR B - PSQL
+
+EXPLAIN (ANALYZE,BUFFERS)
+SELECT c.nombre,p.id,p.fecha,p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id=p.cliente_id
+WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
+ORDER BY p.fecha,p.id;
+
+QUE OBSERVAR
+
+Seis filas finales.
+Uso del indice en esta carga.
+Tiempo y buffers del nuevo principal.
+
+No comparar los tiempos como si fueran cargas identicas:
+ahora devolvemos seis filas; al inicio eran tres.
+Lo fundamental es conservar datos, indice y operacion correcta.
+
+RETO PARA LOS PARTICIPANTES
+
+Responder:
+- Por que B ahora permite INSERT?
+- Que pasaria si A volviera a aceptar escrituras por separado?
+- Tener un nuevo principal significa tener redundancia?
+
+RESPUESTA ESPERADA
+
+B fue promovido.
+Dos principales independientes pueden divergir.
+Solo B esta disponible: la redundancia aun no fue restablecida.
+
+============================================================
+7. RESTAURACION O CIERRE
+============================================================
+
+Salir con \q.
+
+Para repetir desde el estado inicial:
+usar el apartado 6 de 07.00.
+
+Para terminar y eliminar este laboratorio:
+usar el apartado 7 de 07.00.
+
+La reconstruccion crea instancias nuevas.
+No presentar esa operacion como recuperacion automatica,
+pg_rewind ni switchover completo.
+
+CONCLUSION
+
+El mismo sistema evoluciono:
+900 -> 1100 -> 1200 -> 1500.
+
+El indice creado al diagnosticar el reporte sobrevivio
+a la replicacion fisica y a la promocion.
+
+Recuperamos capacidad de lectura y escritura en B.
+No configuramos redireccion automatica de aplicaciones,
+quorum, deteccion automatica de fallos ni alta disponibilidad
+entre maquinas independientes.
+
+COMPARACION CON ORACLE
+
+Data Guard tambien distingue switchover y failover.
+Son cambios de rol con procedimientos y condiciones propios.
+
+La promocion manual de este laboratorio no equivale
+a ejecutar toda la automatizacion de Data Guard Broker.
+La reincorporacion del antiguo principal es un trabajo
+adicional en ambas arquitecturas.
+
+FUENTES
+
+https://www.postgresql.org/docs/18/warm-standby.html
+https://www.postgresql.org/docs/18/functions-admin.html
+https://docs.oracle.com/en/database/oracle/oracle-database/19/sbydb/managing-oracle-data-guard-role-transitions.html
