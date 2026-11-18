@@ -1,291 +1,125 @@
-EJECUCION DE LOS ARCHIVOS POWERSHELL
-
-Los comandos utilizan un proceso independiente de PowerShell.
-ExecutionPolicy Bypass se limita a ese proceso.
-No se modifica la politica permanente del equipo.
-Se comprueba el codigo de salida inmediatamente despues.
-
-PRACTICA 07.00 - PREPARACION Y LIMPIEZA
+PRACTICA 07.00 - PREPARACION Y ELIMINACION DEL LABORATORIO
 Modulos 6 y 7: Performance Tuning y Replicacion
-PostgreSQL DBA Administration
-
-REGLA PARA COPIAR COMANDOS
-
-Ejecutar SQL dentro de psql y comandos Docker en PowerShell.
-No copiar los prompts ni las explicaciones.
-
-Los metacomandos de psql se ejecutan INDIVIDUALMENTE.
-Esto incluye \q, \set y la sentencia que termina con \gset.
-Pegar esa instruccion sola, pulsar Enter y esperar el prompt
-antes de pegar la siguiente consulta.
-
-Los bloques que contienen solamente SQL pueden pegarse completos.
-Un prompt con * indica una transaccion abierta.
-Un prompt con - indica una sentencia incompleta.
-Si hay texto accidental pendiente, pulsar Ctrl+C y esperar
-el prompt antes de pegar nuevamente el SQL.
-
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
 
 OBJETIVO
 
-Construir un laboratorio independiente con dos instancias.
-Preparar todos los datos antes de iniciar los ejercicios.
-Cerrar o reconstruir el laboratorio de manera controlada.
+Preparar un laboratorio con dos instancias PostgreSQL que permita
+analizar consultas lentas, observar la replicacion y simular la falla
+del servidor principal. Los ejercicios se realizan en este orden:
+07.01 -> 07.02 -> 07.03. Los resultados de cada escenario se conservan
+para el siguiente.
 
-SITUACION
 
-Una empresa necesita consultar pedidos, registrar pagos
-y continuar trabajando cuando su principal deja de responder.
+- Escenario 1 - La consulta lenta
+Diagnosticar, optimizar y verificar la mejora en una réplica
 
-Los escenarios forman UNA sola practica.
-Ejecutarlos en orden: 07.01, 07.02 y 07.03.
+- Escenario 2 - La base de datos bajo actividad
+Transacciones, locks, WAL y sincronización de datos
+
+- Escenario 3 - El servidor principal falla
+Promoción de standby, recuperación del servicio y verificación del rendimiento
+
+
+AMBIENTE QUE SE PREPARA
+
+- Windows PowerShell y Docker Desktop.
+- Imagen existente: postgresql-dba:18-p1.
+- Contenedor: p7-integrado-lab.
+- PostgreSQL A: principal; puerto interno 5547; lectura y escritura.
+- PostgreSQL B: standby; puerto interno 5548; solo lectura al inicio.
+- Base de datos: nobleprog_integrado.
+- Esquema: negocio. Tablas: clientes y pedidos.
+- Datos iniciales: 3 clientes y 50004 pedidos (4 recientes y 50000 historicos).
+- Total inicial de pedidos pagados recientes: 900.
+
+Las instancias A y B funcionan dentro del mismo contenedor. Esta
+arquitectura sirve para practicar replicacion y promocion de standby,
+pero no representa dos servidores fisicos independientes.
+
+QUE HACE CADA ARCHIVO DE practices/p7/scripts
+
+ARCHIVOS DEL RECORRIDO
+
+01-create-docker-laboratory.ps1
+  Crea el contenedor, copia los archivos necesarios y deja preparadas
+  las instancias PostgreSQL A y B con los datos iniciales.
+
+02-simulate-primary-server-failure.sh
+  En el escenario 07.03 comprueba la sincronizacion y detiene A para
+  que se pueda practicar la promocion del standby B.
+
+03-restore-initial-laboratory-state.sh
+  Reconstruye A y B con los datos originales si se necesita repetir
+  la practica. No se requiere para iniciar ni para eliminar el ambiente.
+
+04-remove-docker-laboratory.ps1
+  Cierra las instancias y elimina el contenedor del laboratorio.
+
+ARCHIVOS AUXILIARES (NO SE EJECUTAN POR SEPARADO EN ESTA GUIA)
+
+aux-initialize-docker-container.sh
+  Inicia la preparacion dentro del contenedor.
+
+aux-shared-environment-functions.sh
+  Reune variables, conexiones y funciones compartidas entre scripts.
+
+aux-create-tables-and-load-sample-data.sql
+  Crea las tablas de negocio y carga los pedidos de ejemplo e historicos.
+
+aux-configure-primary-and-standby.sh
+  Inicializa A, crea B a partir de un respaldo fisico y configura
+  la replicacion continua de WAL.
+
+aux-verify-standby-synchronization.sh
+  Comprueba que B ya reprodujo los cambios WAL confirmados en A.
+
+aux-query-recent-paid-orders.sql
+  Consulta los pedidos pagados recientes, uno por uno, con su cliente.
+
+aux-report-paid-orders-by-customer.sql
+  Agrupa los pedidos pagados por cliente y calcula cantidades y totales.
+
+aux-stop-postgresql-instances.sh
+  Detiene ordenadamente las instancias PostgreSQL cuando corresponde.
+
+aux-validate-integrated-laboratory.sh
+  Comprueba automaticamente el funcionamiento de los tres escenarios.
+  No forma parte del recorrido manual de los participantes.
 
 ============================================================
-1. ENTORNO Y ARQUITECTURA
+1. INICIAR EL LABORATORIO
 ============================================================
 
-Windows PowerShell 5.1.
-Docker Desktop con la imagen postgresql-dba:18-p1.
-Repositorio:
+Desde PowerShell, situarse en la raiz del repositorio:
 C:\Users\student\Desktop\postgresql-dba-administration
 
-Rama de trabajo: p7. Rama base: p6.
-Carpeta del material nuevo: practices/p7/
-La rama p7 parte de p6 y contiene esta practica integrada.
-
-Contenedor manual: p7-integrado-lab
-Contenedor de validacion: p7-integrado-validacion
-Etiqueta: nobleprog.p7.integrado=true
-
-Dos instancias dentro de UN contenedor:
-A: principal, 127.0.0.1:5547 dentro del contenedor.
-B: standby, 127.0.0.1:5548 dentro del contenedor.
-
-Base: nobleprog_integrado
-Esquema: negocio
-Tablas: clientes y pedidos
-
-Datos A: /tmp/nobleprog-p7-integrado/A
-Datos B: /tmp/nobleprog-p7-integrado/B
-Scripts: /tmp/p7-integrado-scripts
-Evidencias: /tmp/nobleprog-p7-integrado/evidence
-
-No se publican puertos en Windows.
-La red del contenedor es none; las instancias usan loopback.
-El contenedor dispone de 2 CPU y 4 GiB en conjunto.
-
-Esto demuestra dos instancias, no dos equipos independientes.
-Una falla del contenedor detendria ambas.
-
-La autenticacion trust se usa exclusivamente en este
-laboratorio aislado. No trasladar esta configuracion a produccion.
-
-El principal del curso postgresql-dba y los laboratorios
-anteriores no se utilizan ni se modifican.
-
-============================================================
-2. CREAR EL LABORATORIO MANUAL
-============================================================
+Usar la rama p7 y tener Docker Desktop encendido y la imagen
+postgresql-dba:18-p1 disponible.
 
 COMANDO - POWERSHELL
 
-& {
-    $ErrorActionPreference = "Stop"
-    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\00-create-lab.ps1" -Mode manual
-    if ($LASTEXITCODE -ne 0) {
-        throw "La operacion fallo. Conserva la salida y no repitas el bloque."
-    }
-}
-
-QUE HACE
-
-- Comprueba la rama p7 y evita sobrescribir el contenedor.
-- Copia los scripts definitivos del repositorio.
-- Comprueba la sintaxis Bash.
-- Inicializa A y crea la base, extension, esquema y tablas.
-- Inserta tres clientes y 50004 pedidos.
-- Crea B mediante backup fisico de A.
-- Configura un slot fisico y streaming asincrono.
-- Comprueba los roles, datos y sincronizacion.
-- Deja las dos instancias disponibles.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\01-create-docker-laboratory.ps1" -Mode manual
 
 RESULTADO ESPERADO
 
 LISTO PARA CLASE: CARGA INICIAL PRESENTE; EJERCICIOS SIN EJECUTAR.
 
-No significa base vacia.
-Significa que tiene la carga inicial y no se hicieron los ejercicios.
-
-CARGA INICIAL
-
-Tres clientes: Ana, Luis y Maria.
-
-Pedidos del dia didactico 2026-01-15:
-101 | Ana   | PENDIENTE | 200
-102 | Luis  | PAGADO    | 500
-103 | Ana   | PAGADO    | 150
-104 | Maria | PAGADO    | 250
-
-Otros 50000 pedidos tienen fechas historicas de 2025.
-No participan en los totales del dia didactico.
-
-Total reciente pagado: 900.
-La fecha es fija para que el ejercicio no dependa del dia real.
+PostgreSQL A esta disponible como principal y PostgreSQL B como
+standby. Los ejercicios 07.01, 07.02 y 07.03 pueden comenzar.
 
 ============================================================
-3. CONEXIONES INTERACTIVAS
+2. ELIMINAR EL LABORATORIO
 ============================================================
 
-CONEXION A - DESDE POWERSHELL
-
-docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5547 -U postgres -d nobleprog_integrado -v ON_ERROR_STOP=1 -P pager=off
-
-CONEXION B - DESDE OTRA TERMINAL POWERSHELL
-
-docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5548 -U postgres -d nobleprog_integrado -v ON_ERROR_STOP=1 -P pager=off
-
-DENTRO DE CADA PSQL
-
-SELECT current_database(),inet_server_port(),pg_is_in_recovery();
-
-A: puerto 5547, recuperacion f.
-B: puerto 5548, recuperacion t.
-
-Para salir:
-
-\q
-
-Distinguir siempre:
-- SERVIDOR A/B: instancia PostgreSQL.
-- SESION A/B/C: conexiones distintas al servidor A.
-
-============================================================
-4. ORDEN DEL RECORRIDO
-============================================================
-
-07.01:
-Diagnosticar el reporte, crear el indice y comprobarlo en B.
-Entrega total 900 e indice disponible en ambas instancias.
-
-07.02:
-Registrar el pago 101 y el pedido 105.
-Entrega total 1200 en ambas instancias.
-
-07.03:
-Detener A, promover B y registrar el pedido 106.
-Entrega total 1500 en el nuevo principal.
-
-No retirar el indice al cerrar 07.01:
-el escenario siguiente necesita conservarlo.
-
-No reconstruir los datos entre escenarios:
-cada escenario recibe los resultados del anterior.
-
-============================================================
-5. VALIDACION AUTOMATIZADA DE LOS DEFINITIVOS
-============================================================
-
-Es una modalidad separada del recorrido interactivo.
-Construye un contenedor NUEVO y ejecuta los tres escenarios.
-Reconstruye el estado inicial y detiene las instancias al cerrar.
+Realizar este paso despues de terminar los tres escenarios y cerrar
+las sesiones abiertas. Se eliminaran el contenedor y los datos
+almacenados dentro de el; no se borran los archivos del repositorio.
 
 COMANDO - POWERSHELL
 
-& {
-    $ErrorActionPreference = "Stop"
-    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\00-create-lab.ps1" -Mode validate
-    if ($LASTEXITCODE -ne 0) {
-        throw "La operacion fallo. Conserva la salida y no repitas el bloque."
-    }
-}
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\04-remove-docker-laboratory.ps1" -Name p7-integrado-lab
 
 RESULTADO ESPERADO
 
-ESCENARIO 1: PASS
-ESCENARIO 2: PASS
-ESCENARIO 3: PASS
-RESTAURACION: PASS
-CODIGO FINAL: 0
-
-El script recupera las evidencias en temp/p7-definitivo-...
-Si falla, conservar su salida y no repetirlo sobre recursos existentes.
-
-La prueba automatizada no demuestra que una persona
-reprodujo todas las instrucciones de estas guias.
-
-============================================================
-6. RECONSTRUIR PARA REPETIR LA PRACTICA
-============================================================
-
-Solo despues de completar 07.03.
-Cerrar todas las conexiones psql con \q.
-
-COMANDO - POWERSHELL
-
-& {
-    $ErrorActionPreference = "Stop"
-    docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/98-reset-lab.sh
-    if ($LASTEXITCODE -ne 0) {
-        throw "Fallo la reconstruccion. No repetir; revisar la salida."
-    }
-}
-
-QUE HACE
-
-Conserva los directorios usados como A-ejecutado y B-ejecutado.
-Crea un principal A nuevo y un standby B nuevo.
-Restablece los 50004 pedidos iniciales y el total reciente 900.
-Elimina el indice experimental al construir la carga original.
-Deja ambas instancias encendidas.
-
-Esto es reconstruccion de un entorno desechable.
-No demuestra pg_rewind ni reintegracion del antiguo principal.
-Se admite una reconstruccion por contenedor; para otra
-repeticion completa, eliminarlo y crear uno nuevo.
-
-============================================================
-7. ELIMINAR EL LABORATORIO AL TERMINAR
-============================================================
-
-Finalizar transacciones pendientes con COMMIT o ROLLBACK.
-Salir de todas las conexiones con \q.
-
-Esta operacion descarta los datos del contenedor indicado.
-Las evidencias se copian a temp antes de eliminarlo.
-
-COMANDO - POWERSHELL
-
-& {
-    $ErrorActionPreference = "Stop"
-    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\99-remove-lab.ps1" -Name p7-integrado-lab
-    if ($LASTEXITCODE -ne 0) {
-        throw "La operacion fallo. Conserva la salida y no repitas el bloque."
-    }
-}
-
-Para retirar exclusivamente el contenedor de validacion:
-
-& {
-    $ErrorActionPreference = "Stop"
-    Set-Location "C:\Users\student\Desktop\postgresql-dba-administration"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\99-remove-lab.ps1" -Name p7-integrado-validacion
-    if ($LASTEXITCODE -ne 0) {
-        throw "La operacion fallo. Conserva la salida y no repitas el bloque."
-    }
-}
-
-El script verifica nombre, etiqueta, montajes y estado.
-Si el servidor esta funcionando, lo detiene primero.
-Si falla el cierre o la copia, conserva el contenedor.
-
-No elimina temp ni el contenedor temporal anterior
-curso-integrado-validacion.
-Esas limpiezas se gestionan por separado.
-
-CONCLUSION
-
-Preparacion, ejecucion, reconstruccion y eliminacion
-son operaciones distintas. No confundir sus resultados.
+CONTENEDOR ELIMINADO: p7-integrado-lab

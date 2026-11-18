@@ -1,354 +1,2801 @@
-PRACTICA 07.02 - CONCURRENCIA, WAL Y REPLICACION
-Modulos 6 y 7: Performance Tuning y Replicacion
-PostgreSQL DBA Administration
+PRACTICA 07.02 - TRANSACCIONES CONCURRENTES, WAL Y REPLICACION
+MODULOS 6 Y 7 - PERFORMANCE TUNING Y REPLICACION
+POSTGRESQL DBA - ADMINISTRACION, PERFORMANCE Y ALTA DISPONIBILIDAD
 
-REGLA PARA COPIAR COMANDOS
+======================================================================
+1. OBJETIVO DEL LABORATORIO
+======================================================================
 
-Ejecutar SQL dentro de psql y comandos Docker en PowerShell.
-No copiar los prompts ni las explicaciones.
+Continuamos trabajando con la empresa que administra los pedidos
+de sus clientes mediante PostgreSQL.
 
-Los metacomandos de psql se ejecutan INDIVIDUALMENTE.
-Esto incluye \q, \set y la sentencia que termina con \gset.
-Pegar esa instruccion sola, pulsar Enter y esperar el prompt
-antes de pegar la siguiente consulta.
+Durante el escenario 07.01 identificamos una consulta que realizaba
+un recorrido amplio de la tabla de pedidos.
 
-Los bloques que contienen solamente SQL pueden pegarse completos.
-Un prompt con * indica una transaccion abierta.
-Un prompt con - indica una sentencia incompleta.
-Si hay texto accidental pendiente, pulsar Ctrl+C y esperar
-el prompt antes de pegar nuevamente el SQL.
+Creamos un indice compuesto B-tree sobre las columnas estado y fecha
+para optimizar el acceso a los registros.
 
+Comprobamos que el indice tambien estaba disponible en PostgreSQL B,
+gracias a la replicacion fisica.
 
-OBJETIVO
+Ahora estudiaremos otro problema.
 
-Relacionar una transaccion abierta con visibilidad de datos,
-bloqueos, wait events y aplicacion de WAL en la replica.
+Mientras algunos empleados consultan los pedidos, otros registran
+pagos y modifican simultaneamente la informacion.
 
-SITUACION
+La empresa necesita comprender que ocurre cuando dos operaciones
+intentan modificar el mismo pedido y como esos cambios llegan
+al servidor standby.
 
-Un empleado registra un pago y no confirma todavia.
-Otro intenta modificar el mismo pedido.
-Mientras tanto, un supervisor consulta los totales.
+Durante este ejercicio los participantes aprenderan a:
 
-La pregunta central es:
-Si una operacion espera, el problema siempre es una consulta lenta?
+1. Identificar transacciones abiertas.
+2. Comprender la visibilidad de cambios mediante MVCC.
+3. Diferenciar cambios confirmados y no confirmados.
+4. Observar bloqueos entre transacciones concurrentes.
+5. Identificar sesiones bloqueadoras y bloqueadas.
+6. Interpretar pg_stat_activity y pg_locks.
+7. Identificar wait events asociados a bloqueos.
+8. Diferenciar una espera por lock de un deadlock.
+9. Comprender la relacion entre COMMIT y WAL.
+10. Comprobar la replicacion de cambios confirmados.
+11. Interpretar posiciones WAL mediante LSN.
+12. Observar WAL Sender y WAL Receiver.
+13. Consultar replication slots y su estado.
+14. Observar estadisticas de checkpoints y consultas.
+15. Verificar que el reporte optimizado sigue funcionando.
 
-CONCEPTOS NECESARIOS
+PREGUNTA CENTRAL
 
-Transaccion: grupo de operaciones que termina con COMMIT
-o ROLLBACK.
+Cuando una consulta o actualizacion tarda demasiado,
+¿significa necesariamente que necesita un indice?
 
-MVCC: permite lecturas consistentes mediante versiones.
-Una lectura ordinaria no ve cambios no confirmados de otra sesion.
+No.
 
-Lock: coordina operaciones concurrentes.
-Wait event: indica en que esta esperando un proceso.
+Una operacion tambien puede tardar porque otra transaccion
+mantiene un bloqueo sobre los registros que necesita modificar.
 
-WAL: registro utilizado para recuperacion y replicacion.
-Puede generarse y transmitirse antes del COMMIT.
-Eso no hace visibles los cambios no confirmados en el standby.
+Por eso un DBA debe distinguir entre problemas de rendimiento
+de consultas y problemas de concurrencia.
 
-Streaming asincrono: el principal no espera el replay del
-standby para confirmar cada transaccion.
+======================================================================
+2. HISTORIA DE NEGOCIO
+======================================================================
 
-Replication slot: conserva WAL necesario para el consumidor,
-dentro de los limites configurados. No significa retraso cero
-ni ausencia garantizada de perdida de datos.
+La empresa cuenta con tres clientes:
 
-REQUISITO
+TABLA: negocio.clientes
 
-07.01 completada.
-Total inicial del escenario: 900.
-Indice conservado.
+id    nombre
+----------------
+1     Ana
+2     Luis
+3     Maria
 
-============================================================
-1. PREPARAR TRES SESIONES SOBRE EL SERVIDOR A
-============================================================
+Los pedidos recientes son:
 
-Abrir TRES terminales PowerShell.
-En cada una ejecutar la conexion al SERVIDOR A de 07.00.
+TABLA: negocio.pedidos
 
-Dentro de cada conexion, asignar su nombre.
+id    cliente_id    fecha         estado       total
+----------------------------------------------------
+101   1             2026-01-15    PENDIENTE    200
+102   2             2026-01-15    PAGADO       500
+103   1             2026-01-15    PAGADO       150
+104   3             2026-01-15    PAGADO       250
 
-SESION A - PSQL SOBRE SERVIDOR A
+RESULTADO INICIAL
 
-SET application_name='p7_sesion_A';
+Pedidos recientes: 4.
 
-SESION B - PSQL SOBRE SERVIDOR A
+Pedidos pagados: 3.
 
-SET application_name='p7_sesion_B';
+Importe total pagado: 900.
 
-SESION C - PSQL SOBRE SERVIDOR A
+CALCULO
 
-SET application_name='p7_sesion_C';
+Pedido 102: 500.
+Pedido 103: 150.
+Pedido 104: 250.
 
-La SESION C sera el observador.
-No confundir SESION B con SERVIDOR B.
+500 + 150 + 250 = 900.
 
-============================================================
-2. BEFORE - GUARDAR LA POSICION WAL
-============================================================
+El pedido 101 no participa porque continua PENDIENTE.
 
-SESION C - PSQL SOBRE SERVIDOR A
+SITUACION NUEVA
 
-SELECT pg_current_wal_lsn() AS wal_inicio \gset
+Ana realiza el pago del pedido 101 por 200.
 
-SELECT sum(total) AS venta_pagada
-FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+Un empleado comienza a registrar ese pago.
 
-RESULTADO ESPERADO: 900.
+Sin embargo, todavia no confirma su transaccion.
 
-La variable wal_inicio queda guardada en esta conexion psql.
-Conservar la SESION C hasta la comparacion final.
+Al mismo tiempo, otro empleado intenta actualizar
+el mismo pedido.
 
-============================================================
-3. CAMBIO SIN COMMIT
-============================================================
+Mientras ambas operaciones ocurren, un supervisor
+necesita consultar el importe total de pedidos pagados.
 
-SESION A - PSQL SOBRE SERVIDOR A
+Adicionalmente, PostgreSQL B debe conservar una copia
+de los cambios confirmados en el principal.
 
-BEGIN;
+======================================================================
+3. COMO EVOLUCIONARAN LOS DATOS
+======================================================================
 
-UPDATE negocio.pedidos
-SET estado='PAGADO'
-WHERE id=101;
+El ejercicio tendra tres estados principales.
 
-SELECT sum(total) AS venta_pagada
-FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+----------------------------------------------------------------------
+ESTADO 1 - BEFORE
+----------------------------------------------------------------------
 
-RESULTADO ESPERADO: 1100.
+Pedido 101:
 
-NO ejecutar COMMIT todavia.
+Estado: PENDIENTE.
+Importe: 200.
 
-INTERPRETACION
+Pedidos pagados: 3.
 
-A ve su propio cambio: 900 + 200.
-La transaccion sigue abierta y conserva el bloqueo.
+Venta pagada: 900.
 
-SESION C - PSQL SOBRE SERVIDOR A
+----------------------------------------------------------------------
+ESTADO 2 - PAGO DEL PEDIDO 101
+----------------------------------------------------------------------
 
-SELECT sum(total) AS venta_pagada
-FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+El pedido 101 cambia de:
 
-RESULTADO ESPERADO: 900.
+PENDIENTE
 
-Abrir una CUARTA terminal conectada al SERVIDOR B.
+a:
 
-SERVIDOR B - PSQL
+PAGADO
 
-SELECT sum(total) AS venta_pagada
-FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+El importe del pedido permanece en 200.
 
-RESULTADO ESPERADO: 900.
+Una vez confirmado el cambio, el reporte mostrara:
 
-No es necesario provocar retraso:
-el cambio no esta confirmado y no debe hacerse visible.
+Pedido 101: 200.
+Pedido 102: 500.
+Pedido 103: 150.
+Pedido 104: 250.
 
-============================================================
-4. GENERAR LA ESPERA
-============================================================
+200 + 500 + 150 + 250 = 1100.
 
-SESION B - PSQL SOBRE SERVIDOR A
+Pedidos pagados: 4.
 
-SET statement_timeout='5min';
+----------------------------------------------------------------------
+ESTADO 3 - NUEVO PEDIDO 105
+----------------------------------------------------------------------
 
-UPDATE negocio.pedidos
-SET estado='PAGADO'
-WHERE id=101;
+Se registra un nuevo pedido:
+
+ID: 105.
+Cliente: Luis.
+Estado: PAGADO.
+Importe: 100.
+
+El reporte mostrara:
+
+Pedido 101: 200.
+Pedido 102: 500.
+Pedido 103: 150.
+Pedido 104: 250.
+Pedido 105: 100.
+
+200 + 500 + 150 + 250 + 100 = 1200.
+
+Pedidos pagados: 5.
+
+IMPORTANTE
+
+Los 50000 pedidos historicos siguen existiendo.
+
+No participan en el calculo porque pertenecen
+a fechas distintas de 2026-01-15.
+
+El indice compuesto creado durante 07.01
+tambien permanece disponible.
+
+======================================================================
+4. ARQUITECTURA Y ORGANIZACION DE SESIONES
+======================================================================
+
+Utilizaremos las mismas dos instancias PostgreSQL.
+
+POSTGRESQL A
+
+Puerto: 5547.
+Rol: PRIMARY.
+Permite lecturas y escrituras.
+
+POSTGRESQL B
+
+Puerto: 5548.
+Rol: STANDBY.
+Permite consultas de solo lectura.
+
+Ambas funcionan dentro del contenedor Docker:
+
+p7-integrado-lab
+
+----------------------------------------------------------------------
+4.1. ORGANIZACION DE LAS TERMINALES
+----------------------------------------------------------------------
+
+Abriremos cuatro terminales PowerShell.
+
+TERMINAL 1 - SESION A
+
+Servidor: PostgreSQL A.
+Puerto: 5547.
+
+Representa al empleado que registra el pago del pedido 101.
+
+Mantendra una transaccion abierta hasta ejecutar COMMIT.
+
+TERMINAL 2 - SESION B
+
+Servidor: PostgreSQL A.
+Puerto: 5547.
+
+Representa a otro empleado que intenta modificar
+el mismo pedido 101.
+
+Su operacion quedara esperando el bloqueo de la sesion A.
+
+TERMINAL 3 - SESION C
+
+Servidor: PostgreSQL A.
+Puerto: 5547.
+
+Representa al DBA que observa las transacciones,
+consulta los bloqueos y verifica los resultados.
+
+Tambien utilizaremos esta sesion para registrar
+el nuevo pedido 105.
+
+TERMINAL 4 - STANDBY
+
+Servidor: PostgreSQL B.
+Puerto: 5548.
+
+Permite comprobar que informacion se encuentra
+disponible en la replica fisica.
+
+----------------------------------------------------------------------
+4.2. DIFERENCIA IMPORTANTE
+----------------------------------------------------------------------
+
+SESION B y POSTGRESQL B no representan lo mismo.
+
+SESION B:
+
+Es una conexion adicional al servidor principal A.
+
+POSTGRESQL B:
+
+Es la instancia standby que recibe WAL del principal.
+
+Durante los ejercicios identificaremos cada instruccion
+con la sesion y servidor correspondientes.
+
+----------------------------------------------------------------------
+4.3. REQUISITOS
+----------------------------------------------------------------------
+
+La practica 07.01 debe estar completada.
+
+El contenedor debe permanecer funcionando.
+
+PostgreSQL A debe ser PRIMARY.
+
+PostgreSQL B debe ser STANDBY.
+
+El indice pedidos_estado_fecha_idx debe existir
+en ambas instancias.
+
+El importe inicial de pedidos pagados debe ser 900.
+
+No reconstruiremos el ambiente antes de este escenario,
+porque necesitamos conservar el indice creado en 07.01.
+
+======================================================================
+5. CONECTAR LAS CUATRO TERMINALES
+======================================================================
+
+Los comandos de conexion se ejecutan desde PowerShell.
+
+Las instrucciones SQL posteriores se ejecutan dentro de psql.
+
+Los metacomandos de psql comienzan con una barra invertida.
+
+Por ejemplo:
+
+\q
+
+\gset
+
+\echo
+
+\!
+
+Cada metacomando debe ejecutarse respetando
+la sintaxis indicada en esta guia.
+
+----------------------------------------------------------------------
+PASO 5.1 - TERMINAL 1: CONECTAR LA SESION A
+----------------------------------------------------------------------
+
+En PowerShell:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5547 -U postgres -d nobleprog_integrado -P pager=off
+
+EXPLICACION
+
+docker exec:
+Ejecuta un programa dentro del contenedor.
+
+-it:
+Habilita una terminal interactiva.
+
+-u postgres:
+Utiliza el usuario Linux postgres.
+
+p7-integrado-lab:
+Identifica el contenedor del laboratorio.
+
+psql:
+Abre el cliente de PostgreSQL.
+
+-X:
+Evita cargar configuraciones personales de psql.
+
+-h 127.0.0.1:
+Establece el host dentro del contenedor.
+
+-p 5547:
+Selecciona PostgreSQL A.
+
+-U postgres:
+Establece el usuario de base de datos.
+
+-d nobleprog_integrado:
+Selecciona la base de datos del laboratorio.
+
+-P pager=off:
+Evita que las consultas utilicen un paginador.
+
+Una vez conectado, ejecutar:
+
+SET application_name = 'p7_sesion_A';
 
 RESULTADO ESPERADO
 
-El UPDATE queda esperando; no vuelve inmediatamente el prompt.
+SET
 
-No ejecutar otros comandos en esta sesion mientras espera.
-Continuar en la SESION C.
+EXPLICACION
 
-SESION C - PSQL SOBRE SERVIDOR A
+application_name identifica la conexion dentro de
+las vistas de monitoreo de PostgreSQL.
 
-SELECT pid,application_name,state,wait_event_type,wait_event,
+El nombre p7_sesion_A nos permitira localizar
+esta sesion cuando investiguemos los bloqueos.
+
+Esta operacion no modifica datos de negocio.
+
+----------------------------------------------------------------------
+PASO 5.2 - TERMINAL 2: CONECTAR LA SESION B
+----------------------------------------------------------------------
+
+Abrir otra terminal PowerShell.
+
+Ejecutar:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5547 -U postgres -d nobleprog_integrado -P pager=off
+
+Dentro de psql:
+
+SET application_name = 'p7_sesion_B';
+
+RESULTADO ESPERADO
+
+SET
+
+INTERPRETACION
+
+La sesion B tambien esta conectada al principal.
+
+Por tanto, A y B son dos conexiones diferentes
+que pueden ejecutar transacciones simultaneamente
+sobre la misma base de datos.
+
+----------------------------------------------------------------------
+PASO 5.3 - TERMINAL 3: CONECTAR LA SESION C
+----------------------------------------------------------------------
+
+Abrir otra terminal PowerShell.
+
+Ejecutar:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5547 -U postgres -d nobleprog_integrado -P pager=off
+
+Dentro de psql:
+
+SET application_name = 'p7_sesion_C';
+
+RESULTADO ESPERADO
+
+SET
+
+INTERPRETACION
+
+Esta conexion sera utilizada para observar
+el estado de las otras sesiones.
+
+La sesion C no participara inicialmente
+en las modificaciones del pedido 101.
+
+----------------------------------------------------------------------
+PASO 5.4 - TERMINAL 4: CONECTAR AL STANDBY
+----------------------------------------------------------------------
+
+Abrir la cuarta terminal PowerShell.
+
+Ejecutar:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5548 -U postgres -d nobleprog_integrado -P pager=off
+
+EXPLICACION
+
+La diferencia fundamental es:
+
+-p 5548
+
+Este puerto corresponde a PostgreSQL B.
+
+Dentro de psql:
+
+SELECT pg_is_in_recovery() AS es_standby;
+
+RESULTADO ESPERADO
+
+es_standby
+----------
+t
+
+INTERPRETACION
+
+El valor true confirma que la instancia B
+continua funcionando en modo standby.
+
+Las cuatro conexiones quedan preparadas.
+
+======================================================================
+6. BEFORE - COMPROBAR LOS DATOS EN AMBOS SERVIDORES
+======================================================================
+
+Antes de generar transacciones concurrentes,
+debemos confirmar que ambas instancias tienen
+el mismo estado de negocio.
+
+----------------------------------------------------------------------
+PASO 6.1 - CONSULTAR LOS PEDIDOS EN A
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT p.id,
+       c.nombre,
+       p.estado,
+       p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.fecha = DATE '2026-01-15'
+ORDER BY p.id;
+
+RESULTADO ESPERADO
+
+id    nombre    estado       total
+-----------------------------------
+101   Ana       PENDIENTE    200
+102   Luis      PAGADO       500
+103   Ana       PAGADO       150
+104   Maria     PAGADO       250
+
+INTERPRETACION
+
+El pedido 101 continua pendiente.
+
+Los otros tres pedidos estan pagados.
+
+Este es el estado inicial antes de generar
+la primera transaccion.
+
+----------------------------------------------------------------------
+PASO 6.2 - COMPROBAR EL IMPORTE EN A
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+3                  900
+
+----------------------------------------------------------------------
+PASO 6.3 - COMPROBAR EL IMPORTE EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+3                  900
+
+INTERPRETACION
+
+Las dos instancias muestran la misma informacion.
+
+Todavia no se han realizado modificaciones
+en este escenario.
+
+----------------------------------------------------------------------
+PASO 6.4 - COMPROBAR EL INDICE DE 07.01
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx') AS indice;
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx') AS indice;
+
+RESULTADO ESPERADO EN AMBAS
+
+indice
+--------------------------------
+pedidos_estado_fecha_idx
+
+INTERPRETACION
+
+El indice compuesto existe en ambos servidores.
+
+No necesitamos crearlo nuevamente.
+
+Lo conservaremos durante las operaciones
+de concurrencia y replicacion.
+
+======================================================================
+7. BEFORE - GUARDAR LA POSICION WAL INICIAL
+======================================================================
+
+Antes de modificar los pedidos, guardaremos una posicion
+WAL del servidor principal.
+
+Posteriormente podremos comprobar cuanto avanzo WAL
+durante las operaciones de este escenario.
+
+----------------------------------------------------------------------
+PASO 7.1 - OBTENER LA POSICION WAL
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT pg_current_wal_lsn() AS wal_inicio \gset
+
+IMPORTANTE
+
+Esta instruccion termina con \gset.
+
+No requiere agregar un punto y coma despues.
+
+EXPLICACION
+
+pg_current_wal_lsn():
+Devuelve una posicion actual dentro del flujo WAL.
+
+WAL significa Write-Ahead Log.
+
+PostgreSQL utiliza WAL para registrar informacion
+necesaria para recuperacion y replicacion.
+
+LSN significa Log Sequence Number.
+
+Un LSN identifica una posicion dentro del WAL.
+
+AS wal_inicio:
+Asigna el nombre wal_inicio a la columna obtenida.
+
+\gset:
+Es un metacomando de psql.
+
+Ejecuta la consulta y guarda sus columnas
+como variables dentro de la sesion actual de psql.
+
+En este caso se crea la variable:
+
+wal_inicio
+
+----------------------------------------------------------------------
+PASO 7.2 - COMPROBAR EL VALOR GUARDADO
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+\echo :wal_inicio
+
+RESULTADO ESPERADO
+
+Aparecera una posicion WAL.
+
+Ejemplo ilustrativo:
+
+0/2000100
+
+El valor concreto depende del estado del servidor.
+
+INTERPRETACION
+
+La variable wal_inicio conserva nuestra referencia.
+
+Al finalizar los cambios podremos compararla
+con la posicion WAL actual.
+
+IMPORTANTE
+
+La variable pertenece a la sesion C de psql.
+
+No se comparte automaticamente con otras sesiones.
+
+Conservar esta conexion abierta hasta el diagnostico AFTER.
+
+======================================================================
+8. CAMBIO - INICIAR UNA TRANSACCION SIN COMMIT
+======================================================================
+
+El empleado representado por la sesion A comienza
+a registrar el pago del pedido 101.
+
+El pedido tiene importe de 200.
+
+Actualmente su estado es PENDIENTE.
+
+Lo cambiaremos a PAGADO, pero no confirmaremos
+inmediatamente la transaccion.
+
+----------------------------------------------------------------------
+PASO 8.1 - INICIAR LA TRANSACCION
+----------------------------------------------------------------------
+
+SESION A - POSTGRESQL A
+
+BEGIN;
+
+RESULTADO ESPERADO
+
+BEGIN
+
+EXPLICACION
+
+BEGIN inicia una transaccion explicita.
+
+Las siguientes operaciones de esta conexion
+formaran parte de la misma transaccion.
+
+La transaccion continuara abierta hasta ejecutar:
+
+COMMIT
+
+o:
+
+ROLLBACK
+
+Mientras no se ejecute alguna de esas instrucciones,
+los cambios permanecen sin confirmar.
+
+----------------------------------------------------------------------
+PASO 8.2 - ACTUALIZAR EL PEDIDO 101
+----------------------------------------------------------------------
+
+SESION A - POSTGRESQL A
+
+UPDATE negocio.pedidos
+SET estado = 'PAGADO'
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+UPDATE 1
+
+EXPLICACION
+
+UPDATE:
+Modifica registros existentes.
+
+negocio.pedidos:
+Indica la tabla que sera modificada.
+
+SET estado = 'PAGADO':
+Asigna el nuevo estado.
+
+WHERE id = 101:
+Limita la operacion al pedido indicado.
+
+UPDATE 1:
+Significa que una fila fue actualizada.
+
+TRANSFORMACION
+
+ANTES
+
+id    cliente    estado       total
+-----------------------------------
+101   Ana        PENDIENTE    200
+
+DESPUES, DENTRO DE LA SESION A
+
+id    cliente    estado       total
+-----------------------------------
+101   Ana        PAGADO       200
+
+El importe permanece en 200.
+
+Solamente cambia el estado.
+
+IMPORTANTE
+
+La transaccion sigue abierta.
+
+Todavia no hemos ejecutado COMMIT.
+
+----------------------------------------------------------------------
+PASO 8.3 - CONSULTAR EL TOTAL DESDE LA SESION A
+----------------------------------------------------------------------
+
+SESION A - POSTGRESQL A
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+4                  1100
+
+EXPLICACION
+
+La sesion A puede observar sus propios cambios
+aunque todavia no los haya confirmado.
+
+El pedido 101 ahora participa en el reporte
+de esa misma transaccion.
+
+CALCULO
+
+200 + 500 + 150 + 250 = 1100.
+
+INTERPRETACION
+
+La sesion A observa cuatro pedidos pagados.
+
+Sin embargo, este resultado todavia no representa
+un cambio confirmado para las demas sesiones.
+
+======================================================================
+9. MVCC - OBSERVAR LOS CAMBIOS DESDE OTRAS CONEXIONES
+======================================================================
+
+Ahora investigaremos que informacion observan
+las conexiones que no realizaron el UPDATE.
+
+PostgreSQL utiliza MVCC:
+
+Multi-Version Concurrency Control.
+
+Este mecanismo permite mantener versiones de filas
+para proporcionar visibilidad consistente
+entre transacciones concurrentes.
+
+Una lectura ordinaria bajo READ COMMITTED
+no observa cambios sin confirmar de otra transaccion.
+
+----------------------------------------------------------------------
+PASO 9.1 - CONSULTAR DESDE LA SESION C
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT id,
+       estado,
+       total
+FROM negocio.pedidos
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+id     estado       total
+-------------------------
+101    PENDIENTE    200
+
+INTERPRETACION
+
+Aunque la sesion A ya ejecuto el UPDATE,
+la sesion C sigue observando PENDIENTE.
+
+La razon es que A todavia no ha ejecutado COMMIT.
+
+La sesion C observa una version confirmada
+del registro.
+
+----------------------------------------------------------------------
+PASO 9.2 - CONSULTAR EL TOTAL DESDE C
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+venta_pagada
+------------
+900
+
+INTERPRETACION
+
+La sesion C todavia no incorpora los 200
+del pedido 101.
+
+La diferencia entre A y C es:
+
+SESION A
+
+Pedido 101: PAGADO.
+
+Venta pagada: 1100.
+
+SESION C
+
+Pedido 101: PENDIENTE.
+
+Venta pagada: 900.
+
+Ambas sesiones utilizan PostgreSQL A.
+
+La diferencia proviene de la visibilidad
+de la transaccion, no de la replicacion.
+
+----------------------------------------------------------------------
+PASO 9.3 - CONSULTAR DESDE EL STANDBY
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT id,
+       estado,
+       total
+FROM negocio.pedidos
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+id     estado       total
+-------------------------
+101    PENDIENTE    200
+
+Ejecutar tambien:
+
+SELECT sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+venta_pagada
+------------
+900
+
+INTERPRETACION
+
+PostgreSQL B tampoco muestra el pago sin confirmar.
+
+La replicacion puede transmitir y reproducir
+informacion WAL generada antes de un COMMIT.
+
+Eso no significa que los cambios de una transaccion
+sin confirmar se vuelvan visibles para las consultas.
+
+----------------------------------------------------------------------
+PASO 9.4 - COMPARAR LAS TRES OBSERVACIONES
+----------------------------------------------------------------------
+
+ESTADO ACTUAL
+
+CONEXION       PEDIDO 101       VENTA PAGADA
+------------------------------------------------
+Sesion A       PAGADO           1100
+Sesion C       PENDIENTE        900
+PostgreSQL B   PENDIENTE        900
+
+CONCLUSION
+
+El mismo pedido puede observarse de forma diferente
+segun la transaccion desde la que se consulta.
+
+La sesion A observa su cambio sin confirmar.
+
+Las otras conexiones no lo observan.
+
+Esto demuestra el funcionamiento de MVCC.
+
+======================================================================
+10. CONCURRENCIA - PROVOCAR UN BLOQUEO
+======================================================================
+
+Ahora el segundo empleado intenta modificar
+el mismo pedido 101.
+
+La sesion A continua con su transaccion abierta.
+
+Por tanto, PostgreSQL debe coordinar ambas operaciones
+para evitar modificaciones incompatibles sobre la fila.
+
+----------------------------------------------------------------------
+PASO 10.1 - ESTABLECER UN LIMITE DE ESPERA
+----------------------------------------------------------------------
+
+SESION B - POSTGRESQL A
+
+SET statement_timeout = '5min';
+
+RESULTADO ESPERADO
+
+SET
+
+EXPLICACION
+
+statement_timeout establece el tiempo maximo permitido
+para la ejecucion de una sentencia SQL.
+
+En este caso:
+
+5min equivale a cinco minutos.
+
+Si la siguiente instruccion permanece esperando
+durante demasiado tiempo, PostgreSQL la cancelara.
+
+Esta configuracion solamente afecta a la sesion B.
+
+No cambia la configuracion global del servidor.
+
+----------------------------------------------------------------------
+PASO 10.2 - INTENTAR ACTUALIZAR EL PEDIDO 101
+----------------------------------------------------------------------
+
+SESION B - POSTGRESQL A
+
+UPDATE negocio.pedidos
+SET estado = 'PAGADO'
+WHERE id = 101;
+
+COMPORTAMIENTO ESPERADO
+
+La sentencia no termina inmediatamente.
+
+La sesion B permanece esperando.
+
+Todavia no aparece UPDATE 1.
+
+EXPLICACION
+
+La sesion A ya modifico el pedido 101.
+
+Su transaccion permanece abierta.
+
+La sesion B intenta modificar esa misma fila.
+
+PostgreSQL detecta que necesita esperar
+hasta que la transaccion A termine.
+
+Mientras A conserva el bloqueo incompatible,
+la actualizacion de B no puede completarse.
+
+IMPORTANTE
+
+La sesion B permanece ocupada con el UPDATE.
+
+Continuaremos las observaciones desde la sesion C.
+
+----------------------------------------------------------------------
+PASO 10.3 - COMPRENDER LA DIFERENCIA CON 07.01
+----------------------------------------------------------------------
+
+En 07.01 investigamos un problema de acceso a datos.
+
+PostgreSQL examinaba muchos pedidos para recuperar
+solamente los registros solicitados.
+
+Creamos un indice compuesto para mejorar el filtrado.
+
+Ahora tenemos una situacion diferente.
+
+La sesion B puede localizar el pedido 101.
+
+Sin embargo, no puede modificarlo inmediatamente
+porque otra transaccion conserva un bloqueo.
+
+Por tanto:
+
+Un indice puede mejorar la localizacion de una fila.
+
+Pero no elimina los bloqueos necesarios
+para mantener la consistencia de las transacciones.
+
+Esta distincion es fundamental durante
+el troubleshooting de consultas lentas.
+
+======================================================================
+11. DIAGNOSTICO - IDENTIFICAR LAS SESIONES
+======================================================================
+
+Desde la sesion C investigaremos que ocurre
+en PostgreSQL mientras B permanece esperando.
+
+----------------------------------------------------------------------
+PASO 11.1 - CONSULTAR PG_STAT_ACTIVITY
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT pid,
+       application_name,
+       state,
+       wait_event_type,
+       wait_event,
        pg_blocking_pids(pid) AS bloqueadores
 FROM pg_stat_activity
 WHERE application_name IN ('p7_sesion_A','p7_sesion_B')
 ORDER BY application_name;
 
+EXPLICACION
+
+pg_stat_activity:
+Vista estadistica que muestra informacion
+de las conexiones activas a PostgreSQL.
+
+pid:
+Identificador del proceso del servidor PostgreSQL
+que atiende la conexion.
+
+Cada sesion utiliza su propio proceso backend.
+
+application_name:
+Nombre asignado mediante SET application_name.
+
+state:
+Estado actual de la sesion.
+
+wait_event_type:
+Categoria del recurso o evento por el que
+se encuentra esperando el proceso.
+
+wait_event:
+Nombre especifico del evento de espera.
+
+pg_blocking_pids(pid):
+Devuelve los PID de los procesos que bloquean
+a la sesion consultada.
+
 RESULTADO ESPERADO
 
-A: idle in transaction.
-B: active, wait_event_type Lock.
-B identifica el PID de A entre sus bloqueadores.
-Es habitual observar wait_event transactionid.
+Los numeros PID varian en cada ejecucion.
 
-Consultar los locks:
+Ejemplo ilustrativo:
 
-SELECT l.pid,l.locktype,l.mode,l.granted
-FROM pg_locks l
-JOIN pg_stat_activity a USING(pid)
-WHERE a.application_name IN ('p7_sesion_A','p7_sesion_B')
-ORDER BY l.pid,l.granted;
+application_name   state                 wait_event_type
+--------------------------------------------------------
+p7_sesion_A        idle in transaction   Client
+p7_sesion_B        active                Lock
+
+INTERPRETACION DE A
+
+idle in transaction significa que la conexion
+permanece dentro de una transaccion abierta.
+
+La sesion A ya ejecuto su UPDATE y SELECT,
+pero todavia no ejecuto COMMIT.
+
+Por eso conserva el bloqueo del pedido 101.
+
+INTERPRETACION DE B
+
+active significa que la sesion esta ejecutando
+una sentencia SQL.
+
+wait_event_type = Lock indica que la sentencia
+se encuentra esperando un bloqueo.
+
+Es habitual que wait_event muestre:
+
+transactionid
+
+Esto indica que B esta esperando la finalizacion
+de una transaccion relacionada con la fila.
+
+El wait event especifico puede variar.
+
+----------------------------------------------------------------------
+PASO 11.2 - IDENTIFICAR QUIEN BLOQUEA A QUIEN
+----------------------------------------------------------------------
+
+En el resultado de pg_blocking_pids, la sesion B
+debe mostrar el PID de la sesion A.
+
+Ejemplo ilustrativo:
+
+SESION        PID        BLOQUEADORES
+--------------------------------------
+A             120        {}
+B             125        {120}
 
 INTERPRETACION
 
-granted=false significa que ese bloqueo esta solicitado
-y aun no fue concedido.
+La sesion B tiene PID 125.
 
-El indice de 07.01 ayuda a localizar datos.
-No permite saltarse un bloqueo incompatible.
+El arreglo {120} indica que espera un bloqueo
+relacionado con el proceso PID 120.
 
-Esto es una espera por lock, NO un deadlock:
-no existe un ciclo de dependencias.
+El PID 120 corresponde a la sesion A.
 
-RETO PARA LOS PARTICIPANTES
+Por tanto:
 
-Identificar quien bloquea y justificarlo con los PID.
-No concluir que A esta esperando a B porque B siga activo.
+A es la sesion bloqueadora.
 
-Si se agotan los cinco minutos:
-cancelar y revisar el estado antes de continuar.
-Si A sigue abierta, ejecutar ROLLBACK en A, salir de las
-sesiones y revisar la incidencia; no repetir cambios a ciegas.
+B es la sesion bloqueada.
 
-============================================================
-5. COMMIT Y TOTAL 1100
-============================================================
+No debemos confundir ambos papeles.
 
-SESION A - PSQL SOBRE SERVIDOR A
+======================================================================
+12. DIAGNOSTICO - INSPECCIONAR PG_LOCKS
+======================================================================
+
+pg_stat_activity nos permitio identificar
+la sesion que espera.
+
+Ahora utilizaremos pg_locks para examinar
+los bloqueos registrados por PostgreSQL.
+
+----------------------------------------------------------------------
+PASO 12.1 - CONSULTAR LOS BLOQUEOS
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT a.application_name,
+       l.pid,
+       l.locktype,
+       l.mode,
+       l.granted
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE a.application_name IN ('p7_sesion_A','p7_sesion_B')
+ORDER BY a.application_name, l.granted;
+
+EXPLICACION
+
+pg_locks:
+Vista que muestra informacion de bloqueos
+mantenidos o solicitados por procesos PostgreSQL.
+
+l.pid:
+Proceso relacionado con el bloqueo.
+
+l.locktype:
+Tipo de recurso sobre el que existe un bloqueo.
+
+Algunos ejemplos son:
+
+relation:
+Bloqueo relacionado con una tabla o indice.
+
+transactionid:
+Bloqueo relacionado con una transaccion.
+
+tuple:
+Bloqueo relacionado con una tupla.
+
+l.mode:
+Modalidad del bloqueo.
+
+Diferentes modalidades permiten o impiden
+determinadas operaciones concurrentes.
+
+l.granted:
+Indica si el bloqueo fue concedido.
+
+true:
+El bloqueo fue concedido.
+
+false:
+El proceso esta esperando obtenerlo.
+
+JOIN pg_stat_activity:
+Permite relacionar cada PID con el nombre
+de la sesion correspondiente.
+
+----------------------------------------------------------------------
+PASO 12.2 - INTERPRETAR EL RESULTADO
+----------------------------------------------------------------------
+
+Durante la espera esperamos encontrar bloqueos
+pertenecientes a las sesiones A y B.
+
+En particular, la sesion B debe tener al menos
+una solicitud de bloqueo aun no concedida.
+
+Por ejemplo:
+
+application_name    locktype       mode           granted
+----------------------------------------------------------------
+p7_sesion_A         transactionid  ExclusiveLock  t
+p7_sesion_B         transactionid  ShareLock      f
+
+Los valores son ilustrativos.
+
+El resultado completo puede contener varios
+bloqueos adicionales sobre tablas e indices.
+
+INTERPRETACION
+
+La sesion A mantiene una transaccion abierta.
+
+La sesion B necesita que esa transaccion termine
+antes de continuar con su actualizacion.
+
+El valor granted=false permite identificar
+una solicitud de bloqueo pendiente.
+
+----------------------------------------------------------------------
+PASO 12.3 - DIFERENCIAR LOCK Y DEADLOCK
+----------------------------------------------------------------------
+
+En este ejercicio tenemos una espera por lock.
+
+La sesion B espera a la sesion A.
+
+Sin embargo, la sesion A no esta esperando
+un recurso mantenido por B.
+
+Por tanto, no existe un ciclo de dependencias.
+
+ESTADO ACTUAL
+
+Sesion B espera a sesion A.
+
+Sesion A puede ejecutar COMMIT.
+
+Cuando A termine, B podra continuar.
+
+ESTO NO ES UN DEADLOCK.
+
+Un deadlock ocurre cuando dos o mas transacciones
+forman un ciclo de esperas que impide su avance.
+
+Ejemplo conceptual:
+
+Sesion A espera un recurso de B.
+
+Sesion B espera un recurso de A.
+
+En ese caso PostgreSQL puede detectar
+el deadlock y cancelar una de las transacciones.
+
+En nuestro escenario solamente existe
+una dependencia de B hacia A.
+
+----------------------------------------------------------------------
+PASO 12.4 - CONCLUSION DEL DIAGNOSTICO
+----------------------------------------------------------------------
+
+Ya identificamos el problema.
+
+La sesion B no esta esperando porque le falte
+el indice creado durante 07.01.
+
+Tampoco estamos observando necesariamente
+un problema de CPU o lectura de disco.
+
+La operacion se encuentra esperando
+a que otra transaccion libere un bloqueo.
+
+El diagnostico se obtiene combinando:
+
+pg_stat_activity.
+
+pg_blocking_pids().
+
+pg_locks.
+
+Esta informacion permite determinar
+que proceso bloquea y cual permanece esperando.
+
+======================================================================
+13. CAMBIO - CONFIRMAR LA TRANSACCION A
+======================================================================
+
+Ahora confirmaremos el cambio realizado
+sobre el pedido 101.
+
+Esta operacion permitira que la sesion B
+termine su actualizacion.
+
+----------------------------------------------------------------------
+PASO 13.1 - EJECUTAR COMMIT
+----------------------------------------------------------------------
+
+SESION A - POSTGRESQL A
 
 COMMIT;
 
-SESION B - PSQL SOBRE SERVIDOR A
+RESULTADO ESPERADO
 
-Esperar a que aparezca UPDATE 1.
-El UPDATE estaba fuera de BEGIN y se confirma automaticamente.
+COMMIT
+
+EXPLICACION
+
+COMMIT confirma los cambios de la transaccion.
+
+El pedido 101 queda confirmado con:
+
+estado = PAGADO.
+
+importe = 200.
+
+La confirmacion permite liberar
+los bloqueos mantenidos por la transaccion.
+
+Las otras sesiones podran observar el cambio
+en nuevas consultas bajo READ COMMITTED.
+
+----------------------------------------------------------------------
+PASO 13.2 - OBSERVAR LA SESION B
+----------------------------------------------------------------------
+
+REGRESAR A LA SESION B.
+
+La sentencia UPDATE que permanecia esperando
+debe terminar despues del COMMIT de A.
+
+RESULTADO ESPERADO
+
+UPDATE 1
+
+INTERPRETACION
+
+La sesion B logro completar su actualizacion.
+
+Como B ejecuto el UPDATE fuera de una transaccion
+explicita BEGIN, PostgreSQL utiliza autocommit.
+
+Por tanto, su sentencia queda confirmada
+cuando termina correctamente.
+
+IMPORTANTE
+
+La sesion B tambien asigno:
+
+estado = PAGADO
+
+No agrego otro pedido por 200.
+
+Tampoco incremento el importe existente.
+
+Simplemente volvio a establecer el mismo estado
+sobre el pedido 101.
+
+Por eso el total no pasa a 1300.
+
+Permanece en 1100.
+
+----------------------------------------------------------------------
+PASO 13.3 - RESTAURAR EL TIMEOUT DE LA SESION B
+----------------------------------------------------------------------
+
+SESION B - POSTGRESQL A
 
 RESET statement_timeout;
 
-SESION C - PSQL SOBRE SERVIDOR A
+RESULTADO ESPERADO
 
-SELECT sum(total) AS venta_pagada
+RESET
+
+EXPLICACION
+
+RESET restaura el valor del parametro
+statement_timeout para esta sesion.
+
+De esta forma, la configuracion temporal
+utilizada durante la espera deja de aplicarse.
+
+----------------------------------------------------------------------
+PASO 13.4 - COMPROBAR EL PEDIDO 101
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT id,
+       estado,
+       total
 FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+WHERE id = 101;
 
-RESULTADO ESPERADO: 1100.
+RESULTADO ESPERADO
 
-La sesion B asigno otra vez PAGADO.
-No sumo 200 adicionales: modifico el mismo estado del pedido.
+id     estado    total
+----------------------
+101    PAGADO    200
 
-DESDE UNA TERMINAL POWERSHELL ADICIONAL
+INTERPRETACION
 
-& {
-    $ErrorActionPreference = "Stop"
-    docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/00-sync-replica.sh
-    if ($LASTEXITCODE -ne 0) { throw "No se confirmo la sincronizacion." }
-}
+La modificacion ya esta confirmada.
 
-SERVIDOR B - PSQL
+Una nueva consulta desde C observa PAGADO.
 
-SELECT sum(total) AS venta_pagada
+----------------------------------------------------------------------
+PASO 13.5 - COMPROBAR EL NUEVO TOTAL
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
 FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
 
-RESULTADO ESPERADO: 1100.
+RESULTADO ESPERADO
 
-============================================================
-6. NUEVO PEDIDO Y TOTAL 1200
-============================================================
+pedidos_pagados    venta_pagada
+--------------------------------
+4                  1100
 
-SESION C - PSQL SOBRE SERVIDOR A
+CALCULO
+
+200 + 500 + 150 + 250 = 1100.
+
+INTERPRETACION
+
+El pedido 101 ahora participa en el reporte.
+
+La transaccion A fue confirmada.
+
+La actualizacion B tambien termino correctamente.
+
+======================================================================
+14. REPLICACION - COMPROBAR EL TOTAL DE 1100
+======================================================================
+
+Hasta ahora verificamos los cambios en PostgreSQL A.
+
+Ahora debemos comprobar que PostgreSQL B
+haya reproducido la informacion confirmada.
+
+----------------------------------------------------------------------
+PASO 14.1 - ESPERAR LA SINCRONIZACION
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+Ejecutar dentro de psql:
+
+\! bash /tmp/p7-integrado-scripts/aux-verify-standby-synchronization.sh
+
+EXPLICACION
+
+\!:
+Es un metacomando de psql que ejecuta una instruccion
+del sistema operativo donde esta funcionando psql.
+
+En este laboratorio psql se ejecuta dentro
+del contenedor Docker.
+
+bash:
+Ejecuta el script indicado.
+
+aux-verify-standby-synchronization.sh:
+Comprueba que B continua funcionando como standby
+y espera hasta que haya reproducido una posicion WAL de A.
+
+El script utiliza:
+
+pg_current_wal_lsn() en A.
+
+pg_last_wal_replay_lsn() en B.
+
+La sincronizacion se comprueba mediante una posicion WAL.
+
+RESULTADO ESPERADO
+
+PASS | Directorio de datos exclusivo
+PASS | Directorio de datos exclusivo
+PASS | B todavia standby
+PASS | B aplico el WAL confirmado en A
+
+INTERPRETACION
+
+La replica ha reproducido WAL al menos
+hasta la posicion utilizada por la comprobacion.
+
+Esto permite continuar con una lectura consistente
+de los cambios confirmados hasta esa referencia.
+
+----------------------------------------------------------------------
+PASO 14.2 - CONSULTAR EL PEDIDO EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT id,
+       estado,
+       total
+FROM negocio.pedidos
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+id     estado    total
+----------------------
+101    PAGADO    200
+
+INTERPRETACION
+
+El standby ya observa el cambio confirmado.
+
+No fue necesario ejecutar UPDATE en PostgreSQL B.
+
+La replica recibio y reprodujo el WAL
+generado por el servidor principal.
+
+----------------------------------------------------------------------
+PASO 14.3 - COMPROBAR EL REPORTE EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+4                  1100
+
+----------------------------------------------------------------------
+PASO 14.4 - COMPARACION
+----------------------------------------------------------------------
+
+SERVIDOR          PEDIDOS PAGADOS     VENTA PAGADA
+--------------------------------------------------
+PostgreSQL A      4                   1100
+PostgreSQL B      4                   1100
+
+CONCLUSION
+
+Ambos servidores reflejan los cambios confirmados.
+
+La replicacion fisica mantiene la informacion
+del standby alineada con el principal,
+hasta la posicion WAL que comprobamos.
+
+======================================================================
+15. NUEVO PEDIDO - REGISTRAR EL PEDIDO 105
+======================================================================
+
+Ahora realizaremos una segunda operacion de negocio.
+
+Luis registra un nuevo pedido pagado por 100.
+
+Este pedido no existia durante el escenario 07.01.
+
+----------------------------------------------------------------------
+PASO 15.1 - INSERTAR EL PEDIDO
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
 
 INSERT INTO negocio.pedidos
-VALUES(105,2,'2026-01-15','PAGADO',100);
+VALUES (105, 2, DATE '2026-01-15', 'PAGADO', 100);
 
-SELECT sum(total) AS venta_pagada
+RESULTADO ESPERADO
+
+INSERT 0 1
+
+EXPLICACION
+
+INSERT INTO:
+Agrega un registro nuevo.
+
+negocio.pedidos:
+Tabla donde se almacenara el registro.
+
+VALUES:
+Indica los valores de sus columnas.
+
+105:
+Identificador del pedido.
+
+2:
+Identificador del cliente Luis.
+
+DATE '2026-01-15':
+Fecha del pedido.
+
+PAGADO:
+Estado inicial del pedido.
+
+100:
+Importe del pedido.
+
+INSERT 0 1:
+Confirma que se inserto una fila.
+
+Esta sentencia se ejecuta sin BEGIN explicito.
+
+Por tanto, se confirma automaticamente
+cuando termina correctamente.
+
+----------------------------------------------------------------------
+PASO 15.2 - CONSULTAR LOS PEDIDOS
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT p.id,
+       c.nombre,
+       p.estado,
+       p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.fecha = DATE '2026-01-15'
+ORDER BY p.id;
+
+RESULTADO ESPERADO
+
+id    nombre    estado    total
+--------------------------------
+101   Ana       PAGADO    200
+102   Luis      PAGADO    500
+103   Ana       PAGADO    150
+104   Maria     PAGADO    250
+105   Luis      PAGADO    100
+
+INTERPRETACION
+
+Ahora existen cinco pedidos recientes.
+
+Todos tienen estado PAGADO.
+
+----------------------------------------------------------------------
+PASO 15.3 - CONSULTAR EL NUEVO TOTAL
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
 FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
 
-RESULTADO ESPERADO: 1200.
+RESULTADO ESPERADO
 
-Volver a ejecutar el bloque PowerShell de sincronizacion
-del apartado anterior.
+pedidos_pagados    venta_pagada
+--------------------------------
+5                  1200
 
-SERVIDOR B - PSQL
+CALCULO
 
-SELECT sum(total) AS venta_pagada
+200 + 500 + 150 + 250 + 100 = 1200.
+
+TRANSFORMACION
+
+ANTES DEL PEDIDO 105
+
+Pedidos pagados: 4.
+
+Total: 1100.
+
+DESPUES DEL PEDIDO 105
+
+Pedidos pagados: 5.
+
+Total: 1200.
+
+----------------------------------------------------------------------
+PASO 15.4 - COMPROBAR EL REPORTE AGRUPADO
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT c.nombre,
+       count(*) AS pedidos_pagados,
+       sum(p.total) AS total
+FROM negocio.clientes c
+JOIN negocio.pedidos p ON p.cliente_id = c.id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+GROUP BY c.id, c.nombre
+ORDER BY c.nombre;
+
+RESULTADO ESPERADO
+
+nombre   pedidos_pagados   total
+---------------------------------
+Ana      2                 350
+Luis     2                 600
+Maria    1                 250
+
+INTERPRETACION
+
+Ana tiene los pedidos 101 y 103.
+
+200 + 150 = 350.
+
+Luis tiene los pedidos 102 y 105.
+
+500 + 100 = 600.
+
+Maria tiene el pedido 104.
+
+250.
+
+TOTAL GENERAL
+
+350 + 600 + 250 = 1200.
+
+Este resultado demuestra que el nuevo pedido
+esta relacionado correctamente con Luis.
+
+======================================================================
+16. REPLICACION - SINCRONIZAR EL PEDIDO 105
+======================================================================
+
+Ahora comprobaremos que PostgreSQL B recibe
+la segunda modificacion confirmada.
+
+----------------------------------------------------------------------
+PASO 16.1 - ESPERAR LA REPRODUCCION WAL
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+\! bash /tmp/p7-integrado-scripts/aux-verify-standby-synchronization.sh
+
+RESULTADO ESPERADO
+
+PASS | Directorio de datos exclusivo
+PASS | Directorio de datos exclusivo
+PASS | B todavia standby
+PASS | B aplico el WAL confirmado en A
+
+INTERPRETACION
+
+PostgreSQL B ha reproducido WAL
+hasta la posicion objetivo.
+
+El nuevo pedido debe encontrarse disponible
+para consultas de solo lectura.
+
+----------------------------------------------------------------------
+PASO 16.2 - CONSULTAR EL PEDIDO 105 EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT id,
+       cliente_id,
+       fecha,
+       estado,
+       total
 FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
+WHERE id = 105;
 
-RESULTADO ESPERADO: 1200.
+RESULTADO ESPERADO
 
-La espera explicita hace reproducible la comprobacion.
-Sin ella, ambos valores podrian coincidir inmediatamente
-o B podria mostrar temporalmente un estado anterior.
+id    cliente_id    fecha         estado    total
+-------------------------------------------------
+105   2             2026-01-15    PAGADO    100
 
-============================================================
-7. AFTER - WAL Y ESTADO DE LA REPLICACION
-============================================================
+INTERPRETACION
 
-SESION C - PSQL SOBRE SERVIDOR A
+El pedido fue insertado en A.
+
+PostgreSQL B recibio la informacion
+mediante replicacion fisica.
+
+No ejecutamos un INSERT sobre B.
+
+----------------------------------------------------------------------
+PASO 16.3 - COMPROBAR EL TOTAL EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+5                  1200
+
+----------------------------------------------------------------------
+PASO 16.4 - COMPRENDER EL RETRASO DE REPLICACION
+----------------------------------------------------------------------
+
+La replicacion de este laboratorio es asincrona.
+
+Esto significa que PostgreSQL A puede confirmar
+una transaccion sin esperar a que B haya reproducido
+todos los cambios correspondientes.
+
+Por ejemplo, inmediatamente despues de insertar
+el pedido 105 podria ocurrir lo siguiente:
+
+SERVIDOR          TOTAL
+-----------------------
+PostgreSQL A      1200
+PostgreSQL B      1100
+
+Si B todavia no ha reproducido el cambio,
+puede mostrar temporalmente el total anterior.
+
+Cuando alcanza el WAL correspondiente:
+
+SERVIDOR          TOTAL
+-----------------------
+PostgreSQL A      1200
+PostgreSQL B      1200
+
+IMPORTANTE
+
+Este retraso es un comportamiento posible.
+
+No significa que necesariamente lo observaremos
+durante la ejecucion del laboratorio.
+
+Si B reproduce el WAL rapidamente,
+ambos servidores pueden mostrar directamente 1200.
+
+Por eso utilizamos una comprobacion explicita
+de la posicion WAL antes de validar los resultados.
+
+======================================================================
+17. AFTER - MEDIR EL AVANCE DE WAL
+======================================================================
+
+Ya realizamos varias modificaciones confirmadas.
+
+Ahora compararemos la posicion WAL actual
+con la posicion guardada antes de los cambios.
+
+----------------------------------------------------------------------
+PASO 17.1 - CONSULTAR EL AVANCE WAL
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
 
 SELECT pg_wal_lsn_diff(
-    pg_current_wal_lsn(), :'wal_inicio'::pg_lsn
+    pg_current_wal_lsn(),
+    :'wal_inicio'::pg_lsn
 ) AS avance_wal_bytes;
 
-SELECT application_name,state,sync_state,sent_lsn,replay_lsn
+EXPLICACION
+
+pg_current_wal_lsn():
+Obtiene una posicion WAL actual del principal.
+
+:'wal_inicio':
+Recupera el valor guardado anteriormente
+en la variable de psql wal_inicio.
+
+La notacion con dos puntos permite utilizar
+una variable de psql dentro de una consulta.
+
+::pg_lsn:
+Convierte ese valor al tipo PostgreSQL pg_lsn.
+
+pg_wal_lsn_diff():
+Calcula la diferencia entre dos posiciones WAL.
+
+El resultado se expresa en bytes.
+
+AS avance_wal_bytes:
+Asigna un nombre descriptivo al resultado.
+
+RESULTADO ESPERADO
+
+Un valor positivo.
+
+Ejemplo ilustrativo:
+
+avance_wal_bytes
+----------------
+24576
+
+La cifra exacta puede ser diferente.
+
+INTERPRETACION
+
+El WAL avanzo desde la posicion inicial.
+
+Durante el intervalo ocurrieron:
+
+- Actualizacion del pedido 101.
+- Confirmacion de la transaccion A.
+- Actualizacion realizada por la sesion B.
+- Insercion del pedido 105.
+- Otras operaciones propias de PostgreSQL.
+
+IMPORTANTE
+
+La diferencia WAL no representa exclusivamente
+el tamaño del pedido 105.
+
+Puede incluir informacion adicional generada
+por las operaciones realizadas durante el intervalo.
+
+----------------------------------------------------------------------
+PASO 17.2 - CONSULTAR PG_STAT_WAL
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT wal_records,
+       wal_fpi,
+       wal_bytes
+FROM pg_stat_wal;
+
+EXPLICACION
+
+pg_stat_wal:
+Vista que contiene estadisticas acumuladas
+relacionadas con la actividad WAL.
+
+wal_records:
+Cantidad de registros WAL generados.
+
+wal_fpi:
+Cantidad de imagenes completas de pagina
+registradas en WAL.
+
+wal_bytes:
+Cantidad acumulada de bytes WAL generados.
+
+RESULTADO ESPERADO
+
+Valores numericos correspondientes
+a la actividad acumulada de la instancia.
+
+INTERPRETACION
+
+Estas estadisticas no pertenecen exclusivamente
+a nuestro pedido 101 o 105.
+
+Son contadores acumulados del servidor.
+
+Su objetivo es observar la actividad WAL
+desde la perspectiva de monitoreo.
+
+======================================================================
+18. AFTER - OBSERVAR WAL SENDER
+======================================================================
+
+PostgreSQL A envia WAL hacia PostgreSQL B.
+
+El proceso encargado de transmitirlo
+se conoce como WAL Sender.
+
+Podemos observarlo mediante pg_stat_replication.
+
+----------------------------------------------------------------------
+PASO 18.1 - CONSULTAR PG_STAT_REPLICATION
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT application_name,
+       state,
+       sync_state,
+       sent_lsn,
+       replay_lsn
 FROM pg_stat_replication;
 
-SELECT slot_name,slot_type,active,restart_lsn
-FROM pg_replication_slots;
+EXPLICACION
 
-SELECT * FROM pg_stat_checkpointer;
+pg_stat_replication:
+Vista del principal que muestra informacion
+de las conexiones de replicacion.
+
+application_name:
+Nombre asignado a la conexion standby.
+
+state:
+Estado del proceso WAL Sender.
+
+sync_state:
+Modalidad de sincronizacion de la conexion.
+
+sent_lsn:
+Posicion WAL enviada al standby.
+
+replay_lsn:
+Posicion WAL que el standby ha informado
+como reproducida.
 
 RESULTADO ESPERADO
 
-Avance WAL positivo.
-Conexion de B en streaming, sync_state async.
-Slot integrado_b fisico y activo.
+application_name: integrado_B.
 
-El avance WAL incluye la actividad registrada durante
-el intervalo; no es el tamano exacto del pedido 105.
+state: streaming.
 
-pg_stat_checkpointer ofrece contadores acumulados.
-Esta consulta no demuestra que una escritura concreta
-haya provocado un checkpoint.
+sync_state: async.
 
-SERVIDOR B - PSQL
+Los campos LSN deben mostrar posiciones validas.
 
-SELECT status,sender_host,sender_port
+INTERPRETACION
+
+streaming indica que el proceso WAL Sender
+se encuentra transmitiendo WAL.
+
+async indica replicacion asincrona.
+
+sent_lsn representa el avance del envio.
+
+replay_lsn representa el avance de aplicacion
+reportado por el standby.
+
+----------------------------------------------------------------------
+PASO 18.2 - INTERPRETAR POSICIONES WAL
+----------------------------------------------------------------------
+
+Ejemplo ilustrativo:
+
+sent_lsn:
+
+0/3000200
+
+replay_lsn:
+
+0/3000100
+
+En este ejemplo, el standby aun no ha reportado
+la reproduccion de todo el WAL enviado.
+
+Cuando replay_lsn alcanza la posicion enviada,
+la diferencia observada desaparece.
+
+Estas posiciones cambian continuamente
+segun la actividad del servidor.
+
+El objetivo es comprender la relacion entre:
+
+WAL generado.
+
+WAL enviado.
+
+WAL recibido.
+
+WAL reproducido.
+
+======================================================================
+19. AFTER - OBSERVAR WAL RECEIVER
+======================================================================
+
+PostgreSQL B utiliza un proceso WAL Receiver
+para recibir la informacion enviada por A.
+
+Ahora observaremos ese proceso desde el standby.
+
+----------------------------------------------------------------------
+PASO 19.1 - CONSULTAR PG_STAT_WAL_RECEIVER
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT status,
+       sender_host,
+       sender_port,
+       received_lsn,
+       latest_end_lsn
 FROM pg_stat_wal_receiver;
 
+EXPLICACION
+
+pg_stat_wal_receiver:
+Vista que muestra informacion del proceso
+que recibe WAL desde el servidor origen.
+
+status:
+Estado del WAL Receiver.
+
+sender_host:
+Direccion del servidor al que se conecta.
+
+sender_port:
+Puerto del servidor origen.
+
+received_lsn:
+Posicion WAL recibida y registrada por el receptor.
+
+latest_end_lsn:
+Ultima posicion de fin WAL informada
+por el servidor emisor.
+
 RESULTADO ESPERADO
 
-streaming, 127.0.0.1, 5547.
+status: streaming.
 
-============================================================
-8. CIERRE Y CONEXION CON 07.03
-============================================================
+sender_host: 127.0.0.1.
 
-En A y B comprobar el total reciente 1200.
-No borrar el pedido 105 ni retirar el indice.
+sender_port: 5547.
 
-Salir con \q de las CUATRO conexiones.
-Esto cierra las sesiones del ejercicio y elimina los
-ajustes de sesion; el indice y datos se conservan.
+Los campos LSN contienen posiciones WAL.
 
-COMPARACION CON ORACLE
+INTERPRETACION
 
-En ambos motores una transaccion puede impedir el avance
-de otra operacion incompatible.
+PostgreSQL B mantiene una conexion activa
+con PostgreSQL A.
 
-Las vistas, tipos de espera y mecanismos internos difieren.
-pg_stat_activity y pg_locks se usan aqui para observar PostgreSQL.
-No trasladar literalmente sus nombres a Oracle.
+El WAL Receiver recibe informacion del principal
+para que el standby pueda continuar su recuperacion.
 
-El transporte y aplicacion de redo en Data Guard aportan
-una referencia conceptual para distinguir envio y aplicacion
-de WAL en PostgreSQL.
+La vista se consulta desde PostgreSQL B.
 
-FUENTES
+En el servidor principal utilizamos
+pg_stat_replication para observar el WAL Sender.
 
-https://www.postgresql.org/docs/18/monitoring-stats.html
-https://www.postgresql.org/docs/18/warm-standby.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/sbydb/managing-oracle-data-guard-physical-standby-databases.html
+======================================================================
+20. AFTER - OBSERVAR REPLICATION SLOTS
+======================================================================
+
+Durante la preparacion del laboratorio
+se creo un replication slot fisico.
+
+Este mecanismo ayuda a administrar la retencion
+de WAL necesario para una replica.
+
+----------------------------------------------------------------------
+PASO 20.1 - CONSULTAR PG_REPLICATION_SLOTS
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT slot_name,
+       slot_type,
+       active,
+       restart_lsn
+FROM pg_replication_slots;
+
+EXPLICACION
+
+pg_replication_slots:
+Vista que muestra los replication slots existentes
+en la instancia PostgreSQL.
+
+slot_name:
+Nombre del replication slot.
+
+slot_type:
+Tipo de slot.
+
+physical:
+Corresponde a replicacion fisica.
+
+logical:
+Corresponde a replicacion logica.
+
+active:
+Indica si el slot esta siendo utilizado
+por un consumidor activo.
+
+restart_lsn:
+Posicion WAL mas antigua que puede necesitarse
+conservar para ese slot.
+
+RESULTADO ESPERADO
+
+slot_name: integrado_b.
+
+slot_type: physical.
+
+active: true.
+
+restart_lsn: posicion WAL correspondiente al slot.
+
+INTERPRETACION
+
+El slot integrado_b pertenece a la replicacion
+fisica configurada para PostgreSQL B.
+
+El slot permite mantener una referencia
+sobre el WAL que puede necesitar el consumidor.
+
+IMPORTANTE
+
+Un replication slot no garantiza retraso cero.
+
+Tampoco garantiza por si solo que sea imposible
+perder datos ante cualquier escenario de falla.
+
+La retencion de WAL esta sujeta a los limites
+y condiciones configurados en PostgreSQL.
+
+======================================================================
+21. AFTER - OBSERVAR CHECKPOINTS
+======================================================================
+
+WAL y checkpoints estan relacionados
+con los mecanismos de persistencia y recuperacion.
+
+Un checkpoint permite establecer un punto
+de referencia para las operaciones de recuperacion.
+
+Durante el laboratorio podemos observar
+las estadisticas correspondientes.
+
+----------------------------------------------------------------------
+PASO 21.1 - CONSULTAR PG_STAT_CHECKPOINTER
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT *
+FROM pg_stat_checkpointer;
+
+EXPLICACION
+
+pg_stat_checkpointer:
+Vista que contiene estadisticas acumuladas
+del proceso encargado de los checkpoints.
+
+Permite observar informacion sobre:
+
+- Checkpoints ejecutados.
+- Checkpoints solicitados.
+- Tiempo dedicado a escritura.
+- Tiempo dedicado a sincronizacion.
+- Buffers escritos durante checkpoints.
+
+Las columnas concretas corresponden
+a las estadisticas expuestas por PostgreSQL 18.
+
+RESULTADO ESPERADO
+
+Una fila con los contadores de la instancia.
+
+INTERPRETACION
+
+Los valores representan actividad acumulada
+del servidor PostgreSQL.
+
+No podemos concluir que el INSERT del pedido 105
+provoco directamente un checkpoint.
+
+Para establecer esa relacion necesitariamos
+mediciones especificas antes y despues,
+junto con un analisis del contexto.
+
+En este laboratorio utilizaremos la vista
+como herramienta de observacion.
+
+======================================================================
+22. AFTER - OBSERVAR ESTADISTICAS DE CONSULTAS
+======================================================================
+
+Durante el escenario 07.01 utilizamos
+pg_stat_statements para analizar las consultas.
+
+Ahora comprobaremos que el reporte optimizado
+continua funcionando despues de las modificaciones.
+
+----------------------------------------------------------------------
+PASO 22.1 - EJECUTAR EL REPORTE
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+\i /tmp/p7-integrado-scripts/aux-report-paid-orders-by-customer.sql
+
+RESULTADO ESPERADO
+
+nombre   pedidos_pagados   total
+---------------------------------
+Ana      2                 350
+Luis     2                 600
+Maria    1                 250
+
+Ejecutar una segunda vez:
+
+\i /tmp/p7-integrado-scripts/aux-report-paid-orders-by-customer.sql
+
+EXPLICACION
+
+\i ejecuta el archivo SQL indicado.
+
+El archivo contiene el reporte agrupado
+de pedidos pagados por cliente.
+
+Cada ejecucion consulta los datos actuales.
+
+El indice creado en 07.01 permanece disponible
+para que el optimizador lo utilice cuando convenga.
+
+----------------------------------------------------------------------
+PASO 22.2 - CONSULTAR PG_STAT_STATEMENTS
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT calls,
+       rows,
+       round(total_exec_time::numeric, 3) AS total_ms,
+       shared_blks_hit,
+       shared_blks_read,
+       left(query, 100) AS consulta
+FROM pg_stat_statements
+WHERE query ILIKE '%negocio.pedidos%'
+  AND query ILIKE '%negocio.clientes%'
+ORDER BY total_exec_time DESC
+LIMIT 10;
+
+EXPLICACION
+
+pg_stat_statements:
+Contiene estadisticas acumuladas de consultas SQL.
+
+calls:
+Cantidad de ejecuciones registradas.
+
+rows:
+Cantidad acumulada de filas producidas o afectadas.
+
+total_exec_time:
+Tiempo total acumulado de ejecucion.
+
+shared_blks_hit:
+Accesos a bloques encontrados en buffers compartidos.
+
+shared_blks_read:
+Bloques leidos hacia los buffers compartidos.
+
+left(query, 100):
+Limita la longitud del texto presentado.
+
+ILIKE:
+Permite buscar texto sin distinguir mayusculas
+de minusculas.
+
+ORDER BY total_exec_time DESC:
+Ordena las consultas segun su tiempo acumulado.
+
+LIMIT 10:
+Muestra hasta diez registros.
+
+RESULTADO ESPERADO
+
+Deben aparecer estadisticas de las consultas
+que coincidan con los filtros indicados.
+
+Las consultas pueden aparecer normalizadas,
+con parametros en lugar de literales SQL.
+
+INTERPRETACION
+
+El reporte continua devolviendo resultados correctos.
+
+Las estadisticas permiten observar
+su comportamiento acumulado.
+
+No debemos interpretar un mayor total_exec_time
+como evidencia automatica de degradacion.
+
+Tambien puede aumentar simplemente porque
+una consulta se ejecuto mas veces.
+
+======================================================================
+23. AFTER - VERIFICACION FINAL DE LOS DATOS
+======================================================================
+
+Antes de continuar con el escenario 07.03,
+comprobaremos que ambos servidores mantienen
+los resultados esperados.
+
+----------------------------------------------------------------------
+PASO 23.1 - VERIFICAR PEDIDOS EN A
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT p.id,
+       c.nombre,
+       p.estado,
+       p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.fecha = DATE '2026-01-15'
+ORDER BY p.id;
+
+RESULTADO ESPERADO
+
+id    nombre    estado    total
+--------------------------------
+101   Ana       PAGADO    200
+102   Luis      PAGADO    500
+103   Ana       PAGADO    150
+104   Maria     PAGADO    250
+105   Luis      PAGADO    100
+
+----------------------------------------------------------------------
+PASO 23.2 - VERIFICAR EL TOTAL EN A
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+5                  1200
+
+----------------------------------------------------------------------
+PASO 23.3 - VERIFICAR EL TOTAL EN B
+----------------------------------------------------------------------
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+5                  1200
+
+----------------------------------------------------------------------
+PASO 23.4 - VERIFICAR EL INDICE EN AMBOS
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx') AS indice;
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx') AS indice;
+
+RESULTADO ESPERADO EN AMBOS
+
+indice
+--------------------------------
+pedidos_estado_fecha_idx
+
+INTERPRETACION
+
+El indice compuesto continua disponible.
+
+Las operaciones sobre los pedidos
+no eliminaron la optimizacion de 07.01.
+
+----------------------------------------------------------------------
+PASO 23.5 - COMPROBAR LOS ROLES
+----------------------------------------------------------------------
+
+SESION C - POSTGRESQL A
+
+SELECT pg_is_in_recovery() AS en_recuperacion;
+
+RESULTADO ESPERADO
+
+f
+
+TERMINAL 4 - POSTGRESQL B
+
+SELECT pg_is_in_recovery() AS en_recuperacion;
+
+RESULTADO ESPERADO
+
+t
+
+INTERPRETACION
+
+PostgreSQL A continua siendo PRIMARY.
+
+PostgreSQL B continua siendo STANDBY.
+
+La promocion se realizara en el escenario 07.03.
+
+======================================================================
+24. COMPARACION GENERAL BEFORE Y AFTER
+======================================================================
+
+ESTADO DE NEGOCIO
+
+ELEMENTO                  BEFORE       AFTER
+------------------------------------------------
+Pedidos recientes         4            5
+Pedidos pagados           3            5
+Venta pagada              900          1200
+Pedido 101                PENDIENTE    PAGADO
+Pedido 105                Ausente      PAGADO
+Indice compuesto          Presente     Presente
+
+TRANSACCIONES
+
+ANTES
+
+No existia una transaccion abierta
+modificando el pedido 101.
+
+DURANTE
+
+La sesion A modifico el pedido 101
+sin ejecutar COMMIT.
+
+La sesion B intento modificar la misma fila
+y permanecio esperando.
+
+DESPUES
+
+La sesion A confirmo su transaccion.
+
+La sesion B pudo continuar y finalizar.
+
+Los cambios quedaron confirmados.
+
+REPLICACION
+
+ANTES
+
+A y B reportaban 900.
+
+DESPUES DEL PRIMER COMMIT
+
+A y B reportaban 1100
+tras comprobar la sincronizacion.
+
+DESPUES DEL PEDIDO 105
+
+A y B reportaban 1200
+tras comprobar la sincronizacion.
+
+WAL
+
+Registramos una posicion inicial.
+
+Al finalizar, comprobamos que WAL avanzo.
+
+La replicacion fisica reprodujo
+los cambios confirmados en B.
+
+======================================================================
+25. CIERRE Y CONTINUIDAD CON EL ESCENARIO 07.03
+======================================================================
+
+El laboratorio integrado utiliza los mismos
+servidores y registros durante los tres escenarios.
+
+Por tanto, NO restauraremos el ambiente
+despues de completar 07.02.
+
+Debemos conservar:
+
+- PostgreSQL A como PRIMARY.
+- PostgreSQL B como STANDBY.
+- El pedido 101 en estado PAGADO.
+- El pedido 105 registrado y PAGADO.
+- Cinco pedidos recientes pagados.
+- Importe total de 1200.
+- El indice compuesto en ambos servidores.
+- Replicacion fisica funcionando.
+
+----------------------------------------------------------------------
+PASO 25.1 - CERRAR LAS CONEXIONES
+----------------------------------------------------------------------
+
+SESION A
+
+\q
+
+SESION B
+
+\q
+
+SESION C
+
+\q
+
+TERMINAL 4 - POSTGRESQL B
+
+\q
+
+EXPLICACION
+
+\q termina una sesion interactiva de psql.
+
+No detiene PostgreSQL.
+
+No elimina el contenedor Docker.
+
+No elimina las tablas ni los registros.
+
+No elimina el indice compuesto.
+
+Los servidores permanecen funcionando.
+
+----------------------------------------------------------------------
+PASO 25.2 - CONEXION CON EL ESCENARIO 07.03
+----------------------------------------------------------------------
+
+La empresa ya cuenta con:
+
+Una consulta optimizada.
+
+Un indice replicado.
+
+Datos confirmados y sincronizados.
+
+Un servidor principal.
+
+Un servidor standby.
+
+Sin embargo, aparece un nuevo problema.
+
+PostgreSQL A deja de estar disponible.
+
+La empresa necesita continuar consultando
+y registrando pedidos.
+
+Durante el escenario 07.03 realizaremos:
+
+1. Comprobacion del estado inicial.
+2. Simulacion de falla de PostgreSQL A.
+3. Promocion de PostgreSQL B.
+4. Verificacion de los datos existentes.
+5. Confirmacion de que el indice se conserva.
+6. Registro del pedido 106 por 300.
+7. Comprobacion del total final de 1500.
+8. Verificacion de la continuidad del servicio.
+
+PUNTO DE PARTIDA DEL SIGUIENTE ESCENARIO
+
+PostgreSQL A: PRIMARY.
+
+PostgreSQL B: STANDBY.
+
+Pedido 101: PAGADO, 200.
+
+Pedido 105: PAGADO, 100.
+
+Pedidos pagados: 5.
+
+Importe pagado: 1200.
+
+Indice compuesto: presente en A y B.
+
+Replicacion fisica: funcionando.
+
+======================================================================
+26. CONCLUSIONES DEL ESCENARIO
+======================================================================
+
+Durante este ejercicio comprobamos que:
+
+1. Una transaccion puede modificar datos sin confirmarlos.
+
+2. Una sesion puede observar sus propios cambios
+   antes de ejecutar COMMIT.
+
+3. Otras sesiones no observan cambios sin confirmar
+   mediante lecturas ordinarias bajo READ COMMITTED.
+
+4. Una actualizacion puede quedar esperando
+   un bloqueo mantenido por otra transaccion.
+
+5. pg_stat_activity permite identificar
+   sesiones, estados y wait events.
+
+6. pg_blocking_pids permite identificar
+   los procesos bloqueadores.
+
+7. pg_locks permite observar bloqueos
+   solicitados y concedidos.
+
+8. Una espera por lock no constituye
+   necesariamente un deadlock.
+
+9. Un indice no elimina la necesidad
+   de coordinar modificaciones concurrentes.
+
+10. COMMIT confirma los cambios de una transaccion.
+
+11. WAL registra informacion utilizada
+    para recuperacion y replicacion.
+
+12. La replicacion fisica permite que B
+    reproduzca los cambios confirmados en A.
+
+13. La replicacion asincrona puede presentar
+    retrasos temporales de aplicacion.
+
+14. WAL Sender y WAL Receiver permiten
+    observar ambos extremos de la replicacion.
+
+15. Los replication slots ayudan a gestionar
+    la retencion del WAL requerido.
+
+16. Las estadisticas de PostgreSQL permiten
+    investigar consultas, WAL y checkpoints.
+
+17. El indice creado durante 07.01
+    permanece disponible durante 07.02.
+
+18. El estado final de negocio es consistente:
+    cinco pedidos pagados por un total de 1200.
+
+CONCLUSION PRINCIPAL
+
+Una operacion que tarda demasiado puede estar
+consumiendo recursos o esperando un bloqueo.
+
+El diagnostico de un DBA debe identificar
+la causa antes de intentar optimizarla.
+
+Adicionalmente, un cambio de datos confirmado
+debe poder comprobarse tanto en el principal
+como en la replica fisica.
+
+======================================================================
+FIN DE LA PRACTICA 07.02
+======================================================================

@@ -1,340 +1,1540 @@
-PRACTICA 07.01 - CONSULTA LENTA Y REPLICA
-Modulos 6 y 7: Performance Tuning y Replicacion
-PostgreSQL DBA Administration
+PRACTICA 07.01 - DIAGNOSTICO Y OPTIMIZACION DE UNA CONSULTA LENTA
+MODULOS 6 Y 7 - PERFORMANCE TUNING Y REPLICACION
+POSTGRESQL DBA - ADMINISTRACION, PERFORMANCE Y ALTA DISPONIBILIDAD
 
-REGLA PARA COPIAR COMANDOS
+======================================================================
+1. OBJETIVO DEL LABORATORIO
+======================================================================
 
-Ejecutar SQL dentro de psql y comandos Docker en PowerShell.
-No copiar los prompts ni las explicaciones.
+Una empresa administra los pedidos de sus clientes mediante PostgreSQL.
 
-Los metacomandos de psql se ejecutan INDIVIDUALMENTE.
-Esto incluye \q, \set y la sentencia que termina con \gset.
-Pegar esa instruccion sola, pulsar Enter y esperar el prompt
-antes de pegar la siguiente consulta.
+Diariamente necesita consultar los pedidos pagados, identificar
+al cliente correspondiente y conocer el importe de cada operacion.
 
-Los bloques que contienen solamente SQL pueden pegarse completos.
-Un prompt con * indica una transaccion abierta.
-Un prompt con - indica una sentencia incompleta.
-Si hay texto accidental pendiente, pulsar Ctrl+C y esperar
-el prompt antes de pegar nuevamente el SQL.
+Sin embargo, conforme aumenta la cantidad de pedidos almacenados,
+el reporte comienza a realizar mas trabajo del necesario.
 
+El objetivo de este ejercicio es investigar ese comportamiento,
+identificar una oportunidad de optimizacion y comprobar que
+la mejora tambien se encuentra disponible en una replica fisica.
 
-OBJETIVO
+Durante el laboratorio los participantes aprenderan a:
 
-Interpretar un plan sencillo, optimizarlo con un indice
-compuesto y comprobar que la replica fisica recibe el indice.
+1. Consultar los datos originales de un sistema de pedidos.
+2. Identificar las operaciones realizadas por una consulta SQL.
+3. Interpretar EXPLAIN y EXPLAIN ANALYZE.
+4. Analizar los accesos a buffers de PostgreSQL.
+5. Identificar un recorrido secuencial de una tabla.
+6. Crear un indice compuesto B-tree.
+7. Comparar el rendimiento BEFORE y AFTER.
+8. Interpretar estadisticas de pg_stat_statements.
+9. Comprobar que el indice se replica a PostgreSQL B.
+10. Verificar que el standby acepta lecturas, pero no escrituras.
 
-SITUACION
+REGLA PRINCIPAL
 
-Necesitamos consultar tres pedidos pagados de un dia.
-Existen otros 50001 pedidos que no cumplen el filtro.
-Queremos reducir el trabajo sin cambiar el resultado.
+La optimizacion debe mejorar la forma de acceder a los datos,
+sin modificar los resultados del negocio.
 
-PREGUNTAS
+Los pedidos pagados deben continuar siendo los mismos.
+El importe total de ventas debe permanecer en 900.
 
-- Cuantas filas recorre PostgreSQL y cuantas devuelve?
-- Un indice cambia los datos del reporte?
-- Por que aparece el indice en el standby?
-- Podemos escribir en ese standby?
+======================================================================
+2. HISTORIA DE NEGOCIO Y DATOS INICIALES
+======================================================================
 
-CONCEPTOS NECESARIOS
+La empresa tiene tres clientes:
 
-EXPLAIN: muestra el plan estimado sin ejecutar la consulta.
-EXPLAIN ANALYZE: ejecuta y muestra mediciones reales.
-BUFFERS: informa accesos a buffers; hit y read son distintos.
-Un read de PostgreSQL puede resolverse con cache del sistema
-operativo: no demuestra por si solo una lectura fisica de disco.
+TABLA: negocio.clientes
 
-Indice compuesto: indice sobre varias columnas.
-Usaremos un B-tree sobre estado y fecha.
+id    nombre
+----------------
+1     Ana
+2     Luis
+3     Maria
 
-JOIN: relaciona pedidos con clientes.
-SORT: ordena las filas del resultado.
-AGGREGATE: calcula conteos o sumas.
+Cada cliente puede tener varios pedidos.
 
-Replica fisica: reproduce cambios del cluster mediante WAL.
-Hot Standby: permite consultar mientras se aplica la recuperacion.
+TABLA: negocio.pedidos
 
-REQUISITO
+id    cliente_id    fecha         estado       total
+----------------------------------------------------
+101   1             2026-01-15    PENDIENTE    200
+102   2             2026-01-15    PAGADO       500
+103   1             2026-01-15    PAGADO       150
+104   3             2026-01-15    PAGADO       250
 
-Laboratorio manual creado mediante 07.00.
-No haber ejecutado este escenario sobre esa carga.
+INTERPRETACION
 
-============================================================
-1. BEFORE - CONSULTAR LOS DATOS
-============================================================
+El pedido 101 pertenece a Ana y aun no esta pagado.
 
-Abrir una conexion al SERVIDOR A como indica 07.00.
-Todos los comandos de esta seccion son SQL o metacomandos psql.
+El pedido 102 pertenece a Luis y tiene un importe de 500.
 
-SELECT id,cliente_id,estado,total
-FROM negocio.pedidos
-WHERE fecha=DATE '2026-01-15'
-ORDER BY id;
+El pedido 103 pertenece a Ana y tiene un importe de 150.
+
+El pedido 104 pertenece a Maria y tiene un importe de 250.
+
+Por tanto, el reporte inicial debe mostrar:
+
+Pedidos recientes: 4.
+Pedidos recientes pagados: 3.
+Importe total de pedidos pagados: 900.
+
+CALCULO
+
+500 + 150 + 250 = 900
+
+El pedido 101 no participa en esta suma porque
+su estado es PENDIENTE.
+
+DATOS HISTORICOS
+
+Adicionalmente, el laboratorio contiene 50000 pedidos
+historicos pertenecientes a fechas anteriores.
+
+Estos pedidos permiten trabajar con una tabla que contiene
+muchos mas registros que los requeridos por el reporte.
+
+Cantidad total de pedidos:
+
+50000 historicos + 4 recientes = 50004.
+
+La consulta de negocio busca solamente tres pedidos pagados
+de la fecha 2026-01-15.
+
+Por tanto, existen 50001 registros que no cumplen el filtro.
+
+Esta diferencia entre registros almacenados y registros
+necesarios es el punto de partida para el diagnostico.
+
+======================================================================
+3. ARQUITECTURA UTILIZADA
+======================================================================
+
+El laboratorio contiene dos instancias PostgreSQL.
+
+POSTGRESQL A
+
+Puerto: 5547.
+Rol inicial: PRIMARY.
+Permite lectura y escritura.
+
+POSTGRESQL B
+
+Puerto: 5548.
+Rol inicial: STANDBY.
+Permite consultas de solo lectura.
+
+Ambas instancias funcionan dentro del contenedor Docker:
+
+p7-integrado-lab
+
+El servidor A genera registros WAL.
+
+El servidor B recibe y reproduce esos registros para
+mantener una copia fisica de la informacion del principal.
+
+En este escenario crearemos un indice en A y comprobaremos
+que tambien aparece en B.
+
+La replicacion fisica permite reproducir tanto cambios
+en los datos como cambios de estructura, incluidos indices.
+
+======================================================================
+4. PREPARACION Y CONEXION AL SERVIDOR PRINCIPAL
+======================================================================
+
+IMPORTANTE SOBRE LOS COMANDOS
+
+Los comandos docker y powershell.exe se ejecutan desde PowerShell.
+
+Las instrucciones SELECT, EXPLAIN y CREATE INDEX
+se ejecutan dentro de psql.
+
+Cada sentencia SQL termina con punto y coma.
+
+Los metacomandos que comienzan con una barra invertida
+se ejecutan individualmente dentro de psql.
+
+No es necesario escribir los nombres de las terminales
+ni los encabezados de esta guia como parte de un comando.
+
+----------------------------------------------------------------------
+PASO 4.1 - PREPARAR EL AMBIENTE
+----------------------------------------------------------------------
+
+Desde la raiz del repositorio, en PowerShell, ejecutar el
+comando de preparacion definido en la practica 07.00:
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\practices\p7\scripts\01-create-docker-laboratory.ps1" -Mode manual
+
+Este comando solamente debe utilizarse cuando el contenedor
+del laboratorio aun no existe.
+
+QUE HACE
+
+Crea el contenedor Docker, prepara las dos instancias,
+carga los registros iniciales y configura la replicacion.
 
 RESULTADO ESPERADO
 
-101 | 1 | PENDIENTE | 200
-102 | 2 | PAGADO    | 500
-103 | 1 | PAGADO    | 150
-104 | 3 | PAGADO    | 250
+LISTO PARA CLASE: CARGA INICIAL PRESENTE; EJERCICIOS SIN EJECUTAR.
 
-Consultar el resumen:
+Si el laboratorio ya fue preparado y permanece funcionando,
+continuar directamente con el siguiente paso.
+
+----------------------------------------------------------------------
+PASO 4.2 - CONECTARSE A POSTGRESQL A
+----------------------------------------------------------------------
+
+En PowerShell:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5547 -U postgres -d nobleprog_integrado -P pager=off
+
+EXPLICACION DEL COMANDO
+
+docker exec:
+Ejecuta un programa dentro de un contenedor existente.
+
+-it:
+Permite utilizar una terminal interactiva.
+
+-u postgres:
+Ejecuta el programa utilizando el usuario Linux postgres.
+
+p7-integrado-lab:
+Nombre del contenedor del laboratorio.
+
+psql:
+Cliente de linea de comandos de PostgreSQL.
+
+-X:
+Evita cargar configuraciones personales de psql.
+
+-h 127.0.0.1:
+Indica el host de conexion dentro del contenedor.
+
+-p 5547:
+Selecciona el puerto de PostgreSQL A.
+
+-U postgres:
+Indica el usuario de la base de datos.
+
+-d nobleprog_integrado:
+Selecciona la base de datos del laboratorio.
+
+-P pager=off:
+Evita que los resultados se abran en un paginador.
+
+RESULTADO ESPERADO
+
+Se abre una sesion interactiva de psql conectada
+a la base de datos nobleprog_integrado.
+
+Los siguientes comandos SQL se ejecutan dentro de esa sesion.
+
+----------------------------------------------------------------------
+PASO 4.3 - COMPROBAR EL SERVIDOR
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT current_database() AS base_datos,
+       inet_server_port() AS puerto,
+       pg_is_in_recovery() AS en_recuperacion;
+
+EXPLICACION
+
+current_database():
+Devuelve el nombre de la base de datos actual.
+
+inet_server_port():
+Devuelve el puerto TCP de la conexion PostgreSQL.
+
+pg_is_in_recovery():
+Indica si la instancia esta ejecutando recuperacion.
+
+false significa que no se encuentra en modo standby.
+
+true significa que esta funcionando en recuperacion.
+
+RESULTADO ESPERADO
+
+base_datos         puerto    en_recuperacion
+------------------------------------------------
+nobleprog_integrado 5547     f
+
+INTERPRETACION
+
+Estamos conectados a PostgreSQL A.
+
+El servidor funciona como PRIMARY y permite
+realizar las operaciones de optimizacion.
+
+======================================================================
+5. BEFORE - COMPROBAR LA INFORMACION ORIGINAL
+======================================================================
+
+Antes de investigar el rendimiento, debemos comprender
+exactamente que datos existen y que reporte necesita
+obtener la empresa.
+
+----------------------------------------------------------------------
+PASO 5.1 - CONTAR TODOS LOS PEDIDOS
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT count(*) AS pedidos_totales
+FROM negocio.pedidos;
+
+EXPLICACION
+
+COUNT(*) cuenta todas las filas de la tabla.
+
+FROM negocio.pedidos indica de donde provienen los datos.
+
+AS pedidos_totales asigna un nombre descriptivo
+a la columna del resultado.
+
+RESULTADO ESPERADO
+
+pedidos_totales
+---------------
+50004
+
+INTERPRETACION
+
+PostgreSQL almacena 50004 pedidos.
+
+Sin embargo, el reporte solicitado solamente necesita
+los pedidos pagados correspondientes a una fecha.
+
+----------------------------------------------------------------------
+PASO 5.2 - CONSULTAR LOS PEDIDOS RECIENTES
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT p.id,
+       c.nombre,
+       p.fecha,
+       p.estado,
+       p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.fecha = DATE '2026-01-15'
+ORDER BY p.id;
+
+EXPLICACION
+
+SELECT:
+Indica las columnas que queremos obtener.
+
+FROM negocio.pedidos p:
+Selecciona la tabla de pedidos.
+
+La letra p es un alias que facilita referirse
+a las columnas de esa tabla.
+
+JOIN negocio.clientes c:
+Relaciona cada pedido con su cliente.
+
+ON c.id = p.cliente_id:
+Establece la condicion utilizada para relacionar
+las dos tablas.
+
+Por ejemplo:
+
+Pedido 101 tiene cliente_id = 1.
+
+El cliente con id = 1 es Ana.
+
+Por eso el resultado muestra Ana para el pedido 101.
+
+WHERE:
+Limita los registros a la fecha indicada.
+
+DATE '2026-01-15':
+Representa una constante SQL de tipo DATE.
+
+ORDER BY p.id:
+Ordena los pedidos por identificador.
+
+RESULTADO ESPERADO
+
+id    nombre    fecha         estado       total
+-------------------------------------------------
+101   Ana       2026-01-15    PENDIENTE    200
+102   Luis      2026-01-15    PAGADO       500
+103   Ana       2026-01-15    PAGADO       150
+104   Maria     2026-01-15    PAGADO       250
+
+INTERPRETACION
+
+La consulta recupera los cuatro pedidos recientes.
+
+Todavia no hemos filtrado exclusivamente
+los pedidos pagados.
+
+----------------------------------------------------------------------
+PASO 5.3 - CONSULTAR EL REPORTE DE VENTAS PAGADAS
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
 
 SELECT c.nombre,
        count(*) AS pedidos_pagados,
        sum(p.total) AS total
 FROM negocio.clientes c
-JOIN negocio.pedidos p ON p.cliente_id=c.id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-GROUP BY c.id,c.nombre
+JOIN negocio.pedidos p ON p.cliente_id = c.id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+GROUP BY c.id, c.nombre
 ORDER BY c.nombre;
+
+EXPLICACION
+
+FROM negocio.clientes c:
+Selecciona la tabla de clientes.
+
+JOIN negocio.pedidos p:
+Relaciona los clientes con sus pedidos.
+
+WHERE p.estado = 'PAGADO':
+Descarta los pedidos que no estan pagados.
+
+AND p.fecha = DATE '2026-01-15':
+Exige que tambien correspondan a la fecha indicada.
+
+GROUP BY c.id, c.nombre:
+Agrupa los pedidos pertenecientes al mismo cliente.
+
+COUNT(*):
+Cuenta los pedidos pagados de cada grupo.
+
+SUM(p.total):
+Suma los importes de cada grupo.
+
+ORDER BY c.nombre:
+Ordena los clientes alfabeticamente.
 
 RESULTADO ESPERADO
 
-Ana:   1 pedido pagado, 150.
-Luis:  1 pedido pagado, 500.
-Maria: 1 pedido pagado, 250.
-Total: 900.
+nombre   pedidos_pagados   total
+---------------------------------
+Ana      1                 150
+Luis     1                 500
+Maria    1                 250
 
-La consulta utiliza JOIN, COUNT, SUM y GROUP BY.
-Solo lee datos; no modifica la informacion.
+INTERPRETACION
 
-============================================================
-2. DIAGNOSTICAR EL REPORTE DETALLADO
-============================================================
+Ana tiene un pedido pagado por 150.
+
+Luis tiene un pedido pagado por 500.
+
+Maria tiene un pedido pagado por 250.
+
+Cantidad de pedidos pagados: 3.
+
+Importe total:
+
+150 + 500 + 250 = 900.
+
+Este resultado sera nuestra referencia de integridad.
+
+La optimizacion no debe modificar estos importes.
+
+======================================================================
+6. BEFORE - DIAGNOSTICAR LA CONSULTA LENTA
+======================================================================
+
+La empresa necesita mostrar los pedidos pagados
+individualmente, incluyendo el nombre del cliente.
+
+Actualmente PostgreSQL tiene 50004 pedidos y
+solamente tres cumplen el filtro solicitado.
+
+Queremos investigar cuanto trabajo realiza
+el servidor para obtener esas tres filas.
+
+----------------------------------------------------------------------
+PASO 6.1 - CONSULTAR EL PLAN ESTIMADO
+----------------------------------------------------------------------
 
 SERVIDOR A - PSQL
 
 EXPLAIN
-SELECT c.nombre,p.id,p.fecha,p.total
+SELECT c.nombre, p.id, p.fecha, p.total
 FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
 
-Ahora ejecutar y medir:
+EXPLICACION
 
-EXPLAIN (ANALYZE,BUFFERS)
-SELECT c.nombre,p.id,p.fecha,p.total
+EXPLAIN solicita al optimizador de PostgreSQL
+que muestre el plan de ejecucion estimado.
+
+En esta modalidad no ejecuta la consulta SELECT.
+
+El plan describe como PostgreSQL pretende obtener
+los registros solicitados.
+
+Entre los operadores que podemos encontrar estan:
+
+Seq Scan:
+Recorrido secuencial de las filas de una tabla.
+
+Index Scan:
+Acceso a registros utilizando un indice.
+
+Hash Join:
+Relacion entre tablas utilizando una estructura hash.
+
+Nested Loop:
+Relacion entre tablas mediante busquedas repetidas.
+
+Sort:
+Ordenamiento de registros.
+
+Los operadores concretos pueden variar segun
+las decisiones del optimizador.
+
+RESULTADO ESPERADO
+
+Para negocio.pedidos esperamos observar un Seq Scan
+o recorrido secuencial, ya que todavia no existe
+el indice compuesto sobre estado y fecha.
+
+La tabla clientes solamente contiene tres filas.
+
+Un Seq Scan sobre clientes no representa necesariamente
+un problema de rendimiento.
+
+----------------------------------------------------------------------
+PASO 6.2 - EJECUTAR Y MEDIR LA CONSULTA
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT c.nombre, p.id, p.fecha, p.total
 FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
 
-QUE OBSERVAR
+EXPLICACION
 
-- Seq Scan sobre pedidos.
-- Tres filas finales.
-- Filas descartadas por el filtro.
-- JOIN y Sort.
-- Execution Time y buffers del nodo superior.
+EXPLAIN:
+Muestra el plan de ejecucion.
 
-INTERPRETACION
+ANALYZE:
+Ejecuta realmente la consulta y recopila
+mediciones de su funcionamiento.
 
-En la prueba temporal se descartaron 50001 filas.
-El motor examino muchos pedidos para devolver solo tres.
+BUFFERS:
+Muestra informacion sobre los buffers consultados
+durante la ejecucion.
 
-Las estimaciones no tienen que coincidir exactamente con
-las filas reales. La muestra de ANALYZE puede no representar
-con precision una fecha con tan pocos registros.
+Como estamos utilizando SELECT, esta medicion
+no modifica los pedidos.
 
-El costo estimado no esta expresado en milisegundos.
-No sumar buffers de padres e hijos: pueden solaparse.
+ELEMENTOS QUE DEBEMOS IDENTIFICAR
 
-Anotar tiempo, filas finales y buffers.
-No exigir un tiempo minimo para declarar que hay trabajo evitable.
+1. Seq Scan on pedidos
 
-============================================================
-3. CAMBIO - CREAR EL INDICE
-============================================================
+Indica que PostgreSQL examino secuencialmente
+la tabla de pedidos.
+
+2. Filter
+
+Muestra las condiciones utilizadas para
+seleccionar solamente los pedidos pagados
+de la fecha indicada.
+
+3. Rows Removed by Filter
+
+Indica cuantas filas fueron descartadas
+por no cumplir las condiciones.
+
+En este escenario esperamos aproximadamente 50001
+filas descartadas en el recorrido de pedidos.
+
+4. Actual Rows
+
+Indica cuantas filas produjo realmente un operador,
+por cada ejecucion de ese operador.
+
+La consulta completa debe devolver tres filas.
+
+5. Actual Loops
+
+Indica cuantas veces se ejecuto un operador.
+
+6. Execution Time
+
+Indica el tiempo total medido para la ejecucion.
+
+7. Buffers: shared hit
+
+Indica accesos a bloques que PostgreSQL encontro
+en sus buffers compartidos.
+
+8. Buffers: shared read
+
+Indica bloques que PostgreSQL tuvo que incorporar
+a sus buffers compartidos.
+
+Una lectura reportada aqui no demuestra necesariamente
+una lectura fisica desde el disco, porque el sistema
+operativo tambien puede utilizar cache.
+
+9. Sort
+
+Si aparece, indica que PostgreSQL realizo
+una operacion de ordenamiento.
+
+10. Join
+
+Indica como se relacionaron las tablas
+pedidos y clientes.
+
+IMPORTANTE SOBRE LOS COSTOS
+
+El valor cost mostrado por EXPLAIN representa
+una estimacion interna del optimizador.
+
+No esta expresado directamente en milisegundos.
+
+Tampoco debemos sumar indiscriminadamente
+los buffers mostrados en nodos padres e hijos,
+porque sus contabilizaciones pueden incluir
+el trabajo realizado por operadores descendientes.
+
+======================================================================
+7. CAMBIO - CREAR UN INDICE COMPUESTO B-TREE
+======================================================================
+
+Ahora realizaremos un cambio controlado sobre
+la estructura de acceso a los datos.
+
+No modificaremos los registros de negocio.
+
+----------------------------------------------------------------------
+PASO 7.1 - CREAR EL INDICE
+----------------------------------------------------------------------
 
 SERVIDOR A - PSQL
 
 CREATE INDEX pedidos_estado_fecha_idx
-ON negocio.pedidos(estado,fecha);
+ON negocio.pedidos (estado, fecha);
 
-POR QUE
+EXPLICACION
 
-La consulta filtra por igualdad sobre estado y fecha.
-El indice ofrece una ruta para localizar esos pedidos.
+CREATE INDEX:
+Solicita la creacion de un indice.
 
-No cambia el estado de los pedidos ni el importe de venta.
-Tiene costo de almacenamiento y mantenimiento en escrituras.
+pedidos_estado_fecha_idx:
+Nombre asignado al nuevo indice.
 
-============================================================
-4. AFTER - REPETIR LA MISMA MEDICION
-============================================================
+ON negocio.pedidos:
+Indica la tabla sobre la que sera creado.
 
-SERVIDOR A - PSQL
+(estado, fecha):
+Indica las dos columnas incluidas en el indice.
 
-EXPLAIN (ANALYZE,BUFFERS)
-SELECT c.nombre,p.id,p.fecha,p.total
-FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
+Se trata de un indice compuesto porque utiliza
+mas de una columna.
+
+PostgreSQL utiliza B-tree de manera predeterminada
+cuando CREATE INDEX no especifica otro metodo.
+
+POR QUE ESTAS COLUMNAS
+
+Nuestra consulta contiene:
+
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15'
+
+Por tanto, el indice ofrece una forma de localizar
+los registros que cumplen ambas condiciones,
+sin tener que examinar necesariamente toda la tabla.
+
+El optimizador decide si conviene utilizarlo.
 
 RESULTADO ESPERADO
 
-Un acceso que utilice pedidos_estado_fecha_idx.
-Puede ser Index Scan o Bitmap Index Scan con otros nodos.
-Tres filas finales, con los mismos pedidos e importes.
+CREATE INDEX
 
-El JOIN puede cambiar de estrategia: es una decision del motor.
-Seq Scan sobre clientes es razonable: solo tiene tres filas.
+IMPORTANTE
 
-En la prueba temporal se observaron:
-Antes: 7.910 ms, 323 shared hit en el nodo superior.
-Despues: 0.850 ms, 5 shared hit y 2 shared read.
+Crear un indice tiene un costo de almacenamiento.
 
-Son observaciones historicas, no valores de aprobacion.
-La cache, el equipo y la instrumentacion afectan los tiempos.
+Tambien introduce trabajo adicional cuando se
+insertan, actualizan o eliminan registros afectados.
 
-Comprobar el total:
+Por eso no debemos crear indices indiscriminadamente.
 
-SELECT sum(total) AS venta_pagada
+----------------------------------------------------------------------
+PASO 7.2 - COMPROBAR LA DEFINICION DEL INDICE
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT indexname,
+       indexdef
+FROM pg_indexes
+WHERE schemaname = 'negocio'
+  AND tablename = 'pedidos'
+  AND indexname = 'pedidos_estado_fecha_idx';
+
+EXPLICACION
+
+pg_indexes:
+Vista que permite consultar los indices existentes.
+
+schemaname:
+Esquema al que pertenece la tabla.
+
+tablename:
+Nombre de la tabla.
+
+indexname:
+Nombre del indice que buscamos.
+
+indexdef:
+Definicion SQL del indice.
+
+RESULTADO ESPERADO
+
+Debe aparecer el indice pedidos_estado_fecha_idx.
+
+Su definicion debe indicar que utiliza B-tree
+sobre las columnas estado y fecha.
+
+----------------------------------------------------------------------
+PASO 7.3 - CONFIRMAR QUE LOS DATOS NO CAMBIARON
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
 FROM negocio.pedidos
-WHERE estado='PAGADO' AND fecha=DATE '2026-01-15';
-
-RESULTADO ESPERADO: 900.
-
-RETO PARA LOS PARTICIPANTES
-
-Explicar por que mejoro el acceso aunque siga existiendo Sort.
-El indice elegido no garantiza el orden por id.
-
-============================================================
-5. OBSERVAR PG_STAT_STATEMENTS
-============================================================
-
-SERVIDOR A - PSQL
-
-SELECT c.nombre,p.id,p.fecha,p.total
-FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
-SELECT c.nombre,p.id,p.fecha,p.total
-FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
-SELECT c.nombre,p.id,p.fecha,p.total
-FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
-
-SELECT calls,rows,
-       round(total_exec_time::numeric,3) AS total_ms,
-       shared_blks_hit,shared_blks_read,query
-FROM pg_stat_statements
-WHERE query LIKE 'SELECT c.nombre,p.id%'
-ORDER BY calls DESC;
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
 
 RESULTADO ESPERADO
 
-La consulta aparece con al menos tres llamadas.
-Tres ejecuciones de tres filas acumulan nueve filas.
+pedidos_pagados    venta_pagada
+--------------------------------
+3                  900
 
 INTERPRETACION
 
-Estas estadisticas pertenecen a esta instancia.
-No confundir el tiempo acumulado con el de una sola ejecucion.
-Los literales pueden aparecer normalizados como parametros.
-La extension fue precargada durante la preparacion.
+El indice no modifico los pedidos.
 
-============================================================
-6. COMPROBAR LA REPLICA
-============================================================
+Antes de crear el indice teniamos:
 
-Desde OTRA TERMINAL POWERSHELL:
+3 pedidos pagados.
+900 de importe total.
 
-& {
-    $ErrorActionPreference = "Stop"
-    docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/00-sync-replica.sh
-    if ($LASTEXITCODE -ne 0) { throw "No se confirmo la sincronizacion." }
-}
+Despues de crear el indice seguimos teniendo:
 
-El script espera una posicion WAL observable con limite de tiempo.
-No se basa exclusivamente en dormir un numero fijo de segundos.
+3 pedidos pagados.
+900 de importe total.
 
-Abrir conexion al SERVIDOR B como indica 07.00.
+Por tanto, el cambio afecta las posibilidades
+de acceso a los datos, no los datos del negocio.
+
+======================================================================
+8. AFTER - REPETIR EL DIAGNOSTICO
+======================================================================
+
+Ahora ejecutaremos exactamente la misma consulta
+utilizada durante el diagnostico BEFORE.
+
+Esto permite comparar el comportamiento antes
+y despues de crear el indice.
+
+----------------------------------------------------------------------
+PASO 8.1 - MEDIR NUEVAMENTE
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT c.nombre, p.id, p.fecha, p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
+
+QUE BUSCAR
+
+En este conjunto de datos esperamos observar
+que PostgreSQL aproveche el nuevo indice.
+
+Entre los operadores posibles estan:
+
+Index Scan.
+
+Bitmap Index Scan combinado con Bitmap Heap Scan.
+
+El plan exacto depende del optimizador y
+de las condiciones de ejecucion.
+
+La consulta debe continuar devolviendo tres filas.
+
+QUE PUEDE CAMBIAR
+
+El tiempo de ejecucion puede disminuir.
+
+La cantidad de bloques examinados puede disminuir.
+
+La estrategia de JOIN puede cambiar.
+
+La presencia de un operador Sort puede mantenerse.
+
+POR QUE PUEDE CONTINUAR APARECIENDO SORT
+
+Nuestro indice contiene:
+
+estado, fecha.
+
+Pero la consulta ordena utilizando:
+
+fecha, id.
+
+El indice elegido no garantiza por si mismo
+el ordenamiento completo solicitado.
+
+Por eso es posible que PostgreSQL siga utilizando
+una operacion Sort.
+
+Esto no invalida la optimizacion del filtrado.
+
+----------------------------------------------------------------------
+PASO 8.3 - COMPARACION BEFORE Y AFTER
+----------------------------------------------------------------------
+
+INTERPRETACION
+
+La diferencia importante es que ahora PostgreSQL
+dispone de un indice que permite localizar
+directamente los registros del filtro.
+
+Por ejemplo, si un plan pasa de examinar decenas
+de miles de filas a recuperar solamente unas pocas
+mediante un indice, existe una mejora en el
+trabajo de acceso a los registros.
+
+Sin embargo, los tiempos pueden cambiar debido
+a cache, CPU, I/O y condiciones del equipo.
+
+Los valores BEFORE y AFTER deben obtenerse
+de la ejecucion real de los participantes.
+
+No se exige una cantidad fija de milisegundos
+ni se asume que todos los equipos mediran lo mismo.
+
+----------------------------------------------------------------------
+PASO 8.4 - COMPROBAR EL RESULTADO FUNCIONAL
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT c.nombre, p.id, p.fecha, p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
+
+RESULTADO ESPERADO
+
+nombre    id    fecha         total
+------------------------------------
+Luis      102   2026-01-15    500
+Ana       103   2026-01-15    150
+Maria     104   2026-01-15    250
+
+CONCLUSION
+
+La consulta mantiene exactamente los mismos resultados.
+
+La optimizacion modifica el plan de acceso,
+pero no altera la informacion del negocio.
+
+======================================================================
+9. OBSERVAR ESTADISTICAS CON PG_STAT_STATEMENTS
+======================================================================
+
+Hasta ahora utilizamos EXPLAIN ANALYZE para medir
+ejecuciones concretas de nuestra consulta.
+
+Ahora utilizaremos pg_stat_statements para observar
+estadisticas acumuladas de sentencias SQL.
+
+La extension fue habilitada durante la preparacion
+del laboratorio.
+
+----------------------------------------------------------------------
+PASO 9.1 - EJECUTAR TRES VECES LA CONSULTA
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+\i /tmp/p7-integrado-scripts/aux-query-recent-paid-orders.sql
+
+\i /tmp/p7-integrado-scripts/aux-query-recent-paid-orders.sql
+
+\i /tmp/p7-integrado-scripts/aux-query-recent-paid-orders.sql
+
+EXPLICACION
+
+\i es un metacomando de psql.
+
+Permite ejecutar las instrucciones contenidas
+en un archivo SQL.
+
+La ruta indicada corresponde a un archivo
+que ya existe dentro del contenedor Docker.
+
+El archivo contiene la consulta detallada
+de pedidos pagados utilizada anteriormente.
+
+Cada instruccion \i debe ejecutarse individualmente.
+
+RESULTADO ESPERADO
+
+En cada ejecucion aparecen los mismos tres pedidos:
+
+102 - Luis - 500.
+103 - Ana - 150.
+104 - Maria - 250.
+
+No se crean registros nuevos.
+
+No se modifican pedidos.
+
+----------------------------------------------------------------------
+PASO 9.2 - CONSULTAR LAS ESTADISTICAS ACUMULADAS
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT calls,
+       rows,
+       round(total_exec_time::numeric, 3) AS total_ms,
+       shared_blks_hit,
+       shared_blks_read,
+       left(query, 100) AS consulta
+FROM pg_stat_statements
+WHERE dbid = (
+    SELECT oid
+    FROM pg_database
+    WHERE datname = current_database()
+)
+AND query LIKE 'SELECT c.nombre,p.id%'
+ORDER BY calls DESC;
+
+EXPLICACION
+
+pg_stat_statements:
+Vista que contiene estadisticas acumuladas
+de sentencias SQL registradas por PostgreSQL.
+
+calls:
+Cantidad de ejecuciones registradas.
+
+rows:
+Cantidad acumulada de filas devueltas o afectadas
+por las ejecuciones registradas.
+
+total_exec_time:
+Tiempo acumulado de ejecucion en milisegundos.
+
+::numeric:
+Convierte el valor a tipo numeric.
+
+round(..., 3):
+Presenta el tiempo con tres decimales.
+
+shared_blks_hit:
+Cantidad acumulada de accesos a bloques
+encontrados en buffers compartidos.
+
+shared_blks_read:
+Cantidad acumulada de bloques leidos
+hacia los buffers compartidos.
+
+left(query, 100):
+Muestra solamente los primeros 100 caracteres
+del texto de la consulta para facilitar su lectura.
+
+dbid:
+Identifica la base de datos asociada a las estadisticas.
+
+current_database():
+Devuelve el nombre de la base de datos actual.
+
+LIKE:
+Permite localizar las consultas que comienzan
+con el texto especificado.
+
+ORDER BY calls DESC:
+Presenta primero las consultas con mas llamadas.
+
+RESULTADO ESPERADO
+
+La consulta ejecutada mediante el archivo SQL
+debe aparecer con al menos tres llamadas registradas.
+
+Tres ejecuciones que devuelven tres filas cada una
+aportan nueve filas a las estadisticas acumuladas.
+
+Puede haber mas llamadas porque la consulta tambien
+se ejecuto durante otros pasos del laboratorio.
+
+Los tiempos y buffers no tienen valores fijos.
+
+INTERPRETACION
+
+EXPLAIN ANALYZE permite investigar una ejecucion.
+
+pg_stat_statements permite observar el comportamiento
+acumulado de consultas ejecutadas repetidamente.
+
+Esto resulta util para identificar sentencias
+que consumen recursos de forma frecuente.
+
+Las estadisticas pertenecen a la instancia consultada.
+
+Los literales SQL pueden aparecer normalizados
+como parametros dentro del texto registrado.
+
+======================================================================
+10. COMPROBAR LA REPLICACION FISICA
+======================================================================
+
+Ya optimizamos la consulta en PostgreSQL A.
+
+Ahora debemos comprobar que el indice tambien
+se encuentre disponible en PostgreSQL B.
+
+Este paso relaciona directamente:
+
+MODULO 6 - PERFORMANCE TUNING.
+
+MODULO 7 - REPLICACION.
+
+----------------------------------------------------------------------
+PASO 10.1 - VERIFICAR EL ESTADO DE STREAMING REPLICATION
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT application_name,
+       state,
+       sync_state
+FROM pg_stat_replication;
+
+EXPLICACION
+
+pg_stat_replication:
+Vista del servidor principal que muestra informacion
+sobre las conexiones de replicacion.
+
+application_name:
+Identifica la conexion del standby.
+
+state:
+Muestra el estado del proceso WAL Sender.
+
+sync_state:
+Indica la modalidad de sincronizacion
+asociada a la conexion.
+
+RESULTADO ESPERADO
+
+application_name    state        sync_state
+--------------------------------------------
+integrado_B         streaming    async
+
+INTERPRETACION
+
+PostgreSQL B mantiene una conexion de replicacion
+con PostgreSQL A.
+
+streaming indica que el WAL Sender esta transmitiendo
+informacion mediante streaming replication.
+
+async indica que la replica utiliza
+replicacion asincrona.
+
+Esto significa que las transacciones del principal
+no necesitan esperar a que B reproduzca sus cambios
+para que el COMMIT termine.
+
+----------------------------------------------------------------------
+PASO 10.2 - ESPERAR LA SINCRONIZACION
+----------------------------------------------------------------------
+
+Abrir una segunda terminal PowerShell.
+
+Desde esa terminal ejecutar:
+
+docker exec -u postgres p7-integrado-lab bash /tmp/p7-integrado-scripts/aux-verify-standby-synchronization.sh
+
+EXPLICACION
+
+docker exec:
+Ejecuta un programa dentro del contenedor.
+
+-u postgres:
+Utiliza el usuario Linux postgres.
+
+bash:
+Ejecuta el script indicado.
+
+aux-verify-standby-synchronization.sh:
+Comprueba la identidad y el estado de los servidores
+y espera hasta que B reproduzca una posicion WAL de A.
+
+El script utiliza:
+
+pg_current_wal_lsn() en A.
+
+pg_last_wal_replay_lsn() en B.
+
+La finalidad es comprobar que B alcanzo
+la posicion WAL obtenida del principal.
+
+RESULTADO ESPERADO
+
+PASS | Directorio de datos exclusivo
+PASS | Directorio de datos exclusivo
+PASS | B todavia standby
+PASS | B aplico el WAL confirmado en A
+
+INTERPRETACION
+
+PostgreSQL B alcanzo la posicion WAL utilizada
+como referencia para la comprobacion.
+
+Esto permite verificar que los cambios anteriores,
+incluida la creacion del indice, fueron reproducidos.
+
+----------------------------------------------------------------------
+PASO 10.3 - CONECTARSE A POSTGRESQL B
+----------------------------------------------------------------------
+
+En la segunda terminal PowerShell:
+
+docker exec -it -u postgres p7-integrado-lab psql -X -h 127.0.0.1 -p 5548 -U postgres -d nobleprog_integrado -P pager=off
+
+EXPLICACION
+
+Este comando es equivalente a la conexion anterior.
+
+La diferencia importante es:
+
+-p 5548
+
+Ese puerto corresponde a PostgreSQL B.
+
+La primera terminal permanece conectada a A.
+
+La segunda terminal queda conectada a B.
+
+----------------------------------------------------------------------
+PASO 10.4 - COMPROBAR QUE B ES STANDBY
+----------------------------------------------------------------------
 
 SERVIDOR B - PSQL
 
-SELECT pg_is_in_recovery();
+SELECT current_database() AS base_datos,
+       inet_server_port() AS puerto,
+       pg_is_in_recovery() AS en_recuperacion;
 
-SELECT to_regclass('negocio.pedidos_estado_fecha_idx');
+RESULTADO ESPERADO
 
-SELECT c.nombre,p.id,p.fecha,p.total
+base_datos         puerto    en_recuperacion
+------------------------------------------------
+nobleprog_integrado 5548     t
+
+INTERPRETACION
+
+Estamos conectados a PostgreSQL B.
+
+El valor true indica que se encuentra
+funcionando en modo de recuperacion.
+
+Por tanto, continua siendo STANDBY.
+
+----------------------------------------------------------------------
+PASO 10.5 - VERIFICAR QUE EL INDICE EXISTE EN B
+----------------------------------------------------------------------
+
+SERVIDOR B - PSQL
+
+SELECT to_regclass('negocio.pedidos_estado_fecha_idx') AS indice_replicado;
+
+EXPLICACION
+
+to_regclass:
+Busca un objeto de tipo relacion utilizando su nombre.
+
+Si existe, devuelve su identificacion.
+
+Si no existe, devuelve NULL.
+
+En este caso buscamos el indice creado en A.
+
+RESULTADO ESPERADO
+
+indice_replicado
+--------------------------------
+pedidos_estado_fecha_idx
+
+INTERPRETACION
+
+El indice existe en PostgreSQL B.
+
+No fue necesario ejecutar CREATE INDEX en B.
+
+La replicacion fisica reprodujo el cambio
+realizado originalmente en el principal.
+
+----------------------------------------------------------------------
+PASO 10.6 - CONSULTAR LOS DATOS REPLICADOS
+----------------------------------------------------------------------
+
+SERVIDOR B - PSQL
+
+SELECT c.nombre, p.id, p.fecha, p.total
 FROM negocio.pedidos p
-JOIN negocio.clientes c ON c.id=p.cliente_id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-ORDER BY p.fecha,p.id;
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
+
+RESULTADO ESPERADO
+
+nombre    id    fecha         total
+------------------------------------
+Luis      102   2026-01-15    500
+Ana       103   2026-01-15    150
+Maria     104   2026-01-15    250
+
+INTERPRETACION
+
+Los datos consultados en B coinciden
+con los datos confirmados en A.
+
+No existen diferencias en los tres pedidos pagados.
+
+----------------------------------------------------------------------
+PASO 10.7 - COMPROBAR EL TOTAL EN B
+----------------------------------------------------------------------
+
+SERVIDOR B - PSQL
+
+SELECT count(*) AS pedidos_pagados,
+       sum(total) AS venta_pagada
+FROM negocio.pedidos
+WHERE estado = 'PAGADO'
+  AND fecha = DATE '2026-01-15';
+
+RESULTADO ESPERADO
+
+pedidos_pagados    venta_pagada
+--------------------------------
+3                  900
+
+INTERPRETACION
+
+La replica conserva los datos necesarios
+para generar el mismo reporte del principal.
+
+----------------------------------------------------------------------
+PASO 10.8 - OBSERVAR EL PLAN DE EJECUCION EN B
+----------------------------------------------------------------------
+
+SERVIDOR B - PSQL
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT c.nombre, p.id, p.fecha, p.total
+FROM negocio.pedidos p
+JOIN negocio.clientes c ON c.id = p.cliente_id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+ORDER BY p.fecha, p.id;
+
+QUE COMPROBAR
+
+1. La consulta devuelve tres filas.
+
+2. El indice pedidos_estado_fecha_idx esta disponible.
+
+3. El optimizador puede utilizar el indice
+   para acceder a los registros filtrados.
+
+4. Los valores de tiempo y buffers pueden
+   diferir respecto a PostgreSQL A.
+
+INTERPRETACION
+
+La replica fisica recibe el indice.
+
+Sin embargo, PostgreSQL B conserva su propio
+estado de memoria y condiciones de ejecucion.
+
+Por eso los tiempos y planes medidos en A y B
+no tienen que ser exactamente iguales.
+
+----------------------------------------------------------------------
+PASO 10.9 - COMPROBAR QUE B ES DE SOLO LECTURA
+----------------------------------------------------------------------
+
+SERVIDOR B - PSQL
+
+SHOW transaction_read_only;
+
+RESULTADO ESPERADO
+
+transaction_read_only
+---------------------
+on
+
+EXPLICACION
+
+transaction_read_only indica si la transaccion
+actual permite modificar informacion.
+
+En una conexion normal al standby,
+el valor esperado es on.
+
+Esto significa que las operaciones de escritura
+no estan permitidas.
+
+PRUEBA DE ESCRITURA
+
+Ejecutar exclusivamente en PostgreSQL B:
+
+UPDATE negocio.pedidos
+SET estado = 'PAGADO'
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+ERROR: cannot execute UPDATE in a read-only transaction
+
+INTERPRETACION
+
+PostgreSQL B rechaza la modificacion.
+
+El pedido 101 permanece PENDIENTE.
+
+Este resultado demuestra que B puede ejecutar
+consultas, pero no acepta escrituras mientras
+continua funcionando como standby.
+
+No se debe modificar la configuracion de B
+para intentar permitir el UPDATE.
+
+La escritura sera parte de los siguientes escenarios,
+utilizando el servidor que tenga el rol PRIMARY.
+
+======================================================================
+11. AFTER - VERIFICACION FINAL DEL ESCENARIO
+======================================================================
+
+Antes de continuar con el siguiente ejercicio,
+comprobaremos que los datos siguen siendo correctos.
+
+----------------------------------------------------------------------
+PASO 11.1 - VERIFICAR EL ESTADO DEL PEDIDO 101
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
+SELECT id,
+       estado,
+       total
+FROM negocio.pedidos
+WHERE id = 101;
+
+RESULTADO ESPERADO
+
+id     estado       total
+-------------------------
+101    PENDIENTE    200
+
+INTERPRETACION
+
+La practica 07.01 no modifica los pedidos.
+
+El cambio de estado de este registro se realizara
+durante el escenario 07.02.
+
+----------------------------------------------------------------------
+PASO 11.2 - COMPROBAR EL REPORTE FINAL
+----------------------------------------------------------------------
+
+SERVIDOR A - PSQL
+
 SELECT c.nombre,
        count(*) AS pedidos_pagados,
        sum(p.total) AS total
 FROM negocio.clientes c
-JOIN negocio.pedidos p ON p.cliente_id=c.id
-WHERE p.estado='PAGADO' AND p.fecha=DATE '2026-01-15'
-GROUP BY c.id,c.nombre
+JOIN negocio.pedidos p ON p.cliente_id = c.id
+WHERE p.estado = 'PAGADO'
+  AND p.fecha = DATE '2026-01-15'
+GROUP BY c.id, c.nombre
 ORDER BY c.nombre;
 
 RESULTADO ESPERADO
 
-Recuperacion t.
-Indice negocio.pedidos_estado_fecha_idx presente.
-Los mismos tres pedidos y total 900.
+nombre   pedidos_pagados   total
+---------------------------------
+Ana      1                 150
+Luis     1                 500
+Maria    1                 250
 
-El indice se creo en A.
-B lo recibio mediante replicacion fisica.
+Total pagado: 900.
 
-PRUEBA NEGATIVA - SERVIDOR B, FUERA DE BEGIN
+----------------------------------------------------------------------
+PASO 11.3 - COMPARACION FINAL
+----------------------------------------------------------------------
 
-\set VERBOSITY verbose
+ELEMENTO                       BEFORE          AFTER
+------------------------------------------------------
+Pedidos recientes              4               4
+Pedidos pagados                3               3
+Importe pagado                 900             900
+Indice compuesto               Ausente         Presente
+Indice en standby              Ausente         Presente
+Acceso a pedidos               Secuencial      Con indice
+Capacidad de escritura en B    No              No
 
-UPDATE negocio.pedidos SET estado='PAGADO' WHERE id=101;
+INTERPRETACION GENERAL
 
-RESULTADO ESPERADO
+Antes de la optimizacion, PostgreSQL tenia que
+examinar muchos pedidos para recuperar solamente tres.
 
-ERROR 25006: no se puede ejecutar UPDATE en solo lectura.
+Despues del cambio, dispone de un indice compuesto
+que puede reducir el trabajo necesario para
+localizar los registros del filtro.
 
-Este error es intencional.
-No significa que la replicacion haya fallado.
-No intentar corregirlo cambiando la configuracion de B.
+Los datos del negocio permanecieron iguales.
 
-\set VERBOSITY default
+El indice tambien se encuentra en PostgreSQL B
+gracias a la replicacion fisica.
 
-============================================================
-7. CIERRE Y CONEXION CON 07.02
-============================================================
+El standby puede consultar la informacion,
+pero no permite modificar los pedidos.
 
-Conservar el indice y los datos.
-Cerrar conexiones con \q para iniciar las sesiones de 07.02.
+======================================================================
+12. CIERRE Y CONTINUIDAD CON EL ESCENARIO 07.02
+======================================================================
 
-Entregamos:
-A principal, B standby.
-Tres pedidos recientes pagados.
-Total 900 en ambos.
-Indice compuesto disponible en ambos.
+El laboratorio integrado utiliza los mismos datos
+y servidores a lo largo de sus tres escenarios.
 
-COMPARACION CON ORACLE
+Por tanto, NO restauraremos el ambiente
+despues de completar 07.01.
 
-Ambos motores usan optimizadores y planes de ejecucion.
-Los nombres de operadores, costos y herramientas no son
-equivalencias exactas entre productos.
+Debemos conservar:
 
-Una replica fisica de Data Guard aporta una referencia
-conceptual para entender la aplicacion de cambios.
-No supone que configuracion ni licencias sean equivalentes.
-En Oracle, consultar un physical standby mientras aplica redo
-corresponde a la funcionalidad de Active Data Guard.
+- PostgreSQL A como PRIMARY.
+- PostgreSQL B como STANDBY.
+- Los cuatro pedidos recientes originales.
+- El importe pagado de 900.
+- El indice pedidos_estado_fecha_idx en ambas instancias.
+- La replicacion fisica funcionando.
 
-FUENTES
+CERRAR LAS CONEXIONES PSQL
 
-https://www.postgresql.org/docs/18/using-explain.html
-https://www.postgresql.org/docs/18/pgstatstatements.html
-https://www.postgresql.org/docs/18/warm-standby.html
-https://docs.oracle.com/en/database/oracle/oracle-database/19/sbydb/managing-oracle-data-guard-physical-standby-databases.html
+En la terminal conectada a A:
+
+\q
+
+En la terminal conectada a B:
+
+\q
+
+El metacomando \q termina la sesion de psql.
+
+No detiene PostgreSQL.
+
+No elimina el contenedor Docker.
+
+No modifica los datos.
+
+Las instancias permanecen disponibles
+para continuar con el escenario 07.02.
+
+======================================================================
+13. QUE APRENDIMOS Y QUE SIGUE
+======================================================================
+
+En este ejercicio comprobamos que:
+
+1. Una consulta puede devolver pocas filas,
+   aunque la tabla contenga miles de registros.
+
+2. EXPLAIN permite conocer el plan estimado.
+
+3. EXPLAIN ANALYZE permite observar la ejecucion real.
+
+4. BUFFERS permite investigar los accesos a bloques.
+
+5. Un indice compuesto puede mejorar el filtrado.
+
+6. El indice no modifica la informacion del negocio.
+
+7. pg_stat_statements permite observar estadisticas acumuladas.
+
+8. La replicacion fisica reproduce el indice en B.
+
+9. El standby puede atender consultas de solo lectura.
+
+10. Los resultados de A y B coinciden despues de la sincronizacion.
+
+CONEXION CON EL ESCENARIO 07.02
+
+La empresa ya dispone de una consulta optimizada.
+
+Ahora los empleados comenzaran a modificar los pedidos.
+
+Una sesion cambiara el estado de un pedido,
+pero mantendra su transaccion abierta.
+
+Otra sesion intentara actualizar ese mismo registro
+y quedara esperando un bloqueo.
+
+Mientras tanto, comprobaremos que informacion
+pueden observar las otras conexiones y la replica.
+
+El punto de partida del siguiente ejercicio sera:
+
+Pedido 101: PENDIENTE, 200.
+
+Pedidos pagados: 3.
+
+Importe pagado: 900.
+
+Indice compuesto: disponible en A y B.
+
+Replicacion fisica: activa.
+
+======================================================================
+FIN DE LA PRACTICA 07.01
+======================================================================
