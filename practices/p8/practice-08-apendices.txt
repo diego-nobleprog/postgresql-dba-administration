@@ -1,0 +1,703 @@
+APENDICES - PRACTICA 08
+MIGRACION INTEGRAL DE POSTGRESQL
+
+============================================================
+APENDICE A - HERRAMIENTAS ALTERNATIVAS
+============================================================
+
+Metacomandos de psql:
+
+\l+     Lista bases de datos.
+\dn+    Lista schemas.
+\dt+    Lista tablas.
+\df+    Lista funciones.
+\des+   Lista servidores extranjeros.
+
+Consultas de catalogos:
+
+pg_database    Bases de datos.
+pg_roles       Roles.
+pg_class       Relaciones.
+pg_proc        Funciones y procedimientos.
+pg_tablespace  Tablespaces.
+pg_constraint  Restricciones.
+pg_trigger     Triggers.
+
+Herramientas de migracion:
+
+pg_dumpall     Objetos globales.
+pg_dump        Respaldo logico de una base.
+pg_restore     Inspeccion y restauracion de respaldos.
+
+============================================================
+APENDICE B - NOTAS DE SEGURIDAD
+============================================================
+
+1. --no-role-passwords omite los verificadores de contrasenas.
+
+2. No es suficiente restaurar los nombres de los roles
+   cuando una conexion FDW requiere autenticacion.
+
+3. Las credenciales deben gestionarse por separado.
+
+4. No se deben imprimir contrasenas ni verificadores
+   en las evidencias de capacitacion.
+
+5. La corrida de laboratorio presento inicialmente:
+
+   password authentication failed for user "p8_reporter"
+
+6. La credencial se corrigio posteriormente sin volver
+   a restaurar las bases.
+
+7. La comprobacion final registro:
+
+   CREDENCIALES_EQUIVALENTES=1
+   FDW_FILAS|2
+   ADAPTACION_FDW=PASS
+
+============================================================
+APENDICE C - INTERPRETACION DE OBJETOS
+============================================================
+
+SCHEMA:
+Agrupa objetos dentro de una base.
+
+TABLE:
+Tabla convencional.
+
+TABLE DATA:
+Contenido de una tabla incluido en el respaldo.
+
+SEQUENCE:
+Generador de identificadores.
+
+SEQUENCE SET:
+Estado del generador restaurado.
+
+VIEW:
+Vista convencional.
+
+MATERIALIZED VIEW:
+Vista materializada.
+
+MATERIALIZED VIEW DATA:
+Datos persistidos de la vista materializada.
+
+FUNCTION:
+Funcion almacenada.
+
+PROCEDURE:
+Procedimiento almacenado.
+
+TRIGGER:
+Objeto que responde a determinados eventos.
+
+CONSTRAINT:
+Restriccion de integridad.
+
+INDEX:
+Indice.
+
+ACL:
+Permisos asociados a objetos.
+
+EXTENSION:
+Extension PostgreSQL.
+
+SERVER:
+Definicion de un servidor externo.
+
+USER MAPPING:
+Asociacion de usuario local con servidor externo.
+
+FOREIGN TABLE:
+Definicion de tabla remota.
+
+============================================================
+APENDICE D - SALIDAS COMPLETAS VERIFICADAS
+============================================================
+
+Las siguientes transcripciones provienen de la ejecucion
+real. Se incluyen los comandos originales y sus salidas.
+
+Los valores de tiempo, estadisticas y hashes pueden
+cambiar en nuevas ejecuciones.
+
+============================================================
+ETAPA: 01_INVENTARIO_Y_EXPORTACION
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+base='/srv/p8/development/backups'
+mkdir -p "$base"
+chown postgres:postgres "$base"
+runuser -u postgres -- pg_dumpall -h 127.0.0.1 -U postgres --globals-only --no-role-passwords -f "$base/p8-globales.sql"
+runuser -u postgres -- pg_dump -h 127.0.0.1 -U postgres -d ventas_db -Fc -f "$base/ventas_db.dump"
+runuser -u postgres -- pg_dump -h 127.0.0.1 -U postgres -d reportes_db -Fc -f "$base/reportes_db.dump"
+for name in p8-globales.sql ventas_db.dump reportes_db.dump; do
+    test -s "$base/$name"
+    hash=$(sha256sum "$base/$name")
+    echo "HASH_SRC|$name|${hash%% *}"
+    ls -lh "$base/$name"
+done
+echo '=== DEFINICIONES GLOBALES EXPORTADAS ==='
+cat "$base/p8-globales.sql"
+echo '=== INVENTARIO REAL DE ventas_db ==='
+runuser -u postgres -- pg_restore --list "$base/ventas_db.dump"
+echo '=== INVENTARIO REAL DE reportes_db ==='
+runuser -u postgres -- pg_restore --list "$base/reportes_db.dump"
+echo '=== BASE EXCLUIDA ==='
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname='sandbox_db';"
+echo 'SECCION_1_EXPORTACION=PASS'
+
+SALIDA REAL
+
+HASH_SRC|p8-globales.sql|1c96f3c32107719e36d49b0a5f31daad1d1e2476074b252ae98f0d6b3a5630e0
+-rw-r--r-- 1 postgres postgres 1.2K Nov 20 04:07 /srv/p8/development/backups/p8-globales.sql
+HASH_SRC|ventas_db.dump|d0c136b88d5bde654d8709c526b15e27f846443c15fff58c17468ba887faa0a5
+-rw-r--r-- 1 postgres postgres 21K Nov 20 04:07 /srv/p8/development/backups/ventas_db.dump
+HASH_SRC|reportes_db.dump|2cc56959bba896ae60d0ffea222ccccadb491a3fea9bcd57ddd9dc4e381756ca
+-rw-r--r-- 1 postgres postgres 3.2K Nov 20 04:07 /srv/p8/development/backups/reportes_db.dump
+=== DEFINICIONES GLOBALES EXPORTADAS ===
+--
+-- PostgreSQL database cluster dump
+--
+
+\restrict bcQiHVDnEMJVSY4G21eIdqxXJasQ3hf8Bhsrf6O1nnRYTx0qqCeq6V2airzdr7B
+
+SET default_transaction_read_only = off;
+
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+
+--
+-- Roles
+--
+
+CREATE ROLE p8_app;
+ALTER ROLE p8_app WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE p8_owner;
+ALTER ROLE p8_owner WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE p8_reader;
+ALTER ROLE p8_reader WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE p8_reporter;
+ALTER ROLE p8_reporter WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE postgres;
+ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS;
+
+--
+-- User Configurations
+--
+
+
+
+
+
+
+--
+-- Tablespaces
+--
+
+CREATE TABLESPACE p8_ts_indices OWNER postgres LOCATION '/srv/p8/development/tablespaces/indices';
+GRANT ALL ON TABLESPACE p8_ts_indices TO p8_owner;
+
+
+\unrestrict bcQiHVDnEMJVSY4G21eIdqxXJasQ3hf8Bhsrf6O1nnRYTx0qqCeq6V2airzdr7B
+
+--
+-- PostgreSQL database cluster dump complete
+--
+
+=== INVENTARIO REAL DE ventas_db ===
+;
+; Archive created at 2026-11-20 04:07:04 UTC
+;     dbname: ventas_db
+;     TOC Entries: 61
+;     Compression: gzip
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 18.6
+;     Dumped by pg_dump version: 18.6
+;
+;
+; Selected TOC Entries:
+;
+8; 2615 16580 SCHEMA - auditoria p8_owner
+9; 2615 16578 SCHEMA - comercial p8_owner
+3541; 0 0 ACL - SCHEMA comercial p8_owner
+10; 2615 16579 SCHEMA - reportes p8_owner
+3542; 0 0 ACL - SCHEMA reportes p8_owner
+3; 3079 16526 EXTENSION - pg_stat_statements
+3543; 0 0 COMMENT - EXTENSION pg_stat_statements
+2; 3079 16445 EXTENSION - pg_trgm
+3544; 0 0 COMMENT - EXTENSION pg_trgm
+268; 1255 16669 FUNCTION auditoria registrar_cambio_pedido() p8_owner
+284; 1255 16671 PROCEDURE comercial registrar_pago(bigint, numeric) p8_owner
+3545; 0 0 ACL comercial PROCEDURE registrar_pago(IN p_pedido_id bigint, IN p_monto numeric) p8_owner
+283; 1255 16668 FUNCTION comercial total_pedido(bigint) p8_owner
+3546; 0 0 ACL comercial FUNCTION total_pedido(p_pedido_id bigint) p8_owner
+234; 1259 16657 TABLE auditoria cambios_pedidos p8_owner
+233; 1259 16656 SEQUENCE auditoria cambios_pedidos_auditoria_id_seq p8_owner
+226; 1259 16581 TABLE comercial clientes p8_owner
+3547; 0 0 ACL comercial TABLE clientes p8_owner
+230; 1259 16617 TABLE comercial detalles p8_owner
+3548; 0 0 ACL comercial TABLE detalles p8_owner
+231; 1259 16638 SEQUENCE comercial pagos_seq p8_owner
+3549; 0 0 ACL comercial SEQUENCE pagos_seq p8_owner
+232; 1259 16639 TABLE comercial pagos p8_owner
+3550; 0 0 ACL comercial TABLE pagos p8_owner
+229; 1259 16599 TABLE comercial pedidos p8_owner
+3551; 0 0 ACL comercial TABLE pedidos p8_owner
+228; 1259 16598 SEQUENCE comercial pedidos_pedido_id_seq p8_owner
+3552; 0 0 ACL comercial SEQUENCE pedidos_pedido_id_seq p8_owner
+227; 1259 16589 TABLE comercial productos p8_owner
+3553; 0 0 ACL comercial TABLE productos p8_owner
+235; 1259 16672 VIEW reportes v_ventas_pagadas p8_owner
+3554; 0 0 ACL reportes TABLE v_ventas_pagadas p8_owner
+236; 1259 16677 MATERIALIZED VIEW reportes mv_ventas_pagadas p8_owner
+3555; 0 0 ACL reportes TABLE mv_ventas_pagadas p8_owner
+3533; 0 16657 TABLE DATA auditoria cambios_pedidos p8_owner
+3525; 0 16581 TABLE DATA comercial clientes p8_owner
+3529; 0 16617 TABLE DATA comercial detalles p8_owner
+3531; 0 16639 TABLE DATA comercial pagos p8_owner
+3528; 0 16599 TABLE DATA comercial pedidos p8_owner
+3526; 0 16589 TABLE DATA comercial productos p8_owner
+3556; 0 0 SEQUENCE SET auditoria cambios_pedidos_auditoria_id_seq p8_owner
+3557; 0 0 SEQUENCE SET comercial pagos_seq p8_owner
+3558; 0 0 SEQUENCE SET comercial pedidos_pedido_id_seq p8_owner
+3368; 2606 16665 CONSTRAINT auditoria cambios_pedidos cambios_pedidos_pkey p8_owner
+3356; 2606 16588 CONSTRAINT comercial clientes clientes_pkey p8_owner
+3364; 2606 16627 CONSTRAINT comercial detalles detalles_pkey p8_owner
+3366; 2606 16650 CONSTRAINT comercial pagos pagos_pkey p8_owner
+3362; 2606 16611 CONSTRAINT comercial pedidos pedidos_pkey p8_owner
+3359; 2606 16597 CONSTRAINT comercial productos productos_pkey p8_owner
+3360; 1259 16666 INDEX comercial idx_pedidos_estado p8_owner
+3357; 1259 16667 INDEX comercial idx_productos_nombre_trgm p8_owner
+3373; 2620 16670 TRIGGER comercial pedidos trg_pedido_estado p8_owner
+3370; 2606 16628 FK CONSTRAINT comercial detalles detalles_pedido_id_fkey p8_owner
+3371; 2606 16633 FK CONSTRAINT comercial detalles detalles_producto_id_fkey p8_owner
+3372; 2606 16651 FK CONSTRAINT comercial pagos pagos_pedido_id_fkey p8_owner
+3369; 2606 16612 FK CONSTRAINT comercial pedidos pedidos_cliente_id_fkey p8_owner
+3534; 0 16677 MATERIALIZED VIEW DATA reportes mv_ventas_pagadas p8_owner
+=== INVENTARIO REAL DE reportes_db ===
+;
+; Archive created at 2026-11-20 04:07:05 UTC
+;     dbname: reportes_db
+;     TOC Entries: 13
+;     Compression: gzip
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 18.6
+;     Dumped by pg_dump version: 18.6
+;
+;
+; Selected TOC Entries:
+;
+7; 2615 16684 SCHEMA - externo p8_owner
+3412; 0 0 ACL - SCHEMA externo p8_owner
+2; 3079 16570 EXTENSION - postgres_fdw
+3413; 0 0 COMMENT - EXTENSION postgres_fdw
+2059; 1417 16685 SERVER - p8_ventas_server postgres
+3414; 0 0 ACL - FOREIGN SERVER p8_ventas_server postgres
+3415; 0 0 USER MAPPING - USER MAPPING p8_reporter SERVER p8_ventas_server postgres
+221; 1259 16687 FOREIGN TABLE externo pedidos postgres
+3416; 0 0 ACL externo TABLE pedidos postgres
+=== BASE EXCLUIDA ===
+  datname
+------------
+ sandbox_db
+(1 row)
+
+SECCION_1_EXPORTACION=PASS
+
+EXIT_CODE=0
+
+============================================================
+ETAPA: 02_RESTAURAR_ROLES_Y_TABLESPACE
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+mkdir -p /opt/p8/production/tablespaces/indices
+chown -R postgres:postgres /opt/p8/production/tablespaces
+chmod 700 /opt/p8/production/tablespaces/indices
+echo '=== RESTAURAR GLOBALES CON RUTA ADAPTADA ==='
+sed -e '/^CREATE ROLE postgres;/d' -e '/^ALTER ROLE postgres /d' -e 's#/srv/p8/development/tablespaces/indices#/opt/p8/production/tablespaces/indices#g' /tmp/p8-integrado-p8-globales.sql | runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
+echo 'GLOBALES_RESTAURADOS_DESDE_P1=PASS'
+
+SALIDA REAL
+
+=== RESTAURAR GLOBALES CON RUTA ADAPTADA ===
+SET
+SET
+SET
+CREATE ROLE
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
+CREATE TABLESPACE
+GRANT
+GLOBALES_RESTAURADOS_DESDE_P1=PASS
+
+EXIT_CODE=0
+
+============================================================
+ETAPA: 02_RESTAURAR_BASES_Y_ADAPTAR_FDW
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+q() { runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$1"; }
+roles=$(q "SELECT count(*) FROM pg_roles WHERE rolname IN ('p8_owner','p8_app','p8_reader','p8_reporter');")
+ts=$(q "SELECT pg_tablespace_location(oid) FROM pg_tablespace WHERE spcname='p8_ts_indices';")
+priv=$(q "SELECT has_tablespace_privilege('p8_owner','p8_ts_indices','CREATE');")
+bases=$(q "SELECT count(*) FROM pg_database WHERE datname IN ('ventas_db','reportes_db','sandbox_db');")
+test "$roles" = '4'
+test "$ts" = '/opt/p8/production/tablespaces/indices'
+test "$priv" = 't'
+test "$bases" = '0'
+echo '=== RESTAURAR ventas_db, INCLUIDA LA CREACION DE LA BASE ==='
+runuser -u postgres -- pg_restore -h 127.0.0.1 -U postgres -C -d postgres --exit-on-error --verbose /tmp/p8-integrado-ventas_db.dump 2>&1
+echo '=== RESTAURAR reportes_db, INCLUIDA LA CREACION DE LA BASE ==='
+runuser -u postgres -- pg_restore -h 127.0.0.1 -U postgres -C -d postgres --exit-on-error --verbose /tmp/p8-integrado-reportes_db.dump 2>&1
+echo '=== ADAPTAR EL HOST FDW ==='
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d reportes_db -v ON_ERROR_STOP=1 -c "ALTER SERVER p8_ventas_server OPTIONS (SET host 'p8-prod-lab');"
+echo 'SECCION_2_RESTAURACION=PASS'
+
+SALIDA REAL
+
+=== RESTAURAR ventas_db, INCLUIDA LA CREACION DE LA BASE ===
+pg_restore: connecting to database for restore
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
+pg_restore: creating DATABASE "ventas_db"
+pg_restore: connecting to new database "ventas_db"
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
+pg_restore: creating SCHEMA "auditoria"
+pg_restore: creating SCHEMA "comercial"
+pg_restore: creating SCHEMA "reportes"
+pg_restore: creating EXTENSION "pg_stat_statements"
+pg_restore: creating COMMENT "EXTENSION pg_stat_statements"
+pg_restore: creating EXTENSION "pg_trgm"
+pg_restore: creating COMMENT "EXTENSION pg_trgm"
+pg_restore: creating FUNCTION "auditoria.registrar_cambio_pedido()"
+pg_restore: creating PROCEDURE "comercial.registrar_pago(bigint, numeric)"
+pg_restore: creating FUNCTION "comercial.total_pedido(bigint)"
+pg_restore: creating TABLE "auditoria.cambios_pedidos"
+pg_restore: creating SEQUENCE "auditoria.cambios_pedidos_auditoria_id_seq"
+pg_restore: creating TABLE "comercial.clientes"
+pg_restore: creating TABLE "comercial.detalles"
+pg_restore: creating SEQUENCE "comercial.pagos_seq"
+pg_restore: creating TABLE "comercial.pagos"
+pg_restore: creating TABLE "comercial.pedidos"
+pg_restore: creating SEQUENCE "comercial.pedidos_pedido_id_seq"
+pg_restore: creating TABLE "comercial.productos"
+pg_restore: creating VIEW "reportes.v_ventas_pagadas"
+pg_restore: creating MATERIALIZED VIEW "reportes.mv_ventas_pagadas"
+pg_restore: processing data for table "auditoria.cambios_pedidos"
+pg_restore: processing data for table "comercial.clientes"
+pg_restore: processing data for table "comercial.detalles"
+pg_restore: processing data for table "comercial.pagos"
+pg_restore: processing data for table "comercial.pedidos"
+pg_restore: processing data for table "comercial.productos"
+pg_restore: executing SEQUENCE SET cambios_pedidos_auditoria_id_seq
+pg_restore: executing SEQUENCE SET pagos_seq
+pg_restore: executing SEQUENCE SET pedidos_pedido_id_seq
+pg_restore: creating CONSTRAINT "auditoria.cambios_pedidos cambios_pedidos_pkey"
+pg_restore: creating CONSTRAINT "comercial.clientes clientes_pkey"
+pg_restore: creating CONSTRAINT "comercial.detalles detalles_pkey"
+pg_restore: creating CONSTRAINT "comercial.pagos pagos_pkey"
+pg_restore: creating CONSTRAINT "comercial.pedidos pedidos_pkey"
+pg_restore: creating CONSTRAINT "comercial.productos productos_pkey"
+pg_restore: creating INDEX "comercial.idx_pedidos_estado"
+pg_restore: creating INDEX "comercial.idx_productos_nombre_trgm"
+pg_restore: creating TRIGGER "comercial.pedidos trg_pedido_estado"
+pg_restore: creating FK CONSTRAINT "comercial.detalles detalles_pedido_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.detalles detalles_producto_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.pagos pagos_pedido_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.pedidos pedidos_cliente_id_fkey"
+pg_restore: creating ACL "SCHEMA comercial"
+pg_restore: creating ACL "SCHEMA reportes"
+pg_restore: creating ACL "comercial.PROCEDURE registrar_pago(IN p_pedido_id bigint, IN p_monto numeric)"
+pg_restore: creating ACL "comercial.FUNCTION total_pedido(p_pedido_id bigint)"
+pg_restore: creating ACL "comercial.TABLE clientes"
+pg_restore: creating ACL "comercial.TABLE detalles"
+pg_restore: creating ACL "comercial.SEQUENCE pagos_seq"
+pg_restore: creating ACL "comercial.TABLE pagos"
+pg_restore: creating ACL "comercial.TABLE pedidos"
+pg_restore: creating ACL "comercial.SEQUENCE pedidos_pedido_id_seq"
+pg_restore: creating ACL "comercial.TABLE productos"
+pg_restore: creating ACL "reportes.TABLE v_ventas_pagadas"
+pg_restore: creating ACL "reportes.TABLE mv_ventas_pagadas"
+pg_restore: creating MATERIALIZED VIEW DATA "reportes.mv_ventas_pagadas"
+=== RESTAURAR reportes_db, INCLUIDA LA CREACION DE LA BASE ===
+pg_restore: connecting to database for restore
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
+pg_restore: creating DATABASE "reportes_db"
+pg_restore: connecting to new database "reportes_db"
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
+pg_restore: creating SCHEMA "externo"
+pg_restore: creating EXTENSION "postgres_fdw"
+pg_restore: creating COMMENT "EXTENSION postgres_fdw"
+pg_restore: creating SERVER "p8_ventas_server"
+pg_restore: creating USER MAPPING "USER MAPPING p8_reporter SERVER p8_ventas_server"
+pg_restore: creating FOREIGN TABLE "externo.pedidos"
+pg_restore: creating ACL "SCHEMA externo"
+pg_restore: creating ACL "FOREIGN SERVER p8_ventas_server"
+pg_restore: creating ACL "externo.TABLE pedidos"
+=== ADAPTAR EL HOST FDW ===
+ALTER SERVER
+SECCION_2_RESTAURACION=PASS
+
+EXIT_CODE=0
+
+============================================================
+ETAPA: DESARROLLO
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+q() { runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U postgres -d "$1" -v ON_ERROR_STOP=1 -c "$2"; }
+echo '=== BASES DEL ALCANCE ==='
+q postgres "SELECT 'BASES_COMERCIALES|'||count(*) FROM pg_database WHERE datname IN ('ventas_db','reportes_db');"
+q postgres "SELECT 'SANDBOX|'||count(*) FROM pg_database WHERE datname='sandbox_db';"
+echo '=== ESTRUCTURAS Y PROPIETARIOS ==='
+q ventas_db "SELECT 'OBJ|'||n.nspname||'.'||c.relname||'|'||c.relkind::text||'|'||pg_get_userbyid(c.relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('comercial','auditoria','reportes') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'FUNC|'||p.oid::regprocedure::text||'|'||p.prokind::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('comercial','auditoria') ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== CONTEOS Y HASHES DE TABLAS ==='
+q ventas_db "
+SELECT 'DATOS|clientes|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM comercial.clientes t
+UNION ALL SELECT 'DATOS|productos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY producto_id),'')) FROM comercial.productos t
+UNION ALL SELECT 'DATOS|pedidos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id),'')) FROM comercial.pedidos t
+UNION ALL SELECT 'DATOS|detalles|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id,producto_id),'')) FROM comercial.detalles t
+UNION ALL SELECT 'DATOS|pagos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pago_id),'')) FROM comercial.pagos t
+UNION ALL SELECT 'DATOS|auditoria|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY auditoria_id),'')) FROM auditoria.cambios_pedidos t
+UNION ALL SELECT 'DATOS|vista_materializada|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM reportes.mv_ventas_pagadas t
+ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== ESTADOS DE SECUENCIAS ==='
+q ventas_db "SELECT 'SEQ|pagos|'||last_value||'|'||is_called FROM comercial.pagos_seq UNION ALL SELECT 'SEQ|pedidos|'||last_value||'|'||is_called FROM comercial.pedidos_pedido_id_seq UNION ALL SELECT 'SEQ|auditoria|'||last_value||'|'||is_called FROM auditoria.cambios_pedidos_auditoria_id_seq ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== PERMISOS Y CHECK ==='
+q ventas_db "SELECT 'PERM|reader_SELECT|'||has_table_privilege('p8_reader','comercial.pedidos','SELECT') UNION ALL SELECT 'PERM|reader_UPDATE|'||has_table_privilege('p8_reader','comercial.pedidos','UPDATE') UNION ALL SELECT 'PERM|app_UPDATE|'||has_table_privilege('p8_app','comercial.pedidos','UPDATE') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'CHECK|pedidos_estado_check|'||convalidated||'|'||(pg_get_constraintdef(oid) LIKE '%PENDIENTE%' AND pg_get_constraintdef(oid) LIKE '%PAGADO%' AND pg_get_constraintdef(oid) LIKE '%CANCELADO%') FROM pg_constraint WHERE conname='pedidos_estado_check';" | sed 's/^/COMPARE|/'
+echo '=== FDW ==='
+q reportes_db "SELECT 'FDW_HOST|'||split_part(opt,'=',2) FROM pg_foreign_server f CROSS JOIN LATERAL unnest(f.srvoptions) AS opts(opt) WHERE f.srvname='p8_ventas_server' AND opt LIKE 'host=%';"
+q reportes_db "SELECT 'FDW_MAPPING|'||count(*) FROM pg_user_mappings WHERE usename='p8_reporter' AND srvname='p8_ventas_server';"
+runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U p8_reporter -d reportes_db -v ON_ERROR_STOP=1 -c "SELECT 'FDW_FILAS|'||count(*) FROM externo.pedidos;"
+echo 'MONITOREO=PASS'
+
+SALIDA REAL
+
+=== BASES DEL ALCANCE ===
+BASES_COMERCIALES|2
+SANDBOX|1
+=== ESTRUCTURAS Y PROPIETARIOS ===
+COMPARE|OBJ|auditoria.cambios_pedidos_auditoria_id_seq|S|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos_pkey|i|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos|r|p8_owner
+COMPARE|OBJ|comercial.clientes_pkey|i|p8_owner
+COMPARE|OBJ|comercial.clientes|r|p8_owner
+COMPARE|OBJ|comercial.detalles_pkey|i|p8_owner
+COMPARE|OBJ|comercial.detalles|r|p8_owner
+COMPARE|OBJ|comercial.idx_pedidos_estado|i|p8_owner
+COMPARE|OBJ|comercial.idx_productos_nombre_trgm|i|p8_owner
+COMPARE|OBJ|comercial.pagos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pagos_seq|S|p8_owner
+COMPARE|OBJ|comercial.pagos|r|p8_owner
+COMPARE|OBJ|comercial.pedidos_pedido_id_seq|S|p8_owner
+COMPARE|OBJ|comercial.pedidos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pedidos|r|p8_owner
+COMPARE|OBJ|comercial.productos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.productos|r|p8_owner
+COMPARE|OBJ|reportes.mv_ventas_pagadas|m|p8_owner
+COMPARE|OBJ|reportes.v_ventas_pagadas|v|p8_owner
+COMPARE|FUNC|auditoria.registrar_cambio_pedido()|f
+COMPARE|FUNC|comercial.registrar_pago(bigint,numeric)|p
+COMPARE|FUNC|comercial.total_pedido(bigint)|f
+=== CONTEOS Y HASHES DE TABLAS ===
+COMPARE|DATOS|auditoria|0|d41d8cd98f00b204e9800998ecf8427e
+COMPARE|DATOS|clientes|2|230719980092c0d7f8c6d05c6553777f
+COMPARE|DATOS|detalles|3|b895d47f4742110f8eec92a585c9627a
+COMPARE|DATOS|pagos|1|39e0a273120d06358e120e733bb6f784
+COMPARE|DATOS|pedidos|2|4e3afac22b023b199ef8a903c738309c
+COMPARE|DATOS|productos|3|cff17dea028ec0d8d593bc4ade3d3978
+COMPARE|DATOS|vista_materializada|2|4afc6f1f68f12e499b1144db348068bb
+=== ESTADOS DE SECUENCIAS ===
+COMPARE|SEQ|auditoria|1|false
+COMPARE|SEQ|pagos|9002|false
+COMPARE|SEQ|pedidos|5003|false
+=== PERMISOS Y CHECK ===
+COMPARE|PERM|app_UPDATE|true
+COMPARE|PERM|reader_SELECT|true
+COMPARE|PERM|reader_UPDATE|false
+COMPARE|CHECK|pedidos_estado_check|true|true
+=== FDW ===
+FDW_HOST|p8-dev-lab
+FDW_MAPPING|1
+FDW_FILAS|2
+MONITOREO=PASS
+
+EXIT_CODE=0
+
+============================================================
+ETAPA: PRODUCCION
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+q() { runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U postgres -d "$1" -v ON_ERROR_STOP=1 -c "$2"; }
+echo '=== BASES DEL ALCANCE ==='
+q postgres "SELECT 'BASES_COMERCIALES|'||count(*) FROM pg_database WHERE datname IN ('ventas_db','reportes_db');"
+q postgres "SELECT 'SANDBOX|'||count(*) FROM pg_database WHERE datname='sandbox_db';"
+echo '=== ESTRUCTURAS Y PROPIETARIOS ==='
+q ventas_db "SELECT 'OBJ|'||n.nspname||'.'||c.relname||'|'||c.relkind::text||'|'||pg_get_userbyid(c.relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('comercial','auditoria','reportes') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'FUNC|'||p.oid::regprocedure::text||'|'||p.prokind::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('comercial','auditoria') ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== CONTEOS Y HASHES DE TABLAS ==='
+q ventas_db "
+SELECT 'DATOS|clientes|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM comercial.clientes t
+UNION ALL SELECT 'DATOS|productos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY producto_id),'')) FROM comercial.productos t
+UNION ALL SELECT 'DATOS|pedidos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id),'')) FROM comercial.pedidos t
+UNION ALL SELECT 'DATOS|detalles|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id,producto_id),'')) FROM comercial.detalles t
+UNION ALL SELECT 'DATOS|pagos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pago_id),'')) FROM comercial.pagos t
+UNION ALL SELECT 'DATOS|auditoria|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY auditoria_id),'')) FROM auditoria.cambios_pedidos t
+UNION ALL SELECT 'DATOS|vista_materializada|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM reportes.mv_ventas_pagadas t
+ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== ESTADOS DE SECUENCIAS ==='
+q ventas_db "SELECT 'SEQ|pagos|'||last_value||'|'||is_called FROM comercial.pagos_seq UNION ALL SELECT 'SEQ|pedidos|'||last_value||'|'||is_called FROM comercial.pedidos_pedido_id_seq UNION ALL SELECT 'SEQ|auditoria|'||last_value||'|'||is_called FROM auditoria.cambios_pedidos_auditoria_id_seq ORDER BY 1;" | sed 's/^/COMPARE|/'
+echo '=== PERMISOS Y CHECK ==='
+q ventas_db "SELECT 'PERM|reader_SELECT|'||has_table_privilege('p8_reader','comercial.pedidos','SELECT') UNION ALL SELECT 'PERM|reader_UPDATE|'||has_table_privilege('p8_reader','comercial.pedidos','UPDATE') UNION ALL SELECT 'PERM|app_UPDATE|'||has_table_privilege('p8_app','comercial.pedidos','UPDATE') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'CHECK|pedidos_estado_check|'||convalidated||'|'||(pg_get_constraintdef(oid) LIKE '%PENDIENTE%' AND pg_get_constraintdef(oid) LIKE '%PAGADO%' AND pg_get_constraintdef(oid) LIKE '%CANCELADO%') FROM pg_constraint WHERE conname='pedidos_estado_check';" | sed 's/^/COMPARE|/'
+echo '=== FDW ==='
+q reportes_db "SELECT 'FDW_HOST|'||split_part(opt,'=',2) FROM pg_foreign_server f CROSS JOIN LATERAL unnest(f.srvoptions) AS opts(opt) WHERE f.srvname='p8_ventas_server' AND opt LIKE 'host=%';"
+q reportes_db "SELECT 'FDW_MAPPING|'||count(*) FROM pg_user_mappings WHERE usename='p8_reporter' AND srvname='p8_ventas_server';"
+runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U p8_reporter -d reportes_db -v ON_ERROR_STOP=1 -c "SELECT 'FDW_FILAS|'||count(*) FROM externo.pedidos;"
+echo 'MONITOREO=PASS'
+
+SALIDA REAL
+
+=== BASES DEL ALCANCE ===
+BASES_COMERCIALES|2
+SANDBOX|0
+=== ESTRUCTURAS Y PROPIETARIOS ===
+COMPARE|OBJ|auditoria.cambios_pedidos_auditoria_id_seq|S|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos_pkey|i|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos|r|p8_owner
+COMPARE|OBJ|comercial.clientes_pkey|i|p8_owner
+COMPARE|OBJ|comercial.clientes|r|p8_owner
+COMPARE|OBJ|comercial.detalles_pkey|i|p8_owner
+COMPARE|OBJ|comercial.detalles|r|p8_owner
+COMPARE|OBJ|comercial.idx_pedidos_estado|i|p8_owner
+COMPARE|OBJ|comercial.idx_productos_nombre_trgm|i|p8_owner
+COMPARE|OBJ|comercial.pagos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pagos_seq|S|p8_owner
+COMPARE|OBJ|comercial.pagos|r|p8_owner
+COMPARE|OBJ|comercial.pedidos_pedido_id_seq|S|p8_owner
+COMPARE|OBJ|comercial.pedidos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pedidos|r|p8_owner
+COMPARE|OBJ|comercial.productos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.productos|r|p8_owner
+COMPARE|OBJ|reportes.mv_ventas_pagadas|m|p8_owner
+COMPARE|OBJ|reportes.v_ventas_pagadas|v|p8_owner
+COMPARE|FUNC|auditoria.registrar_cambio_pedido()|f
+COMPARE|FUNC|comercial.registrar_pago(bigint,numeric)|p
+COMPARE|FUNC|comercial.total_pedido(bigint)|f
+=== CONTEOS Y HASHES DE TABLAS ===
+COMPARE|DATOS|auditoria|0|d41d8cd98f00b204e9800998ecf8427e
+COMPARE|DATOS|clientes|2|230719980092c0d7f8c6d05c6553777f
+COMPARE|DATOS|detalles|3|b895d47f4742110f8eec92a585c9627a
+COMPARE|DATOS|pagos|1|39e0a273120d06358e120e733bb6f784
+COMPARE|DATOS|pedidos|2|4e3afac22b023b199ef8a903c738309c
+COMPARE|DATOS|productos|3|cff17dea028ec0d8d593bc4ade3d3978
+COMPARE|DATOS|vista_materializada|2|4afc6f1f68f12e499b1144db348068bb
+=== ESTADOS DE SECUENCIAS ===
+COMPARE|SEQ|auditoria|1|false
+COMPARE|SEQ|pagos|9002|false
+COMPARE|SEQ|pedidos|5003|false
+=== PERMISOS Y CHECK ===
+COMPARE|PERM|app_UPDATE|true
+COMPARE|PERM|reader_SELECT|true
+COMPARE|PERM|reader_UPDATE|false
+COMPARE|CHECK|pedidos_estado_check|true|true
+=== FDW ===
+FDW_HOST|p8-prod-lab
+FDW_MAPPING|1
+FDW_FILAS|2
+MONITOREO=PASS
+
+EXIT_CODE=0
+
+============================================================
+ETAPA: MONITOREO_OPERATIVO
+============================================================
+
+COMANDOS EJECUTADOS
+
+set -euo pipefail
+echo '=== ESTADISTICAS ACTUALES (NO SON IDENTICAS AL ORIGEN) ==='
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SELECT datname,numbackends,xact_commit,deadlocks FROM pg_stat_database WHERE datname IN ('ventas_db','reportes_db') ORDER BY datname;"
+echo '=== PLAN DE EJECUCION ==='
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "EXPLAIN (ANALYZE,BUFFERS) SELECT * FROM comercial.pedidos WHERE estado='PAGADO';"
+echo '=== CONFIGURACION AUTOVACUUM ==='
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c 'SHOW autovacuum;'
+echo 'SECCION_3_MONITOREO=PASS'
+
+SALIDA REAL
+
+=== ESTADISTICAS ACTUALES (NO SON IDENTICAS AL ORIGEN) ===
+   datname   | numbackends | xact_commit | deadlocks
+-------------+-------------+-------------+-----------
+ reportes_db |           0 |          57 |         0
+ ventas_db   |           0 |         143 |         0
+(2 rows)
+
+=== PLAN DE EJECUCION ===
+                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------
+ Seq Scan on pedidos  (cost=0.00..1.02 rows=1 width=94) (actual time=0.042..0.057 rows=1.00 loops=1)
+   Filter: ((estado)::text = 'PAGADO'::text)
+   Rows Removed by Filter: 1
+   Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=87
+ Planning Time: 0.654 ms
+ Execution Time: 0.156 ms
+(8 rows)
+
+=== CONFIGURACION AUTOVACUUM ===
+ autovacuum
+------------
+ on
+(1 row)
+
+SECCION_3_MONITOREO=PASS
+
+EXIT_CODE=0
+
+============================================================
+APENDICE E - RESULTADO CONSOLIDADO
+============================================================
+
+SOURCE_COMPARE_ITEMS=36
+TARGET_COMPARE_ITEMS=36
+COMPARE_DIFFERENCES=0
+COMPARACION_DE_DATOS=PASS
+ADAPTACION_FDW=PASS
+EXCLUSION_SANDBOX=PASS
+P8_VALIDACION_FINAL_PASS=1
+RESTAURACIONES_REPETIDAS=0
+CONTENEDORES_REINICIADOS=0
+
+FIN DE LOS APENDICES DE LA PRACTICA 08

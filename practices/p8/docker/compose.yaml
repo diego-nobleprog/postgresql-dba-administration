@@ -1,0 +1,119 @@
+# Declarar los dos servidores PostgreSQL de P8.
+services:
+  # Definir el servidor A de desarrollo.
+  p8-dev:
+    # Utilizar Oracle Linux 9 y PostgreSQL 18.
+    image: postgresql-dba:18-p1
+    # Asignar un nombre exclusivo al contenedor.
+    container_name: p8-dev-lab
+    # Definir el hostname del servidor A.
+    hostname: p8-dev-lab
+    # Ejecutar la preparacion inicial con permisos de root.
+    user: root
+    # Configurar las variables del servidor de desarrollo.
+    environment:
+      # Identificar el rol de desarrollo.
+      P8_ROLE: dev
+      # Definir el directorio persistente de desarrollo.
+      P8_HOME: /srv/p8/development
+      # Definir el directorio PostgreSQL de desarrollo.
+      PGDATA: /srv/p8/development/pgdata
+    # Ejecutar automaticamente el script de ambientacion.
+    command: ["/bin/bash", "/opt/p8/scripts/00-bootstrap-container.sh"]
+    # Asignar dos CPU al contenedor.
+    cpus: 2.0
+    # Limitar la memoria a cuatro gigabytes.
+    mem_limit: 4g
+    # Asignar memoria compartida para PostgreSQL.
+    shm_size: 256m
+    # Definir los montajes utilizados por desarrollo.
+    volumes:
+      # Montar los scripts del repositorio en modo lectura.
+      - ../scripts:/opt/p8/scripts:ro
+      # Mantener datos y tablespaces en un volumen independiente.
+      - p8_dev_data:/srv/p8/development
+    # Conectar desarrollo exclusivamente a la red de P8.
+    networks:
+      # Utilizar la red privada del laboratorio.
+      - p8_migration_net
+    # Definir las verificaciones automaticas de disponibilidad.
+    healthcheck:
+      # Exigir PostgreSQL disponible y ambientacion terminada.
+      test: ["CMD-SHELL", "test -f /srv/p8/development/.p8-ready && pg_isready -h 127.0.0.1 -p 5432 -U postgres"]
+      # Verificar la disponibilidad cada cinco segundos.
+      interval: 5s
+      # Limitar cada verificacion a diez segundos.
+      timeout: 10s
+      # Permitir tiempo para inicializar las bases de datos.
+      start_period: 90s
+      # Establecer el numero maximo de intentos.
+      retries: 12
+    # Evitar reinicios automaticos ante errores de ambientacion.
+    restart: "no"
+
+  # Definir el servidor B de produccion.
+  p8-prod:
+    # Utilizar exactamente la misma imagen que desarrollo.
+    image: postgresql-dba:18-p1
+    # Asignar un nombre exclusivo al segundo contenedor.
+    container_name: p8-prod-lab
+    # Definir el hostname del servidor B.
+    hostname: p8-prod-lab
+    # Preparar los directorios con permisos de root.
+    user: root
+    # Configurar las variables del servidor productivo.
+    environment:
+      # Identificar el rol de produccion.
+      P8_ROLE: prod
+      # Definir el directorio persistente de produccion.
+      P8_HOME: /opt/p8/production
+      # Definir PGDATA en una ruta diferente.
+      PGDATA: /opt/p8/production/pgdata
+    # Utilizar el mismo inicializador del servidor A.
+    command: ["/bin/bash", "/opt/p8/scripts/00-bootstrap-container.sh"]
+    # Asignar los mismos dos CPU.
+    cpus: 2.0
+    # Asignar los mismos cuatro gigabytes de memoria.
+    mem_limit: 4g
+    # Asignar la misma memoria compartida.
+    shm_size: 256m
+    # Definir los montajes independientes de produccion.
+    volumes:
+      # Permitir lectura de los mismos scripts auxiliares.
+      - ../scripts:/opt/p8/scripts:ro
+      # Guardar los datos productivos en un volumen exclusivo.
+      - p8_prod_data:/opt/p8/production
+    # Conectar produccion a la red privada del laboratorio.
+    networks:
+      # Utilizar la misma red interna que desarrollo.
+      - p8_migration_net
+    # Verificar el estado del servidor productivo.
+    healthcheck:
+      # Comprobar que el servidor termino su preparacion y responde.
+      test: ["CMD-SHELL", "test -f /opt/p8/production/.p8-ready && pg_isready -h 127.0.0.1 -p 5432 -U postgres"]
+      # Repetir la comprobacion cada cinco segundos.
+      interval: 5s
+      # Limitar el tiempo de respuesta del healthcheck.
+      timeout: 10s
+      # Permitir la inicializacion del cluster.
+      start_period: 90s
+      # Establecer doce intentos.
+      retries: 12
+    # No ocultar errores mediante reinicios automaticos.
+    restart: "no"
+
+# Declarar los volumenes persistentes del laboratorio.
+volumes:
+  # Almacenar exclusivamente los datos de desarrollo.
+  p8_dev_data:
+  # Almacenar exclusivamente los datos de produccion.
+  p8_prod_data:
+
+# Declarar la red dedicada a P8.
+networks:
+  # Crear una red privada para comunicar ambos servidores.
+  p8_migration_net:
+    # Utilizar una red Docker de tipo bridge.
+    driver: bridge
+    # Impedir conexiones hacia redes externas.
+    internal: true
