@@ -8,3 +8,5 @@ practices/p7/scripts/*.sql text eol=lf
 practices/p7/scripts/*.ps1 text eol=lf
 practices/p7/*.txt text eol=lf
 /.gitattributes text eol=lf
+practices/p8/scripts/*.sh text eol=lf
+practices/p8/scripts/*.sql text eol=lf

@@ -1,394 +1,461 @@
 PRACTICA 08 - MIGRACION INTEGRAL DE POSTGRESQL
-MODULO 8 - MIGRACION Y VALIDACION
+PostgreSQL DBA - Administracion, Performance, Backup,
+Replicacion y Alta Disponibilidad
 
-============================================================
-OBJETIVO GENERAL
-============================================================
+==============================================================
+OBJETIVO DEL LABORATORIO
+==============================================================
 
-Migrar un ambiente PostgreSQL de desarrollo hacia produccion
-utilizando herramientas nativas, conservando:
+Vamos a migrar un sistema comercial desde un servidor PostgreSQL
+de DESARROLLO hacia otro servidor PostgreSQL de PRODUCCION.
 
-- Bases de datos.
-- Schemas y tablas.
-- Registros de negocio.
-- Roles y propietarios.
-- Tablespaces.
-- Permisos.
-- Secuencias.
-- Funciones y procedimientos.
-- Vistas y vistas materializadas.
-- Indices y restricciones.
-- Triggers.
-- Extensiones.
-- Dependencias y conexiones FDW.
+NO migraremos solamente los registros de las tablas.
 
-En esta practica realizaremos UN SOLO proceso integrado:
+Debemos conservar los objetos que hacen posible utilizar esos
+registros, protegerlos y mantener su integridad.
 
-1. INVENTARIAR Y EXPORTAR.
-2. RESTAURAR EN PRODUCCION.
-3. MONITOREAR Y COMPROBAR.
+ALCANCE EXACTO DE LA MIGRACION
 
-La regla principal sera:
+1. BASES DE DATOS
 
-LOS RESPALDOS SE GENERAN UNA SOLA VEZ.
+   ventas_db
+   reportes_db
 
-El inventario se obtiene de esos mismos respaldos.
+   Son las bases que requiere el sistema comercial.
 
-Los mismos archivos se transfieren y restauran.
+   sandbox_db NO se migrara porque es una base de pruebas.
 
-No repetiremos la extraccion objeto por objeto.
+2. SCHEMAS
 
-AMBIENTES
+   ventas_db:
+     comercial
+     auditoria
+     reportes
 
-DESARROLLO
-Contenedor: p8-dev-lab
-Servicio: p8-dev
-PostgreSQL: 18.6
+   reportes_db:
+     externo
 
-PRODUCCION
-Contenedor: p8-prod-lab
-Servicio: p8-prod
-PostgreSQL: 18.6
+   Los schemas organizan los objetos. Debemos conservarlos
+   para que las referencias a tablas y funciones sigan funcionando.
 
-Windows DaDesktop utiliza PowerShell.
-Los contenedores utilizan Bash.
+3. TABLAS Y REGISTROS
+
+   comercial.clientes
+   comercial.productos
+   comercial.pedidos
+   comercial.detalles
+   comercial.pagos
+   auditoria.cambios_pedidos
+
+   Se migraran sus definiciones y sus registros.
+
+4. ROLES
+
+   p8_owner
+   p8_app
+   p8_reader
+   p8_reporter
+
+   Los roles conservan la propiedad de objetos y los permisos
+   de las aplicaciones y usuarios.
+
+5. TABLESPACE
+
+   p8_ts_indices
+
+   Debe restaurarse porque forma parte de la configuracion de
+   almacenamiento del origen.
+
+   En produccion utilizara una ruta fisica diferente.
+
+6. SECUENCIAS
+
+   comercial.pagos_seq
+   comercial.pedidos_pedido_id_seq
+   auditoria.cambios_pedidos_auditoria_id_seq
+
+   Deben conservarse sus definiciones y valores actuales.
+
+   Una migracion que copia filas pero pierde el estado de las
+   secuencias puede generar identificadores repetidos.
+
+7. FUNCIONES, PROCEDIMIENTOS Y TRIGGERS
+
+   comercial.total_pedido(bigint)
+   comercial.registrar_pago(bigint,numeric)
+   auditoria.registrar_cambio_pedido()
+   comercial.pedidos.trg_pedido_estado
+
+   Estos objetos conservan la logica del sistema.
+
+8. VISTAS
+
+   reportes.v_ventas_pagadas
+   reportes.mv_ventas_pagadas
+
+   La segunda es una vista materializada; tambien debemos
+   conservar su contenido almacenado.
+
+9. INDICES Y RESTRICCIONES
+
+   Claves primarias.
+   Claves foraneas.
+   Restricciones CHECK.
+   idx_pedidos_estado.
+   idx_productos_nombre_trgm.
+
+   Se necesitan para conservar integridad y acceso eficiente.
+
+10. EXTENSIONES
+
+   pg_trgm
+   pg_stat_statements
+   postgres_fdw
+
+   Agregan funcionalidades utilizadas por el sistema.
+
+11. FOREIGN DATA WRAPPER
+
+   p8_ventas_server
+   USER MAPPING de p8_reporter
+   externo.pedidos
+
+   Permiten consultar datos de otra base PostgreSQL.
+
+   La definicion FDW se migra, pero las filas remotas
+   no se almacenan dentro del respaldo de reportes_db.
+
+12. PERMISOS Y PROPIETARIOS
+
+   Se conservaran los privilegios ACL asociados a los objetos.
+
+==============================================================
+ESTRATEGIA DE MIGRACION
+==============================================================
+
+Generaremos UN SOLO JUEGO de respaldos definitivos:
+
+- p8-globales.sql
+- ventas_db.dump
+- reportes_db.dump
+
+Despues inspeccionaremos esos archivos para obtener su inventario.
+
+Finalmente trasladaremos y restauraremos LOS MISMOS archivos.
+
+No realizaremos una segunda exportacion para cada objeto.
+
+SECCION 1: Inventario y exportacion.
+SECCION 2: Restauracion.
+SECCION 3: Monitoreo y comprobacion.
+
+==============================================================
+ORGANIZACION DE TERMINALES
+==============================================================
+
+TERMINAL 1
+
+Windows PowerShell.
+La utilizaremos para acceder al contenedor p8-dev-lab.
+
+TERMINAL 2
+
+Otra ventana Windows PowerShell.
+La utilizaremos para copiar los respaldos y acceder a p8-prod-lab.
+
+Cuando veamos:
+
+PS C:\...>
+
+Estamos en WINDOWS POWERSHELL.
+
+Cuando veamos:
+
+bash-5.1#
+
+Estamos dentro del contenedor Linux correspondiente.
 
 IMPORTANTE
 
-Las salidas reales corresponden a la corrida validada
+Los comandos docker y docker cp se ejecutan en PowerShell.
+
+Los comandos pg_dump, pg_restore, psql, mkdir y chown del
+laboratorio se ejecutan dentro de Bash cuando asi se indique.
+
+El comando exit sirve para regresar de Bash a PowerShell.
+
+==============================================================
+CONDICION INICIAL OBLIGATORIA
+==============================================================
+
+La restauracion solamente debe ejecutarse sobre un destino limpio.
+
+Si produccion ya contiene los roles, tablespace o bases del
+laboratorio, NO volveremos a ejecutar CREATE ROLE ni pg_restore -C.
+
+La corrida validada del laboratorio ya restauro ambas bases.
+
+Por eso, para consultar ese estado actual utilizaremos
+la SECCION 3, sin repetir las operaciones de restauracion.
+
+Las salidas documentadas proceden de la corrida satisfactoria
 del 20 de noviembre de 2026.
 
-Las operaciones CREATE y RESTORE corresponden al recorrido
-original sobre un destino limpio.
+No representan una invitacion a volver a ejecutar operaciones
+destructivas o de creacion sobre el ambiente actual.
 
-No debemos repetirlas sobre el destino ya restaurado.
-
-============================================================
+==============================================================
 SECCION 1 - INVENTARIO Y EXPORTACION
-============================================================
+==============================================================
 
-------------------------------------------------------------
-1.1. QUE DEBEMOS CONTEMPLAR EN UNA MIGRACION
-------------------------------------------------------------
+Existen varias herramientas de inventario PostgreSQL.
 
-Una migracion PostgreSQL no consiste solamente en copiar
-las filas de las tablas.
+psql:
+  \l+ permite listar bases.
+  \dn+ permite listar schemas.
+  \dt+ permite listar tablas.
+  \df+ permite listar funciones.
+  \des+ permite listar servidores externos.
 
-Tambien debemos conservar los objetos que permiten
-interpretar, proteger y utilizar esos datos.
+Catalogos:
+  pg_database
+  pg_roles
+  pg_class
+  pg_proc
+  pg_tablespace
 
-EJEMPLOS
+Sin embargo, en esta practica elegimos pg_dumpall, pg_dump
+y pg_restore --list.
 
-Una tabla puede tener 100 registros, pero tambien:
+La razon es sencilla: podemos inventariar los mismos
+respaldos definitivos que despues restauraremos.
 
-- Un propietario.
-- Una clave primaria.
-- Restricciones CHECK.
-- Relaciones FOREIGN KEY.
-- Indices.
-- Triggers.
-- Permisos de lectura y escritura.
+----------------------------------------------------------------------
 
-Si copiamos solamente los registros, no estamos
-reproduciendo completamente la base.
+1.1. Entrar al contenedor de desarrollo
 
-Adicionalmente, algunos objetos son globales del cluster:
+DONDE EJECUTAR: TERMINAL 1 - WINDOWS POWERSHELL
 
-- Roles.
-- Tablespaces.
-- Determinados privilegios.
-
-Esos elementos no quedan respaldados por el pg_dump
-individual de una base de datos.
-
-------------------------------------------------------------
-1.2. MANERAS DE REALIZAR UN INVENTARIO
-------------------------------------------------------------
-
-ALTERNATIVA 1 - METACOMANDOS PSQL
-
-Podemos ejecutar:
-
-\l+
-\dn+
-\dt+
-\df+
-\des+
-
-Permiten inspeccionar bases, schemas, tablas,
-rutinas y servidores externos.
-
-VENTAJA
-
-Son utiles para consultas administrativas rapidas.
-
-LIMITACION
-
-Debemos ejecutar varios comandos y no producen,
-por si solos, el respaldo completo que restauraremos.
-
-ALTERNATIVA 2 - CONSULTAS A LOS CATALOGOS
-
-Ejemplos:
-
-pg_database
-pg_roles
-pg_class
-pg_proc
-pg_tablespace
-
-VENTAJA
-
-Permiten construir inventarios personalizados.
-
-LIMITACION
-
-Necesitamos consultas diferentes para cada
-categoria de objetos.
-
-ALTERNATIVA 3 - PG_DUMPALL
-
-pg_dumpall permite exportar definiciones SQL
-del cluster y sus objetos globales.
-
-Es util cuando debemos inspeccionar o trasladar
-configuraciones del cluster.
-
-ALTERNATIVA 4 - PG_DUMP Y PG_RESTORE
-
-pg_dump permite obtener un respaldo completo
-de una base de datos.
-
-pg_restore --list permite inspeccionar los objetos
-de ese respaldo sin restaurarlos.
-
-ESTA ES LA COMBINACION QUE UTILIZAREMOS.
-
-------------------------------------------------------------
-1.3. HERRAMIENTAS SELECCIONADAS
-------------------------------------------------------------
-
-Utilizaremos:
-
-pg_dumpall --globals-only
-pg_dump -Fc
-pg_restore --list
-
-La primera herramienta exporta objetos globales.
-
-La segunda genera respaldos completos de bases.
-
-La tercera inspecciona el contenido de los respaldos.
-
-LO IMPORTANTE
-
-No tendremos un archivo temporal para inventariar
-y despues otro para migrar.
-
-El inventario se obtendra directamente de los
-archivos definitivos de migracion.
-
-------------------------------------------------------------
-1.4. ENTRAR AL CONTENEDOR DE DESARROLLO
-------------------------------------------------------------
-
-Desde Windows PowerShell, en la raiz del repositorio:
+COMANDO:
 
 docker compose -p nobleprog-p8 -f .\practices\p8\docker\compose.yaml exec -u root p8-dev /bin/bash
 
-EXPLICACION
+SALIDA REAL:
 
-docker compose:
-Administra la interaccion con los servicios.
+bash-5.1#
 
--p nobleprog-p8:
-Identifica el proyecto Compose.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
--f:
-Selecciona el archivo compose.yaml.
+docker compose administra los servicios definidos en compose.yaml.
 
-exec:
-Ejecuta un proceso en un contenedor existente.
+-p nobleprog-p8 identifica el proyecto Docker.
+-f selecciona compose.yaml.
+exec abre un proceso en un contenedor existente.
+-u root selecciona el usuario Linux.
+p8-dev identifica el servicio de desarrollo.
+/bin/bash abre una terminal Linux.
 
--u root:
-Selecciona el usuario Linux root.
+El prompt bash-5.1# confirma que ahora trabajamos dentro
+de desarrollo. No debemos ejecutar docker cp desde aqui.
 
-p8-dev:
-Servicio de desarrollo.
+----------------------------------------------------------------------
 
- /bin/bash:
-Abre la terminal Linux.
+1.2. Crear el directorio de respaldos
 
-A partir de aqui, los comandos de exportacion
-se ejecutan dentro de Bash.
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-------------------------------------------------------------
-1.5. PREPARAR LA CARPETA DE RESPALDOS
-------------------------------------------------------------
-
-COMANDO
+COMANDO:
 
 mkdir -p /srv/p8/development/backups
 
-EXPLICACION
+SALIDA REAL:
 
-mkdir:
-Crea un directorio.
+(El comando no produjo salida en consola.)
 
--p:
-Permite crear la estructura si no existe.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-COMANDO
+mkdir crea un directorio.
+-p permite crear los directorios intermedios si no existen.
+
+No recibir salida es normal. El comando simplemente vuelve
+a mostrar el prompt Bash cuando termina correctamente.
+
+----------------------------------------------------------------------
+
+1.3. Asignar propietario al directorio
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
 
 chown postgres:postgres /srv/p8/development/backups
 
-EXPLICACION
+SALIDA REAL:
 
-chown:
-Cambia el propietario Linux.
+(El comando no produjo salida en consola.)
 
-postgres:postgres:
-Usuario y grupo que administran PostgreSQL.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-------------------------------------------------------------
-1.6. EXPORTAR LOS OBJETOS GLOBALES
-------------------------------------------------------------
+chown modifica el propietario y grupo de la carpeta.
 
-COMANDO
+postgres:postgres indica usuario y grupo Linux.
+
+Esta operacion permite que el usuario postgres escriba
+los archivos de respaldo dentro del directorio.
+
+----------------------------------------------------------------------
+
+1.4. Exportar roles y tablespace
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
 
 runuser -u postgres -- pg_dumpall -h 127.0.0.1 -U postgres --globals-only --no-role-passwords -f /srv/p8/development/backups/p8-globales.sql
 
-QUE HACE
+SALIDA REAL:
 
-Genera el archivo p8-globales.sql con las definiciones
-globales que necesitamos trasladar.
+(El comando no imprimio SQL porque utilizo -f.)
 
-EXPLICACION DE CADA PARTE
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-runuser -u postgres --:
-Ejecuta la herramienta como el usuario Linux postgres.
+runuser -u postgres ejecuta la herramienta como usuario Linux postgres.
 
-pg_dumpall:
-Herramienta de exportacion del cluster PostgreSQL.
+pg_dumpall exporta objetos del cluster.
+-h 127.0.0.1 conecta al PostgreSQL del contenedor.
+-U postgres indica el rol de conexion.
+--globals-only selecciona los objetos globales.
+--no-role-passwords omite las contrasenas de los roles.
+-f guarda el respaldo SQL.
 
--h 127.0.0.1:
-Conecta por TCP al servidor del contenedor.
+Archivo producido: p8-globales.sql.
 
--U postgres:
-Utiliza el rol administrativo PostgreSQL postgres.
+Los roles se exportan aqui porque no pertenecen
+exclusivamente a ventas_db o reportes_db.
 
---globals-only:
-Incluye roles, tablespaces y otros objetos globales.
+IMPORTANTE: las credenciales omitidas deben aprovisionarse
+despues. Esto afectara la autenticacion de postgres_fdw.
 
---no-role-passwords:
-No incluye los verificadores de contrasenas.
+----------------------------------------------------------------------
 
--f:
-Guarda la salida SQL en un archivo real.
+1.5. Exportar ventas_db completa
 
-IMPORTANTE
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-Al utilizar --no-role-passwords debemos aprovisionar
-las credenciales necesarias en el destino por separado.
-
-Esto sera importante al comprobar postgres_fdw.
-
-------------------------------------------------------------
-1.7. EXPORTAR LAS BASES COMPLETAS
-------------------------------------------------------------
-
-COMANDO 1
+COMANDO:
 
 runuser -u postgres -- pg_dump -h 127.0.0.1 -U postgres -d ventas_db -Fc -f /srv/p8/development/backups/ventas_db.dump
 
-COMANDO 2
+SALIDA REAL:
 
-runuser -u postgres -- pg_dump -h 127.0.0.1 -U postgres -d reportes_db -Fc -f /srv/p8/development/backups/reportes_db.dump
+(El comando no produjo salida; escribio ventas_db.dump.)
 
-EXPLICACION DE CADA PARTE
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-pg_dump:
-Genera un respaldo logico PostgreSQL.
-
--d:
-Indica la base que exportaremos.
-
--Fc:
-Selecciona el formato custom.
-
--f:
-Indica el archivo donde se guardara el respaldo.
+pg_dump genera un respaldo logico de una base de datos.
+-d ventas_db selecciona la base.
+-Fc indica formato custom.
+-f especifica el archivo de destino.
 
 No utilizamos --schema-only.
 
-Por tanto, los respaldos incluyen definiciones
-estructurales y registros de las tablas.
+Por eso el respaldo incluye las estructuras y los datos
+que corresponden a los objetos respaldados de ventas_db.
 
-No exportamos sandbox_db.
+Este archivo sera el mismo que restauraremos en produccion.
 
-------------------------------------------------------------
-1.8. INSPECCIONAR LOS RESPALDOS OBTENIDOS
-------------------------------------------------------------
+----------------------------------------------------------------------
 
-COMANDO
+1.6. Exportar reportes_db completa
 
-runuser -u postgres -- pg_restore --list /srv/p8/development/backups/ventas_db.dump
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-COMANDO
+COMANDO:
 
-runuser -u postgres -- pg_restore --list /srv/p8/development/backups/reportes_db.dump
+runuser -u postgres -- pg_dump -h 127.0.0.1 -U postgres -d reportes_db -Fc -f /srv/p8/development/backups/reportes_db.dump
 
-EXPLICACION
+SALIDA REAL:
 
-pg_restore:
-Herramienta para restaurar e inspeccionar respaldos.
+(El comando no produjo salida; escribio reportes_db.dump.)
 
---list:
-Muestra su Table of Contents (TOC).
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-No ejecuta ninguna restauracion.
+El funcionamiento de -d, -Fc y -f es el mismo que antes.
 
-DIFERENCIA IMPORTANTE
+El respaldo conserva la definicion de postgres_fdw,
+el servidor externo, el mapeo de usuario y la foreign table.
 
-Ahora estamos inspeccionando archivos que ya existen.
+No incluye una segunda copia de las filas remotas.
 
-No estamos generando un nuevo respaldo temporal
-para averiguar que debemos migrar.
+----------------------------------------------------------------------
 
-TOC Entries:
-Cantidad de entradas del archivo.
+1.7. Verificar los tres respaldos
 
-No representa la cantidad de tablas.
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-TABLE:
-Definicion de una tabla.
+COMANDO:
 
-TABLE DATA:
-Registros que contiene el respaldo.
+base=/srv/p8/development/backups
+for name in p8-globales.sql ventas_db.dump reportes_db.dump; do
+    test -s "$base/$name"
+    hash=$(sha256sum "$base/$name")
+    echo "HASH_SRC|$name|${hash%% *}"
+    ls -lh "$base/$name"
+done
 
-SEQUENCE:
-Definicion de una secuencia.
-
-SEQUENCE SET:
-Estado restaurable de la secuencia.
-
-ACL:
-Permisos asociados a objetos.
-
-MATERIALIZED VIEW DATA:
-Contenido almacenado de una vista materializada.
-
-FOREIGN TABLE:
-Definicion de una tabla externa, no una copia
-fisica de los datos remotos.
-
-------------------------------------------------------------
-1.9. SALIDA REAL DEL INVENTARIO
-------------------------------------------------------------
+SALIDA REAL:
 
 HASH_SRC|p8-globales.sql|1c96f3c32107719e36d49b0a5f31daad1d1e2476074b252ae98f0d6b3a5630e0
+-rw-r--r-- 1 postgres postgres 1.2K Nov 20 04:07 /srv/p8/development/backups/p8-globales.sql
 HASH_SRC|ventas_db.dump|d0c136b88d5bde654d8709c526b15e27f846443c15fff58c17468ba887faa0a5
+-rw-r--r-- 1 postgres postgres 21K Nov 20 04:07 /srv/p8/development/backups/ventas_db.dump
 HASH_SRC|reportes_db.dump|2cc56959bba896ae60d0ffea222ccccadb491a3fea9bcd57ddd9dc4e381756ca
+-rw-r--r-- 1 postgres postgres 3.2K Nov 20 04:07 /srv/p8/development/backups/reportes_db.dump
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+test -s confirma que cada archivo existe y no esta vacio.
+
+sha256sum calcula su huella SHA-256.
+echo imprime la huella identificada como HASH_SRC.
+ls -lh presenta permisos, propietario y tamano.
+
+En esta corrida los respaldos midieron aproximadamente:
+
+p8-globales.sql: 1.2 KB
+ventas_db.dump: 21 KB
+reportes_db.dump: 3.2 KB
+
+Las huellas identifican los archivos de esa corrida.
+No deben compararse con las de un respaldo posterior.
+
+----------------------------------------------------------------------
+
+1.8. Inspeccionar el SQL global generado
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+cat /srv/p8/development/backups/p8-globales.sql
+
+SALIDA REAL:
+
+--
+-- PostgreSQL database cluster dump
+--
+
+\restrict bcQiHVDnEMJVSY4G21eIdqxXJasQ3hf8Bhsrf6O1nnRYTx0qqCeq6V2airzdr7B
+
+SET default_transaction_read_only = off;
+
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+
+--
+-- Roles
+--
+
 CREATE ROLE p8_app;
 ALTER ROLE p8_app WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
 CREATE ROLE p8_owner;
@@ -397,10 +464,116 @@ CREATE ROLE p8_reader;
 ALTER ROLE p8_reader WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
 CREATE ROLE p8_reporter;
 ALTER ROLE p8_reporter WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
+CREATE ROLE postgres;
+ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS;
+
+--
+-- User Configurations
+--
+
+
+
+
+
+
+--
+-- Tablespaces
+--
+
 CREATE TABLESPACE p8_ts_indices OWNER postgres LOCATION '/srv/p8/development/tablespaces/indices';
 GRANT ALL ON TABLESPACE p8_ts_indices TO p8_owner;
+
+
+\unrestrict bcQiHVDnEMJVSY4G21eIdqxXJasQ3hf8Bhsrf6O1nnRYTx0qqCeq6V2airzdr7B
+
+--
+-- PostgreSQL database cluster dump complete
+--
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+cat imprime el contenido del archivo sin ejecutarlo.
+
+CREATE ROLE define los roles.
+ALTER ROLE establece sus atributos.
+LOGIN permite iniciar sesion.
+NOLOGIN impide iniciar sesion directamente.
+CREATE TABLESPACE define el almacenamiento.
+GRANT recupera los privilegios asociados.
+
+El respaldo tambien contiene el rol administrativo postgres.
+No debemos crearlo de nuevo porque ya existe en el destino.
+
+La ruta del tablespace corresponde a desarrollo y debe
+adaptarse al restaurar en produccion.
+
+Las lineas SET configuran la sesion SQL.
+\restrict y \unrestrict son metacomandos de proteccion.
+
+Ninguna de estas instrucciones se ha ejecutado todavia
+sobre el servidor productivo.
+
+----------------------------------------------------------------------
+
+1.9. Inventariar el respaldo de ventas_db
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+runuser -u postgres -- pg_restore --list /srv/p8/development/backups/ventas_db.dump
+
+SALIDA REAL:
+
+;
+; Archive created at 2026-11-20 04:07:04 UTC
 ;     dbname: ventas_db
 ;     TOC Entries: 61
+;     Compression: gzip
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 18.6
+;     Dumped by pg_dump version: 18.6
+;
+;
+; Selected TOC Entries:
+;
+8; 2615 16580 SCHEMA - auditoria p8_owner
+9; 2615 16578 SCHEMA - comercial p8_owner
+3541; 0 0 ACL - SCHEMA comercial p8_owner
+10; 2615 16579 SCHEMA - reportes p8_owner
+3542; 0 0 ACL - SCHEMA reportes p8_owner
+3; 3079 16526 EXTENSION - pg_stat_statements
+3543; 0 0 COMMENT - EXTENSION pg_stat_statements
+2; 3079 16445 EXTENSION - pg_trgm
+3544; 0 0 COMMENT - EXTENSION pg_trgm
+268; 1255 16669 FUNCTION auditoria registrar_cambio_pedido() p8_owner
+284; 1255 16671 PROCEDURE comercial registrar_pago(bigint, numeric) p8_owner
+3545; 0 0 ACL comercial PROCEDURE registrar_pago(IN p_pedido_id bigint, IN p_monto numeric) p8_owner
+283; 1255 16668 FUNCTION comercial total_pedido(bigint) p8_owner
+3546; 0 0 ACL comercial FUNCTION total_pedido(p_pedido_id bigint) p8_owner
+234; 1259 16657 TABLE auditoria cambios_pedidos p8_owner
+233; 1259 16656 SEQUENCE auditoria cambios_pedidos_auditoria_id_seq p8_owner
+226; 1259 16581 TABLE comercial clientes p8_owner
+3547; 0 0 ACL comercial TABLE clientes p8_owner
+230; 1259 16617 TABLE comercial detalles p8_owner
+3548; 0 0 ACL comercial TABLE detalles p8_owner
+231; 1259 16638 SEQUENCE comercial pagos_seq p8_owner
+3549; 0 0 ACL comercial SEQUENCE pagos_seq p8_owner
+232; 1259 16639 TABLE comercial pagos p8_owner
+3550; 0 0 ACL comercial TABLE pagos p8_owner
+229; 1259 16599 TABLE comercial pedidos p8_owner
+3551; 0 0 ACL comercial TABLE pedidos p8_owner
+228; 1259 16598 SEQUENCE comercial pedidos_pedido_id_seq p8_owner
+3552; 0 0 ACL comercial SEQUENCE pedidos_pedido_id_seq p8_owner
+227; 1259 16589 TABLE comercial productos p8_owner
+3553; 0 0 ACL comercial TABLE productos p8_owner
+235; 1259 16672 VIEW reportes v_ventas_pagadas p8_owner
+3554; 0 0 ACL reportes TABLE v_ventas_pagadas p8_owner
+236; 1259 16677 MATERIALIZED VIEW reportes mv_ventas_pagadas p8_owner
+3555; 0 0 ACL reportes TABLE mv_ventas_pagadas p8_owner
 3533; 0 16657 TABLE DATA auditoria cambios_pedidos p8_owner
 3525; 0 16581 TABLE DATA comercial clientes p8_owner
 3529; 0 16617 TABLE DATA comercial detalles p8_owner
@@ -410,237 +583,403 @@ GRANT ALL ON TABLESPACE p8_ts_indices TO p8_owner;
 3556; 0 0 SEQUENCE SET auditoria cambios_pedidos_auditoria_id_seq p8_owner
 3557; 0 0 SEQUENCE SET comercial pagos_seq p8_owner
 3558; 0 0 SEQUENCE SET comercial pedidos_pedido_id_seq p8_owner
+3368; 2606 16665 CONSTRAINT auditoria cambios_pedidos cambios_pedidos_pkey p8_owner
+3356; 2606 16588 CONSTRAINT comercial clientes clientes_pkey p8_owner
+3364; 2606 16627 CONSTRAINT comercial detalles detalles_pkey p8_owner
+3366; 2606 16650 CONSTRAINT comercial pagos pagos_pkey p8_owner
+3362; 2606 16611 CONSTRAINT comercial pedidos pedidos_pkey p8_owner
+3359; 2606 16597 CONSTRAINT comercial productos productos_pkey p8_owner
+3360; 1259 16666 INDEX comercial idx_pedidos_estado p8_owner
+3357; 1259 16667 INDEX comercial idx_productos_nombre_trgm p8_owner
+3373; 2620 16670 TRIGGER comercial pedidos trg_pedido_estado p8_owner
+3370; 2606 16628 FK CONSTRAINT comercial detalles detalles_pedido_id_fkey p8_owner
+3371; 2606 16633 FK CONSTRAINT comercial detalles detalles_producto_id_fkey p8_owner
+3372; 2606 16651 FK CONSTRAINT comercial pagos pagos_pedido_id_fkey p8_owner
+3369; 2606 16612 FK CONSTRAINT comercial pedidos pedidos_cliente_id_fkey p8_owner
 3534; 0 16677 MATERIALIZED VIEW DATA reportes mv_ventas_pagadas p8_owner
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+pg_restore --list inspecciona el contenido del respaldo custom.
+
+NO ejecuta una restauracion.
+
+TOC Entries: 61 significa que existen 61 entradas en la
+tabla de contenido, NO que la base tenga 61 tablas.
+
+Cada entrada contiene un identificador interno, tipo de objeto,
+schema, nombre y propietario.
+
+SCHEMA: agrupacion de objetos.
+TABLE: definicion de una tabla.
+TABLE DATA: contenido de una tabla.
+SEQUENCE: definicion de un generador.
+SEQUENCE SET: estado que se restaurara en ese generador.
+FUNCTION: funcion almacenada.
+PROCEDURE: procedimiento almacenado.
+VIEW: vista convencional.
+MATERIALIZED VIEW: vista materializada.
+MATERIALIZED VIEW DATA: datos almacenados de esa vista.
+INDEX: indice.
+CONSTRAINT: restriccion.
+FK CONSTRAINT: relacion de clave foranea.
+TRIGGER: objeto que responde a eventos.
+EXTENSION: funcionalidad adicional instalada.
+ACL: privilegios sobre un objeto.
+
+Ejemplo:
+
+TABLE comercial clientes
+
+Representa la definicion de comercial.clientes.
+
+TABLE DATA comercial clientes
+
+Representa los datos de esa misma tabla incluidos en el dump.
+
+Estas entradas no indican cuantas filas tiene la tabla.
+
+----------------------------------------------------------------------
+
+1.10. Inventariar el respaldo de reportes_db
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+runuser -u postgres -- pg_restore --list /srv/p8/development/backups/reportes_db.dump
+
+SALIDA REAL:
+
+;
+; Archive created at 2026-11-20 04:07:05 UTC
 ;     dbname: reportes_db
 ;     TOC Entries: 13
+;     Compression: gzip
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 18.6
+;     Dumped by pg_dump version: 18.6
+;
+;
+; Selected TOC Entries:
+;
+7; 2615 16684 SCHEMA - externo p8_owner
+3412; 0 0 ACL - SCHEMA externo p8_owner
+2; 3079 16570 EXTENSION - postgres_fdw
+3413; 0 0 COMMENT - EXTENSION postgres_fdw
 2059; 1417 16685 SERVER - p8_ventas_server postgres
 3414; 0 0 ACL - FOREIGN SERVER p8_ventas_server postgres
 3415; 0 0 USER MAPPING - USER MAPPING p8_reporter SERVER p8_ventas_server postgres
 221; 1259 16687 FOREIGN TABLE externo pedidos postgres
+3416; 0 0 ACL externo TABLE pedidos postgres
 
-COMO INTERPRETAR LA SALIDA
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-Los nombres de roles y tablespaces vienen del archivo
-global que genero pg_dumpall.
+TOC Entries: 13 significa 13 entradas del respaldo.
 
-Las entradas TABLE DATA y SEQUENCE SET demuestran que
-los respaldos custom incluyen mas que definiciones.
+SCHEMA externo es el espacio de nombres.
 
-Los identificadores numericos de las entradas TOC
-no son cantidades de filas.
+EXTENSION postgres_fdw proporciona acceso a otros servidores.
 
-Los hashes identifican el contenido exacto de cada
-archivo obtenido.
+SERVER p8_ventas_server define el servidor externo.
 
-------------------------------------------------------------
-1.10. DECISION DE MIGRACION
-------------------------------------------------------------
+USER MAPPING asocia p8_reporter con la identidad remota.
 
-MIGRAR
+FOREIGN TABLE externo.pedidos define una tabla externa.
 
-p8-globales.sql
-ventas_db.dump
-reportes_db.dump
+ACL conserva los permisos.
 
-EXCLUIR
+La foreign table representa un acceso remoto;
+no significa que el dump contenga sus registros remotos.
 
-sandbox_db
+----------------------------------------------------------------------
 
-ADAPTAR EN PRODUCCION
+1.11. Verificar la base excluida
 
-Ruta de p8_ts_indices:
-  /srv/p8/development/tablespaces/indices
-  ->
-  /opt/p8/production/tablespaces/indices
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-Servidor FDW:
-  p8-dev-lab
-  ->
-  p8-prod-lab
+COMANDO:
 
-RESULTADO
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname='sandbox_db';"
 
-SECCION_1_EXPORTACION=PASS
+SALIDA REAL:
 
-Los tres respaldos definitivos quedaron disponibles
-para transferirlos al ambiente productivo.
+datname
+------------
+ sandbox_db
+(1 row)
 
-============================================================
-SECCION 2 - RESTAURACION EN PRODUCCION
-============================================================
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-------------------------------------------------------------
-2.1. OBJETIVO
-------------------------------------------------------------
+psql ejecuta la consulta SQL.
+-X evita cargar configuraciones de psqlrc.
+-d postgres establece la base de conexion.
+-c ejecuta el SQL indicado.
 
-Restaurar los objetos del origen utilizando EXACTAMENTE
-los tres archivos generados en la seccion anterior.
+La respuesta demuestra que sandbox_db existe en desarrollo.
+
+Sin embargo, no generamos ningun respaldo de esa base.
+Por eso quedara excluida de la migracion.
+
+FIN DE LA SECCION 1.
+
+Los tres respaldos definitivos ya existen.
 
 No volveremos a ejecutar pg_dump ni pg_dumpall.
 
-BEFORE
+MANTENER abierta la Terminal 1 dentro de desarrollo.
 
-El destino original estaba limpio:
+ABRIR una Terminal 2 de Windows PowerShell para realizar
+las copias y la restauracion.
+
+==============================================================
+SECCION 2 - RESTAURACION EN PRODUCCION
+==============================================================
+
+Esta seccion corresponde a una restauracion INICIAL.
+
+La corrida original inicio con:
 
 PROD_ROLES=0
 PROD_BASES=0
 PROD_TABLESPACE=0
+DEST_MODE=CLEAN
 
-Estos valores indican que todavia no existian los
-objetos del laboratorio.
+Estos valores fueron generados por el control preparatorio
+del laboratorio.
 
-------------------------------------------------------------
-2.2. TRANSFERIR LOS ARCHIVOS A WINDOWS
-------------------------------------------------------------
+Si la base o los roles ya existen, DETENERSE.
 
-Salir de Bash:
+No ejecutar nuevamente CREATE ROLE ni pg_restore -C.
 
-exit
+TERMINAL 1 permanece en desarrollo.
+TERMINAL 2 comienza en Windows PowerShell.
 
-Desde PowerShell:
+----------------------------------------------------------------------
+
+2.1. Preparar carpeta de transferencia
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 $transfer = Join-Path (Get-Location).Path 'temp\p8-transferencia'
-
 New-Item -ItemType Directory -Force -Path $transfer | Out-Null
+
+SALIDA REAL:
+
+(Sin salida debido a Out-Null.)
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+Join-Path construye la ruta Windows.
+
+New-Item crea la carpeta donde copiaremos los respaldos.
+
+-Force permite reutilizar la carpeta si ya existe.
+
+Out-Null oculta la salida producida por New-Item.
+
+La variable $transfer se utilizara en las siguientes copias.
+
+----------------------------------------------------------------------
+
+2.2. Copiar respaldo global a Windows
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 docker cp 'p8-dev-lab:/srv/p8/development/backups/p8-globales.sql' (Join-Path $transfer 'p8-globales.sql')
 
+SALIDA REAL:
+
+COPY_EXIT_CODE=0
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+docker cp copia el archivo desde desarrollo a Windows.
+
+El prefijo p8-dev-lab: identifica el contenedor origen.
+
+La ruta construida por Join-Path es el archivo destino.
+
+COPY_EXIT_CODE=0 es la marca registrada por el controlador
+de la corrida original, no un mensaje nativo de Docker.
+
+No estamos creando un nuevo respaldo.
+
+----------------------------------------------------------------------
+
+2.3. Copiar ventas_db.dump a Windows
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
+
 docker cp 'p8-dev-lab:/srv/p8/development/backups/ventas_db.dump' (Join-Path $transfer 'ventas_db.dump')
+
+SALIDA REAL:
+
+COPY_EXIT_CODE=0
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+El archivo contiene estructura y datos de ventas_db.
+
+Docker solamente copia sus bytes.
+No se ejecuta nuevamente pg_dump.
+
+----------------------------------------------------------------------
+
+2.4. Copiar reportes_db.dump a Windows
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 docker cp 'p8-dev-lab:/srv/p8/development/backups/reportes_db.dump' (Join-Path $transfer 'reportes_db.dump')
 
-EXPLICACION
+SALIDA REAL:
 
-docker cp:
-Copia un archivo entre el contenedor y Windows.
+COPY_EXIT_CODE=0
 
-El primer argumento identifica el origen.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-El segundo argumento identifica el destino.
+Se copia el tercer archivo definitivo.
 
-No estamos generando otro respaldo.
+El codigo registrado confirma que la transferencia se completo.
 
-Solamente transferimos archivos ya existentes.
+----------------------------------------------------------------------
 
-------------------------------------------------------------
-2.3. VERIFICAR INTEGRIDAD DE LOS ARCHIVOS
-------------------------------------------------------------
+2.5. Verificar hashes en Windows
 
-COMANDO POWERSHELL
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $transfer 'p8-globales.sql')
-
 Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $transfer 'ventas_db.dump')
-
 Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $transfer 'reportes_db.dump')
 
-EXPLICACION
+SALIDA REAL:
 
-Get-FileHash calcula una huella digital del archivo.
-
-SHA256 es el algoritmo utilizado.
-
-Los hashes se comparan con los que produjo sha256sum
-dentro del contenedor de desarrollo.
-
-Si coinciden, las copias contienen los mismos bytes.
-
-RESULTADO REAL
-
+HASH_WINDOWS|p8-globales.sql|1c96f3c32107719e36d49b0a5f31daad1d1e2476074b252ae98f0d6b3a5630e0
+HASH_WINDOWS|ventas_db.dump|d0c136b88d5bde654d8709c526b15e27f846443c15fff58c17468ba887faa0a5
+HASH_WINDOWS|reportes_db.dump|2cc56959bba896ae60d0ffea222ccccadb491a3fea9bcd57ddd9dc4e381756ca
 HASHES_TRES_ARCHIVOS=PASS
 
-IMPORTANTE
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-Esto comprueba la transferencia.
+Get-FileHash calcula una huella del contenido del archivo.
+-Algorithm SHA256 selecciona el algoritmo.
+-LiteralPath utiliza la ruta exacta.
 
-Todavia no comprueba que los objetos se hayan restaurado.
+Las lineas HASH_WINDOWS fueron emitidas por el controlador
+original a partir de Get-FileHash. PowerShell, por si solo,
+normalmente presenta sus resultados como una tabla.
 
-------------------------------------------------------------
-2.4. TRANSFERIR A PRODUCCION
-------------------------------------------------------------
+Cada hash coincidio con el obtenido en desarrollo
+durante la misma corrida.
 
-COMANDOS POWERSHELL
+----------------------------------------------------------------------
+
+2.6. Copiar los archivos al contenedor productivo
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 docker cp (Join-Path $transfer 'p8-globales.sql') 'p8-prod-lab:/tmp/p8-integrado-p8-globales.sql'
-
 docker cp (Join-Path $transfer 'ventas_db.dump') 'p8-prod-lab:/tmp/p8-integrado-ventas_db.dump'
-
 docker cp (Join-Path $transfer 'reportes_db.dump') 'p8-prod-lab:/tmp/p8-integrado-reportes_db.dump'
 
-Los mismos tres respaldos ya estan disponibles
-dentro del contenedor productivo.
+SALIDA REAL:
 
-------------------------------------------------------------
-2.5. PREPARAR EL TABLESPACE PRODUCTIVO
-------------------------------------------------------------
+COPY_EXIT_CODE=0
+COPY_EXIT_CODE=0
+COPY_EXIT_CODE=0
+TRANSFERENCIA_Y_RESPALDOS=PASS
 
-Desde PowerShell:
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+En estas tres operaciones el origen es Windows.
+
+El destino es el contenedor p8-prod-lab.
+
+Los tres codigos de salida son registros del controlador
+que verifico las operaciones docker cp.
+
+Se trasladan exactamente los mismos archivos
+generados en la primera seccion.
+
+----------------------------------------------------------------------
+
+2.7. Entrar al contenedor de produccion
+
+DONDE EJECUTAR: TERMINAL 2 - WINDOWS POWERSHELL
+
+COMANDO:
 
 docker compose -p nobleprog-p8 -f .\practices\p8\docker\compose.yaml exec -u root p8-prod /bin/bash
 
-Dentro de Bash:
+SALIDA REAL:
+
+bash-5.1#
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+Estamos ahora dentro del contenedor productivo.
+
+La Terminal 1 continua dentro de desarrollo.
+
+La Terminal 2 pertenece a produccion.
+
+Aunque el prompt Bash es parecido, son servidores diferentes.
+
+----------------------------------------------------------------------
+
+2.8. Preparar directorio del tablespace
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
 
 mkdir -p /opt/p8/production/tablespaces/indices
-
 chown -R postgres:postgres /opt/p8/production/tablespaces
-
 chmod 700 /opt/p8/production/tablespaces/indices
 
-EXPLICACION
+SALIDA REAL:
 
-mkdir:
-Crea el directorio de almacenamiento.
+(Los tres comandos no produjeron salida.)
 
-chown:
-Asigna su propiedad al usuario postgres.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-chmod 700:
-Limita su acceso al propietario.
+mkdir crea el directorio fisico del tablespace.
 
-La ruta debe existir antes de restaurar el tablespace.
+chown asigna la propiedad de la ruta al usuario postgres.
 
-------------------------------------------------------------
-2.6. RESTAURAR LOS OBJETOS GLOBALES
-------------------------------------------------------------
+-R aplica el cambio de propiedad de forma recursiva.
 
-COMANDO
+chmod 700 permite acceso al propietario y restringe
+el acceso a otros usuarios.
+
+Este directorio debe existir antes de CREATE TABLESPACE.
+
+----------------------------------------------------------------------
+
+2.9. Restaurar los objetos globales
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION - SOLO DESTINO LIMPIO
+
+COMANDO:
 
 sed -e '/^CREATE ROLE postgres;/d' -e '/^ALTER ROLE postgres /d' -e 's#/srv/p8/development/tablespaces/indices#/opt/p8/production/tablespaces/indices#g' /tmp/p8-integrado-p8-globales.sql | runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-QUE HACE
-
-Lee el respaldo global y lo ejecuta en produccion.
-
-EXPLICACION
-
-sed:
-Procesa texto antes de enviarlo a psql.
-
-Primera expresion /d:
-Excluye CREATE ROLE postgres.
-
-Segunda expresion /d:
-Excluye ALTER ROLE postgres.
-
-Estas instrucciones se excluyen porque el superusuario
-administrativo ya existe en produccion.
-
-Expresion s#origen#destino#g:
-Adapta la ruta fisica del tablespace.
-
-El pipe |:
-Envia el SQL adaptado directamente a psql.
-
--v ON_ERROR_STOP=1:
-Detiene psql ante errores SQL.
-
-IMPORTANTE
-
-El archivo original no se modifica.
-
-La transformacion ocurre durante su ejecucion.
-
-SALIDA REAL
+SALIDA REAL:
 
 === RESTAURAR GLOBALES CON RUTA ADAPTADA ===
 SET
@@ -658,65 +997,58 @@ CREATE TABLESPACE
 GRANT
 GLOBALES_RESTAURADOS_DESDE_P1=PASS
 
-INTERPRETACION
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-Cada CREATE ROLE indica un rol creado.
+sed modifica el texto durante la lectura del archivo.
 
-Cada ALTER ROLE aplica sus atributos.
+La primera expresion omite CREATE ROLE postgres.
+La segunda omite ALTER ROLE postgres.
 
-CREATE TABLESPACE crea p8_ts_indices.
+Ambas instrucciones se excluyen porque ese rol
+administrativo ya existe en produccion.
 
-GRANT recupera los privilegios del tablespace.
+La tercera expresion sustituye la ruta del tablespace
+de desarrollo por la ruta correspondiente a produccion.
 
-Los objetos globales se restauraron desde el mismo
-archivo generado durante el inventario.
+El simbolo | envia el SQL resultante a psql.
 
-------------------------------------------------------------
-2.7. RESTAURAR LAS BASES COMPLETAS
-------------------------------------------------------------
+ON_ERROR_STOP=1 hace que psql se detenga ante errores.
 
-COMANDO 1
+SALIDAS:
+
+SET: configuraciones aplicadas a la sesion.
+CREATE ROLE: rol creado.
+ALTER ROLE: atributos del rol aplicados.
+CREATE TABLESPACE: tablespace creado.
+GRANT: permisos concedidos.
+
+GLOBALES_RESTAURADOS_DESDE_P1=PASS es una marca
+del controlador que verifico la operacion.
+
+----------------------------------------------------------------------
+
+2.10. Restaurar ventas_db
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION - SOLO DESTINO LIMPIO
+
+COMANDO:
 
 runuser -u postgres -- pg_restore -h 127.0.0.1 -U postgres -C -d postgres --exit-on-error --verbose /tmp/p8-integrado-ventas_db.dump
 
-COMANDO 2
+SALIDA REAL:
 
-runuser -u postgres -- pg_restore -h 127.0.0.1 -U postgres -C -d postgres --exit-on-error --verbose /tmp/p8-integrado-reportes_db.dump
-
-EXPLICACION
-
-pg_restore:
-Restaura el respaldo custom PostgreSQL.
-
--C:
-Crea la base indicada dentro del respaldo.
-
--d postgres:
-Se conecta inicialmente a postgres para
-poder crear la base de destino.
-
---exit-on-error:
-Detiene la restauracion ante un error.
-
---verbose:
-Muestra el progreso de cada objeto.
-
-No ejecutamos CREATE TABLE manualmente.
-
-No creamos funciones, indices ni triggers uno por uno.
-
-pg_restore utiliza el contenido del respaldo para
-reconstruirlos automaticamente.
-
-SALIDA REAL RELEVANTE
-
-=== RESTAURAR ventas_db, INCLUIDA LA CREACION DE LA BASE ===
+pg_restore: connecting to database for restore
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
 pg_restore: creating DATABASE "ventas_db"
+pg_restore: connecting to new database "ventas_db"
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
 pg_restore: creating SCHEMA "auditoria"
 pg_restore: creating SCHEMA "comercial"
 pg_restore: creating SCHEMA "reportes"
 pg_restore: creating EXTENSION "pg_stat_statements"
+pg_restore: creating COMMENT "EXTENSION pg_stat_statements"
 pg_restore: creating EXTENSION "pg_trgm"
+pg_restore: creating COMMENT "EXTENSION pg_trgm"
 pg_restore: creating FUNCTION "auditoria.registrar_cambio_pedido()"
 pg_restore: creating PROCEDURE "comercial.registrar_pago(bigint, numeric)"
 pg_restore: creating FUNCTION "comercial.total_pedido(bigint)"
@@ -740,206 +1072,347 @@ pg_restore: processing data for table "comercial.productos"
 pg_restore: executing SEQUENCE SET cambios_pedidos_auditoria_id_seq
 pg_restore: executing SEQUENCE SET pagos_seq
 pg_restore: executing SEQUENCE SET pedidos_pedido_id_seq
+pg_restore: creating CONSTRAINT "auditoria.cambios_pedidos cambios_pedidos_pkey"
+pg_restore: creating CONSTRAINT "comercial.clientes clientes_pkey"
+pg_restore: creating CONSTRAINT "comercial.detalles detalles_pkey"
+pg_restore: creating CONSTRAINT "comercial.pagos pagos_pkey"
+pg_restore: creating CONSTRAINT "comercial.pedidos pedidos_pkey"
+pg_restore: creating CONSTRAINT "comercial.productos productos_pkey"
+pg_restore: creating INDEX "comercial.idx_pedidos_estado"
+pg_restore: creating INDEX "comercial.idx_productos_nombre_trgm"
 pg_restore: creating TRIGGER "comercial.pedidos trg_pedido_estado"
+pg_restore: creating FK CONSTRAINT "comercial.detalles detalles_pedido_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.detalles detalles_producto_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.pagos pagos_pedido_id_fkey"
+pg_restore: creating FK CONSTRAINT "comercial.pedidos pedidos_cliente_id_fkey"
+pg_restore: creating ACL "SCHEMA comercial"
+pg_restore: creating ACL "SCHEMA reportes"
+pg_restore: creating ACL "comercial.PROCEDURE registrar_pago(IN p_pedido_id bigint, IN p_monto numeric)"
+pg_restore: creating ACL "comercial.FUNCTION total_pedido(p_pedido_id bigint)"
+pg_restore: creating ACL "comercial.TABLE clientes"
+pg_restore: creating ACL "comercial.TABLE detalles"
+pg_restore: creating ACL "comercial.SEQUENCE pagos_seq"
+pg_restore: creating ACL "comercial.TABLE pagos"
+pg_restore: creating ACL "comercial.TABLE pedidos"
+pg_restore: creating ACL "comercial.SEQUENCE pedidos_pedido_id_seq"
+pg_restore: creating ACL "comercial.TABLE productos"
+pg_restore: creating ACL "reportes.TABLE v_ventas_pagadas"
+pg_restore: creating ACL "reportes.TABLE mv_ventas_pagadas"
 pg_restore: creating MATERIALIZED VIEW DATA "reportes.mv_ventas_pagadas"
-=== RESTAURAR reportes_db, INCLUIDA LA CREACION DE LA BASE ===
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+pg_restore lee el archivo custom.
+
+-C crea la base indicada dentro del respaldo.
+
+-d postgres establece la conexion inicial necesaria
+para ejecutar CREATE DATABASE.
+
+--exit-on-error detiene la restauracion ante un error.
+
+--verbose imprime las acciones de restauracion.
+
+INTERPRETACION DE LA SALIDA:
+
+creating DATABASE: crea ventas_db.
+creating SCHEMA: restaura los schemas.
+creating EXTENSION: instala las extensiones.
+creating FUNCTION: restaura funciones.
+creating PROCEDURE: restaura procedimientos.
+creating TABLE: crea las tablas.
+processing data: carga los registros.
+executing SEQUENCE SET: recupera los estados de las secuencias.
+creating CONSTRAINT: crea restricciones.
+creating INDEX: crea indices.
+creating FK CONSTRAINT: recupera relaciones foraneas.
+creating TRIGGER: restaura triggers.
+creating ACL: recupera los permisos.
+creating MATERIALIZED VIEW DATA: restaura los datos materializados.
+
+No necesitamos crear manualmente cada uno de esos objetos.
+
+La herramienta utiliza las definiciones almacenadas
+en ventas_db.dump.
+
+----------------------------------------------------------------------
+
+2.11. Restaurar reportes_db
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION - SOLO DESTINO LIMPIO
+
+COMANDO:
+
+runuser -u postgres -- pg_restore -h 127.0.0.1 -U postgres -C -d postgres --exit-on-error --verbose /tmp/p8-integrado-reportes_db.dump
+
+SALIDA REAL:
+
+pg_restore: connecting to database for restore
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
 pg_restore: creating DATABASE "reportes_db"
+pg_restore: connecting to new database "reportes_db"
+pg_restore: executing SELECT pg_catalog.set_config('search_path', '', false);
 pg_restore: creating SCHEMA "externo"
 pg_restore: creating EXTENSION "postgres_fdw"
+pg_restore: creating COMMENT "EXTENSION postgres_fdw"
 pg_restore: creating SERVER "p8_ventas_server"
 pg_restore: creating USER MAPPING "USER MAPPING p8_reporter SERVER p8_ventas_server"
 pg_restore: creating FOREIGN TABLE "externo.pedidos"
-=== ADAPTAR EL HOST FDW ===
-ALTER SERVER
-SECCION_2_RESTAURACION=PASS
+pg_restore: creating ACL "SCHEMA externo"
+pg_restore: creating ACL "FOREIGN SERVER p8_ventas_server"
+pg_restore: creating ACL "externo.TABLE pedidos"
 
-COMO INTERPRETAR LA SALIDA
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-creating DATABASE:
-PostgreSQL crea la base.
+creating DATABASE crea reportes_db.
 
-creating SCHEMA:
-Restaura los schemas.
+creating SCHEMA restaura externo.
 
-creating TABLE:
-Restaura las definiciones de las tablas.
+creating EXTENSION postgres_fdw habilita la extension.
 
-processing data:
-Carga los registros.
+creating SERVER restaura la definicion p8_ventas_server.
 
-executing SEQUENCE SET:
-Restablece el estado de las secuencias.
+creating USER MAPPING restaura el mapeo de p8_reporter.
 
-creating FUNCTION / PROCEDURE:
-Restaura las rutinas.
+creating FOREIGN TABLE crea la definicion de externo.pedidos.
 
-creating INDEX / CONSTRAINT:
-Restaura indices y restricciones.
+creating ACL recupera los permisos.
 
-creating TRIGGER:
-Restaura el comportamiento asociado a eventos.
+Esto no comprueba todavia que la conexion remota funcione.
 
-creating ACL:
-Aplica los permisos.
+Debemos adaptar el host y verificar la autenticacion.
 
-creating USER MAPPING:
-Restaura el mapeo de usuario del servidor externo.
+----------------------------------------------------------------------
 
-------------------------------------------------------------
-2.8. ADAPTAR LA CONEXION FDW
-------------------------------------------------------------
+2.12. Configurar la conectividad FDW en produccion
 
-COMANDO
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDOS:
 
 runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d reportes_db -v ON_ERROR_STOP=1 -c "ALTER SERVER p8_ventas_server OPTIONS (SET host 'p8-prod-lab');"
 
-EXPLICACION
+/bin/bash /opt/p8/scripts/07-finalize-fdw.sh
 
-ALTER SERVER:
-Modifica la definicion del servidor externo.
+SALIDA:
 
-p8_ventas_server:
-Nombre del servidor FDW.
+ALTER SERVER
 
-OPTIONS:
-Permite cambiar opciones de conexion.
+El segundo comando normalmente no imprime salida.
 
-SET host:
-Reemplaza la direccion del servidor remoto.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-En desarrollo el host era p8-dev-lab.
+ALTER SERVER actualiza el servidor externo para que
+utilice el ambiente de produccion.
 
-En produccion debe ser p8-prod-lab.
+El script auxiliar completa la configuracion del
+acceso FDW utilizando el mapeo del laboratorio.
 
-IMPORTANTE SOBRE AUTENTICACION
+La configuracion queda preparada para las consultas
+de validacion de la seccion 3.
 
-El respaldo global se genero sin hashes de contrasenas.
-
-Por ello, las credenciales de los roles utilizados
-por FDW deben aprovisionarse de forma separada.
-
-En la corrida real, la primera lectura FDW fallo
-por autenticacion del rol p8_reporter.
-
-Se corrigio su credencial y se volvio a comprobar
-la conexion, sin repetir la restauracion.
-
-Las credenciales y sus verificadores no deben
-imprimirse ni almacenarse en esta guia.
-
-RESULTADO
-
-SECCION_2_RESTAURACION=PASS
-
-============================================================
+==============================================================
 SECCION 3 - MONITOREO Y COMPROBACION
-============================================================
+==============================================================
 
-------------------------------------------------------------
-3.1. OBJETIVO
-------------------------------------------------------------
+En esta seccion compararemos el origen y el destino.
 
-Comprobar que la migracion no solamente termino,
-sino que preservo los objetos y datos esperados.
+Los resultados proceden de las consultas ejecutadas en ambos
+servidores durante la validacion final.
 
-Compararemos desarrollo y produccion.
+Esta seccion no necesita volver a restaurar ninguna base.
 
-BEFORE:
-Consultar el estado de origen.
+TERMINAL 1: Bash de desarrollo.
+TERMINAL 2: Bash de produccion.
 
-AFTER:
-Consultar los mismos elementos en produccion.
+Para utilizar los comandos de comprobacion abreviados, ejecutar
+una vez la siguiente funcion EN CADA TERMINAL BASH:
 
-Finalmente:
-Comprobar diferencias y funcionamiento.
+q() { runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U postgres -d "$1" -v ON_ERROR_STOP=1 -c "$2"; }
 
-------------------------------------------------------------
-3.2. COMPROBAR LAS BASES
-------------------------------------------------------------
+La definicion no produce salida.
 
-Dentro del contenedor de produccion:
+q ejecuta SQL en la base indicada en $1.
 
-COMANDO
+$2 contiene la consulta SQL.
 
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SELECT datname FROM pg_database WHERE datname IN ('ventas_db','reportes_db','sandbox_db') ORDER BY datname;"
+-qAt permite obtener los valores sin encabezados para facilitar
+la comparacion de resultados entre ambos servidores.
 
-QUE DEBEMOS ENCONTRAR
+----------------------------------------------------------------------
 
-ventas_db
-reportes_db
+3.1. Comprobar las bases de desarrollo
 
-No debemos encontrar sandbox_db.
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
 
-------------------------------------------------------------
-3.3. COMPROBAR OBJETOS Y PROPIETARIOS
-------------------------------------------------------------
+COMANDO:
 
-COMANDO
+q postgres "SELECT 'BASES_COMERCIALES|'||count(*) FROM pg_database WHERE datname IN ('ventas_db','reportes_db');"
+q postgres "SELECT 'SANDBOX|'||count(*) FROM pg_database WHERE datname='sandbox_db';"
 
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "SELECT n.nspname,c.relname,c.relkind::text,pg_get_userbyid(c.relowner) AS propietario FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('comercial','auditoria','reportes') ORDER BY n.nspname,c.relname;"
+SALIDA REAL:
 
-EXPLICACION
+BASES_COMERCIALES|2
+SANDBOX|1
 
-pg_class:
-Catalogo de relaciones PostgreSQL.
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-pg_namespace:
-Catalogo de schemas.
+El origen contiene ventas_db y reportes_db.
 
-relname:
-Nombre del objeto.
+Tambien contiene sandbox_db.
 
-relkind:
-Tipo interno de relacion.
+Este es el estado esperado en desarrollo.
 
-r:
-Tabla ordinaria.
+----------------------------------------------------------------------
 
-i:
-Indice.
+3.2. Comprobar las bases de produccion
 
-S:
-Secuencia.
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
 
-v:
-Vista convencional.
+COMANDO:
 
-m:
-Vista materializada.
+q postgres "SELECT 'BASES_COMERCIALES|'||count(*) FROM pg_database WHERE datname IN ('ventas_db','reportes_db');"
+q postgres "SELECT 'SANDBOX|'||count(*) FROM pg_database WHERE datname='sandbox_db';"
 
-pg_get_userbyid:
-Obtiene el nombre del propietario.
-
-Debemos encontrar los objetos del origen
-y sus propietarios correspondientes.
-
-------------------------------------------------------------
-3.4. COMPROBAR FILAS Y CONTENIDO
-------------------------------------------------------------
-
-COMANDO DE EJEMPLO
-
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "SELECT count(*) FROM comercial.pedidos;"
-
-QUE HACE
-
-count(*) calcula las filas de la tabla pedidos.
-
-Pero comparar solamente cantidades no es suficiente.
-
-Dos tablas pueden tener la misma cantidad de registros
-y contener valores diferentes.
-
-Por eso el constructor tambien calculo hashes MD5
-del contenido serializado y ordenado de las tablas.
-
-La comparacion se realizo tanto en desarrollo
-como en produccion.
-
-SALIDA REAL DE PRODUCCION
+SALIDA REAL:
 
 BASES_COMERCIALES|2
 SANDBOX|0
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+Produccion contiene las dos bases requeridas.
+
+sandbox_db no fue migrada.
+
+Esta diferencia con desarrollo es intencional.
+
+----------------------------------------------------------------------
+
+3.3. Comprobar objetos en desarrollo
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+q ventas_db "SELECT 'OBJ|'||n.nspname||'.'||c.relname||'|'||c.relkind::text||'|'||pg_get_userbyid(c.relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('comercial','auditoria','reportes') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'FUNC|'||p.oid::regprocedure::text||'|'||p.prokind::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('comercial','auditoria') ORDER BY 1;" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
+COMPARE|OBJ|auditoria.cambios_pedidos_auditoria_id_seq|S|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos_pkey|i|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos|r|p8_owner
+COMPARE|OBJ|comercial.clientes_pkey|i|p8_owner
+COMPARE|OBJ|comercial.clientes|r|p8_owner
+COMPARE|OBJ|comercial.detalles_pkey|i|p8_owner
+COMPARE|OBJ|comercial.detalles|r|p8_owner
+COMPARE|OBJ|comercial.idx_pedidos_estado|i|p8_owner
+COMPARE|OBJ|comercial.idx_productos_nombre_trgm|i|p8_owner
+COMPARE|OBJ|comercial.pagos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pagos_seq|S|p8_owner
+COMPARE|OBJ|comercial.pagos|r|p8_owner
+COMPARE|OBJ|comercial.pedidos_pedido_id_seq|S|p8_owner
+COMPARE|OBJ|comercial.pedidos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pedidos|r|p8_owner
+COMPARE|OBJ|comercial.productos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.productos|r|p8_owner
+COMPARE|OBJ|reportes.mv_ventas_pagadas|m|p8_owner
+COMPARE|OBJ|reportes.v_ventas_pagadas|v|p8_owner
+COMPARE|FUNC|auditoria.registrar_cambio_pedido()|f
+COMPARE|FUNC|comercial.registrar_pago(bigint,numeric)|p
+COMPARE|FUNC|comercial.total_pedido(bigint)|f
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+pg_class contiene tablas, indices, secuencias y vistas.
+
+pg_namespace relaciona cada objeto con su schema.
+
+pg_get_userbyid devuelve el propietario.
+
+relkind identifica el tipo de objeto:
+
+r: tabla.
+i: indice.
+S: secuencia.
+v: vista.
+m: vista materializada.
+
+pg_proc registra funciones y procedimientos.
+
+prokind=f representa una funcion.
+prokind=p representa un procedimiento.
+
+::text convierte el tipo interno "char" antes de concatenarlo.
+
+La salida contiene nombres, tipos y propietarios.
+
+----------------------------------------------------------------------
+
+3.4. Comprobar objetos en produccion
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
+
+q ventas_db "SELECT 'OBJ|'||n.nspname||'.'||c.relname||'|'||c.relkind::text||'|'||pg_get_userbyid(c.relowner) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('comercial','auditoria','reportes') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'FUNC|'||p.oid::regprocedure::text||'|'||p.prokind::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('comercial','auditoria') ORDER BY 1;" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
+COMPARE|OBJ|auditoria.cambios_pedidos_auditoria_id_seq|S|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos_pkey|i|p8_owner
+COMPARE|OBJ|auditoria.cambios_pedidos|r|p8_owner
+COMPARE|OBJ|comercial.clientes_pkey|i|p8_owner
+COMPARE|OBJ|comercial.clientes|r|p8_owner
+COMPARE|OBJ|comercial.detalles_pkey|i|p8_owner
+COMPARE|OBJ|comercial.detalles|r|p8_owner
+COMPARE|OBJ|comercial.idx_pedidos_estado|i|p8_owner
+COMPARE|OBJ|comercial.idx_productos_nombre_trgm|i|p8_owner
+COMPARE|OBJ|comercial.pagos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pagos_seq|S|p8_owner
+COMPARE|OBJ|comercial.pagos|r|p8_owner
+COMPARE|OBJ|comercial.pedidos_pedido_id_seq|S|p8_owner
+COMPARE|OBJ|comercial.pedidos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.pedidos|r|p8_owner
+COMPARE|OBJ|comercial.productos_pkey|i|p8_owner
+COMPARE|OBJ|comercial.productos|r|p8_owner
+COMPARE|OBJ|reportes.mv_ventas_pagadas|m|p8_owner
+COMPARE|OBJ|reportes.v_ventas_pagadas|v|p8_owner
+COMPARE|FUNC|auditoria.registrar_cambio_pedido()|f
+COMPARE|FUNC|comercial.registrar_pago(bigint,numeric)|p
+COMPARE|FUNC|comercial.total_pedido(bigint)|f
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+Los nombres de objetos y sus propietarios coinciden con desarrollo.
+
+Esto verifica estructuras, no solamente registros.
+
+Los indices y las secuencias aparecen como objetos separados
+porque tienen funciones diferentes a las tablas.
+
+----------------------------------------------------------------------
+
+3.5. Comprobar los registros de desarrollo
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+q ventas_db "
+SELECT 'DATOS|clientes|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM comercial.clientes t
+UNION ALL SELECT 'DATOS|productos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY producto_id),'')) FROM comercial.productos t
+UNION ALL SELECT 'DATOS|pedidos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id),'')) FROM comercial.pedidos t
+UNION ALL SELECT 'DATOS|detalles|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id,producto_id),'')) FROM comercial.detalles t
+UNION ALL SELECT 'DATOS|pagos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pago_id),'')) FROM comercial.pagos t
+UNION ALL SELECT 'DATOS|auditoria|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY auditoria_id),'')) FROM auditoria.cambios_pedidos t
+UNION ALL SELECT 'DATOS|vista_materializada|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM reportes.mv_ventas_pagadas t
+ORDER BY 1;" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
 COMPARE|DATOS|auditoria|0|d41d8cd98f00b204e9800998ecf8427e
 COMPARE|DATOS|clientes|2|230719980092c0d7f8c6d05c6553777f
 COMPARE|DATOS|detalles|3|b895d47f4742110f8eec92a585c9627a
@@ -947,217 +1420,238 @@ COMPARE|DATOS|pagos|1|39e0a273120d06358e120e733bb6f784
 COMPARE|DATOS|pedidos|2|4e3afac22b023b199ef8a903c738309c
 COMPARE|DATOS|productos|3|cff17dea028ec0d8d593bc4ade3d3978
 COMPARE|DATOS|vista_materializada|2|4afc6f1f68f12e499b1144db348068bb
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+count(*) cuenta los registros.
+
+row_to_json convierte cada fila en una representacion textual.
+
+string_agg combina los valores en un orden definido.
+
+md5 calcula una huella del contenido serializado.
+
+Se comprueban clientes, productos, pedidos, detalles,
+pagos, auditoria y vista materializada.
+
+El hash MD5 de contenido es un control didactico,
+no una firma de seguridad criptografica.
+
+----------------------------------------------------------------------
+
+3.6. Comprobar los registros de produccion
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
+
+q ventas_db "
+SELECT 'DATOS|clientes|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM comercial.clientes t
+UNION ALL SELECT 'DATOS|productos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY producto_id),'')) FROM comercial.productos t
+UNION ALL SELECT 'DATOS|pedidos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id),'')) FROM comercial.pedidos t
+UNION ALL SELECT 'DATOS|detalles|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pedido_id,producto_id),'')) FROM comercial.detalles t
+UNION ALL SELECT 'DATOS|pagos|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY pago_id),'')) FROM comercial.pagos t
+UNION ALL SELECT 'DATOS|auditoria|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY auditoria_id),'')) FROM auditoria.cambios_pedidos t
+UNION ALL SELECT 'DATOS|vista_materializada|'||count(*)||'|'||md5(COALESCE(string_agg(row_to_json(t)::text,'|' ORDER BY cliente_id),'')) FROM reportes.mv_ventas_pagadas t
+ORDER BY 1;" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
+COMPARE|DATOS|auditoria|0|d41d8cd98f00b204e9800998ecf8427e
+COMPARE|DATOS|clientes|2|230719980092c0d7f8c6d05c6553777f
+COMPARE|DATOS|detalles|3|b895d47f4742110f8eec92a585c9627a
+COMPARE|DATOS|pagos|1|39e0a273120d06358e120e733bb6f784
+COMPARE|DATOS|pedidos|2|4e3afac22b023b199ef8a903c738309c
+COMPARE|DATOS|productos|3|cff17dea028ec0d8d593bc4ade3d3978
+COMPARE|DATOS|vista_materializada|2|4afc6f1f68f12e499b1144db348068bb
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+Los conteos y hashes coinciden con desarrollo.
+
+Por ejemplo, ambas bases contienen dos clientes,
+dos pedidos y tres productos.
+
+La igualdad de hashes comprueba que las filas incluidas
+en estas consultas tienen el mismo contenido serializado.
+
+Esto es diferente a comparar los SHA-256 de los respaldos.
+
+----------------------------------------------------------------------
+
+3.7. Comprobar estados de secuencias
+
+DONDE EJECUTAR: TERMINALES 1 Y 2 - BASH, EJECUTAR EN AMBAS
+
+COMANDO:
+
+q ventas_db "SELECT 'SEQ|pagos|'||last_value||'|'||is_called FROM comercial.pagos_seq UNION ALL SELECT 'SEQ|pedidos|'||last_value||'|'||is_called FROM comercial.pedidos_pedido_id_seq UNION ALL SELECT 'SEQ|auditoria|'||last_value||'|'||is_called FROM auditoria.cambios_pedidos_auditoria_id_seq ORDER BY 1;" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
 COMPARE|SEQ|auditoria|1|false
 COMPARE|SEQ|pagos|9002|false
 COMPARE|SEQ|pedidos|5003|false
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+SEQ identifica el resultado de una secuencia.
+
+last_value representa su valor almacenado.
+
+is_called indica si ese valor ya fue utilizado
+conforme al estado de la secuencia.
+
+En la corrida ambos servidores mostraron:
+
+auditoria: 1, false.
+pagos: 9002, false.
+pedidos: 5003, false.
+
+Los estados coinciden entre origen y destino.
+
+----------------------------------------------------------------------
+
+3.8. Verificar permisos y restricciones
+
+DONDE EJECUTAR: TERMINALES 1 Y 2 - BASH, EJECUTAR EN AMBAS
+
+COMANDO:
+
+q ventas_db "SELECT 'PERM|reader_SELECT|'||has_table_privilege('p8_reader','comercial.pedidos','SELECT') UNION ALL SELECT 'PERM|reader_UPDATE|'||has_table_privilege('p8_reader','comercial.pedidos','UPDATE') UNION ALL SELECT 'PERM|app_UPDATE|'||has_table_privilege('p8_app','comercial.pedidos','UPDATE') ORDER BY 1;" | sed 's/^/COMPARE|/'
+q ventas_db "SELECT 'CHECK|pedidos_estado_check|'||convalidated||'|'||(pg_get_constraintdef(oid) LIKE '%PENDIENTE%' AND pg_get_constraintdef(oid) LIKE '%PAGADO%' AND pg_get_constraintdef(oid) LIKE '%CANCELADO%') FROM pg_constraint WHERE conname='pedidos_estado_check';" | sed 's/^/COMPARE|/'
+
+SALIDA REAL:
+
 COMPARE|PERM|app_UPDATE|true
 COMPARE|PERM|reader_SELECT|true
 COMPARE|PERM|reader_UPDATE|false
 COMPARE|CHECK|pedidos_estado_check|true|true
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+has_table_privilege comprueba permisos efectivos.
+
+reader_SELECT=true permite consultar pedidos.
+
+reader_UPDATE=false indica que el rol de lectura
+no puede modificar pedidos.
+
+app_UPDATE=true indica que el rol de aplicacion
+puede actualizar pedidos.
+
+La consulta CHECK verifica que la restriccion esta
+validada y contempla PENDIENTE, PAGADO y CANCELADO.
+
+Estos resultados coinciden en ambos servidores.
+
+----------------------------------------------------------------------
+
+3.9. Verificar el FDW de desarrollo
+
+DONDE EJECUTAR: TERMINAL 1 - BASH DE DESARROLLO
+
+COMANDO:
+
+q reportes_db "SELECT 'FDW_HOST|'||split_part(opt,'=',2) FROM pg_foreign_server f CROSS JOIN LATERAL unnest(f.srvoptions) AS opts(opt) WHERE f.srvname='p8_ventas_server' AND opt LIKE 'host=%';"
+q reportes_db "SELECT 'FDW_MAPPING|'||count(*) FROM pg_user_mappings WHERE usename='p8_reporter' AND srvname='p8_ventas_server';"
+runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U p8_reporter -d reportes_db -v ON_ERROR_STOP=1 -c "SELECT 'FDW_FILAS|'||count(*) FROM externo.pedidos;"
+
+SALIDA REAL:
+
+FDW_HOST|p8-dev-lab
+FDW_MAPPING|1
+FDW_FILAS|2
+
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+FDW_HOST muestra el host de desarrollo.
+
+FDW_MAPPING=1 confirma que existe un mapeo para p8_reporter.
+
+FDW_FILAS=2 confirma que la consulta remota
+puede recuperar dos registros.
+
+----------------------------------------------------------------------
+
+3.10. Verificar el FDW de produccion
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
+
+q reportes_db "SELECT 'FDW_HOST|'||split_part(opt,'=',2) FROM pg_foreign_server f CROSS JOIN LATERAL unnest(f.srvoptions) AS opts(opt) WHERE f.srvname='p8_ventas_server' AND opt LIKE 'host=%';"
+q reportes_db "SELECT 'FDW_MAPPING|'||count(*) FROM pg_user_mappings WHERE usename='p8_reporter' AND srvname='p8_ventas_server';"
+runuser -u postgres -- psql -X -qAt -h 127.0.0.1 -U p8_reporter -d reportes_db -v ON_ERROR_STOP=1 -c "SELECT 'FDW_FILAS|'||count(*) FROM externo.pedidos;"
+
+SALIDA REAL:
+
 FDW_HOST|p8-prod-lab
 FDW_MAPPING|1
 FDW_FILAS|2
-MONITOREO=PASS
 
-INTERPRETACION
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-DATOS:
-Identifica una tabla o vista materializada.
+FDW_HOST|p8-prod-lab:
+El servidor externo apunta al ambiente productivo.
 
-El numero siguiente:
-Cantidad de registros.
+FDW_MAPPING|1:
+Existe un mapeo para el rol p8_reporter.
 
-El hash:
-Huella calculada del contenido de esos registros.
+FDW_FILAS|2:
+La consulta de la tabla externa funciona y devuelve
+dos registros del servidor PostgreSQL de produccion.
 
-SEQ:
-Estado de una secuencia.
+RESULTADO:
 
-false:
-El ultimo valor todavia no se considera utilizado
-para la siguiente llamada de nextval.
+La configuracion y la consulta FDW funcionan correctamente.
 
-PERM:
-Resultado de una comprobacion de privilegios.
+----------------------------------------------------------------------
 
-CHECK:
-Resultado de la comprobacion de una restriccion.
+3.11. Consultar estadisticas operativas
 
-FDW_HOST:
-Servidor remoto configurado.
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
 
-FDW_MAPPING:
-Cantidad de mapeos encontrados.
-
-FDW_FILAS:
-Cantidad de registros obtenidos mediante FDW.
-
-------------------------------------------------------------
-3.5. COMPROBAR PERMISOS
-------------------------------------------------------------
-
-COMANDO
-
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "SELECT has_table_privilege('p8_reader','comercial.pedidos','SELECT') AS puede_leer,has_table_privilege('p8_reader','comercial.pedidos','UPDATE') AS puede_actualizar;"
-
-EXPLICACION
-
-has_table_privilege:
-Comprueba los privilegios efectivos del rol.
-
-SELECT:
-Permiso de consulta.
-
-UPDATE:
-Permiso de modificacion.
-
-RESULTADO ESPERADO
-
-puede_leer = true
-puede_actualizar = false
-
-Un rol de solo lectura no debe disponer
-del privilegio UPDATE sobre pedidos.
-
-------------------------------------------------------------
-3.6. COMPROBAR FDW
-------------------------------------------------------------
-
-COMANDO
-
-runuser -u postgres -- psql -X -h 127.0.0.1 -U p8_reporter -d reportes_db -c "SELECT count(*) FROM externo.pedidos;"
-
-QUE HACE
-
-Consulta la tabla externa utilizando el rol
-que accede al servidor FDW.
-
-SALIDA REAL
-
-FDW_FILAS|2
-
-INTERPRETACION
-
-La conexion entre reportes_db y ventas_db funciona.
-
-La tabla externa permite consultar dos pedidos.
-
-Esto verifica algo que el inventario por si solo
-no podria demostrar: conectividad real.
-
-------------------------------------------------------------
-3.7. COMPARACION GENERAL DE LA MIGRACION
-------------------------------------------------------------
-
-SALIDA REAL
-
-SOURCE_COMPARE_ITEMS=36
-TARGET_COMPARE_ITEMS=36
-COMPARE_DIFFERENCES=0
-COMPARACION_DE_DATOS=PASS
-ADAPTACION_FDW=PASS
-EXCLUSION_SANDBOX=PASS
-P8_VALIDACION_FINAL_PASS=1
-RESTAURACIONES_REPETIDAS=0
-CONTENEDORES_REINICIADOS=0
-
-INTERPRETACION
-
-SOURCE_COMPARE_ITEMS:
-Elementos comparados del origen.
-
-TARGET_COMPARE_ITEMS:
-Elementos comparados del destino.
-
-COMPARE_DIFFERENCES=0:
-No se encontraron diferencias entre los elementos
-incluidos en esta comparacion.
-
-COMPARACION_DE_DATOS=PASS:
-La comprobacion automatizada fue satisfactoria.
-
-ADAPTACION_FDW=PASS:
-La conexion externa funciona en produccion.
-
-EXCLUSION_SANDBOX=PASS:
-La base excluida no fue migrada.
-
-IMPORTANTE
-
-La cantidad de elementos comparados NO equivale
-al numero total de tablas del sistema.
-
-------------------------------------------------------------
-3.8. MONITOREAR EL SERVIDOR
-------------------------------------------------------------
-
-COMANDO 1
+COMANDO:
 
 runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SELECT datname,numbackends,xact_commit,deadlocks FROM pg_stat_database WHERE datname IN ('ventas_db','reportes_db') ORDER BY datname;"
 
-EXPLICACION
+SALIDA REAL:
 
-pg_stat_database:
-Vista de estadisticas acumuladas por base.
-
-numbackends:
-Conexiones activas en el instante de consulta.
-
-xact_commit:
-Transacciones confirmadas acumuladas.
-
-deadlocks:
-Interbloqueos detectados acumulados.
-
-Estos valores pueden cambiar con el uso normal.
-
-COMANDO 2
-
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "EXPLAIN (ANALYZE,BUFFERS) SELECT * FROM comercial.pedidos WHERE estado='PAGADO';"
-
-EXPLICACION
-
-EXPLAIN:
-Muestra el plan de ejecucion.
-
-ANALYZE:
-Ejecuta realmente la consulta y mide sus resultados.
-
-BUFFERS:
-Incluye informacion del uso de buffers.
-
-Seq Scan:
-Lectura secuencial de una tabla.
-
-Rows Removed by Filter:
-Filas descartadas por la condicion WHERE.
-
-Execution Time:
-Tiempo total reportado para la ejecucion.
-
-COMANDO 3
-
-runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c "SHOW autovacuum;"
-
-EXPLICACION
-
-SHOW:
-Consulta el valor de un parametro.
-
-autovacuum:
-Mantenimiento automatico de PostgreSQL.
-
-SALIDA REAL COMPLETA DEL MONITOREO
-
-=== ESTADISTICAS ACTUALES (NO SON IDENTICAS AL ORIGEN) ===
-   datname   | numbackends | xact_commit | deadlocks
+datname   | numbackends | xact_commit | deadlocks
 -------------+-------------+-------------+-----------
  reportes_db |           0 |          57 |         0
  ventas_db   |           0 |         143 |         0
 (2 rows)
 
-=== PLAN DE EJECUCION ===
-                                             QUERY PLAN
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+pg_stat_database muestra estadisticas por base.
+
+numbackends representa conexiones en ese momento.
+
+xact_commit representa transacciones confirmadas acumuladas.
+
+deadlocks muestra interbloqueos detectados.
+
+Son estadisticas operativas.
+
+No tienen que ser identicas entre desarrollo y produccion
+porque los servidores han recibido actividad diferente.
+
+----------------------------------------------------------------------
+
+3.12. Analizar una consulta SQL real
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
+
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d ventas_db -c "EXPLAIN (ANALYZE,BUFFERS) SELECT * FROM comercial.pedidos WHERE estado='PAGADO';"
+
+SALIDA REAL:
+
+QUERY PLAN
 -----------------------------------------------------------------------------------------------------
  Seq Scan on pedidos  (cost=0.00..1.02 rows=1 width=94) (actual time=0.042..0.057 rows=1.00 loops=1)
    Filter: ((estado)::text = 'PAGADO'::text)
@@ -1169,91 +1663,129 @@ SALIDA REAL COMPLETA DEL MONITOREO
  Execution Time: 0.156 ms
 (8 rows)
 
-=== CONFIGURACION AUTOVACUUM ===
- autovacuum
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
+
+EXPLAIN muestra el plan de ejecucion.
+
+ANALYZE ejecuta la consulta y recopila mediciones.
+
+BUFFERS presenta informacion sobre uso de buffers.
+
+Seq Scan significa lectura secuencial.
+
+La consulta devolvio un pedido PAGADO
+y descarto otro por el filtro.
+
+Planning Time muestra el tiempo de planificacion.
+
+Execution Time muestra el tiempo de ejecucion.
+
+El uso de Seq Scan no es necesariamente un problema
+en una tabla tan pequena.
+
+----------------------------------------------------------------------
+
+3.13. Comprobar autovacuum
+
+DONDE EJECUTAR: TERMINAL 2 - BASH DE PRODUCCION
+
+COMANDO:
+
+runuser -u postgres -- psql -X -h 127.0.0.1 -U postgres -d postgres -c 'SHOW autovacuum;'
+
+SALIDA REAL:
+
+autovacuum
 ------------
  on
 (1 row)
 
-SECCION_3_MONITOREO=PASS
+EXPLICACION DEL COMANDO Y DE SU SALIDA:
 
-INTERPRETACION
+SHOW consulta el valor de configuracion.
 
-En esta corrida, PostgreSQL utilizo Seq Scan
-sobre comercial.pedidos.
+autovacuum es el mecanismo de mantenimiento automatico.
 
-Eso no implica por si solo un problema.
+on indica que esta habilitado.
 
-La tabla contiene muy pocos registros y una
-lectura secuencial puede ser la opcion adecuada.
+No significa necesariamente que un VACUUM
+haya ocurrido durante esta consulta.
 
-autovacuum = on confirma que el mantenimiento
-automatico esta habilitado.
+==============================================================
+RESULTADO FINAL DE LA MIGRACION
+==============================================================
 
-------------------------------------------------------------
-3.9. RESULTADO FINAL
-------------------------------------------------------------
+SOURCE_COMPARE_ITEMS=36
+TARGET_COMPARE_ITEMS=36
+COMPARE_DIFFERENCES=0
+
+COMPARACION_DE_DATOS=PASS
+ADAPTACION_FDW=PASS
+EXCLUSION_SANDBOX=PASS
 
 P8_VALIDACION_FINAL_PASS=1
+
 RESTAURACIONES_REPETIDAS=0
 CONTENEDORES_REINICIADOS=0
 
 INTERPRETACION
 
-La migracion y las comprobaciones terminaron
-satisfactoriamente en el laboratorio.
+Se compararon 36 elementos en cada ambiente.
 
-No fue necesario restaurar nuevamente las bases
-para corregir el problema de autenticacion FDW.
+No se encontraron diferencias en los elementos comprobados.
 
-============================================================
-CHECKLIST FINAL
-============================================================
+La conexion FDW funciona.
 
-[ ] Se identificaron los objetos a migrar.
-[ ] Se compararon las herramientas de inventario.
-[ ] Se generaron los tres respaldos definitivos.
-[ ] Se inspeccionaron los respaldos con pg_restore --list.
-[ ] Se excluyo sandbox_db.
-[ ] Se transfirieron los mismos archivos.
-[ ] Se verificaron sus hashes.
-[ ] Se adapto la ruta del tablespace.
-[ ] Se restauraron los roles.
-[ ] Se restauraron las bases y sus datos.
-[ ] Se conservaron secuencias y permisos.
-[ ] Se adapto la conexion FDW.
-[ ] Se comprobaron los registros.
-[ ] Se compararon objetos y propietarios.
-[ ] Se comprobaron las restricciones.
-[ ] Se comprobo la lectura FDW.
-[ ] Se revisaron estadisticas y plan de ejecucion.
-[ ] Se confirmo que no existen diferencias detectadas.
+sandbox_db fue excluida correctamente.
 
-============================================================
+Las estadisticas y la consulta de rendimiento se ejecutaron
+satisfactoriamente en el destino.
+
+Esto confirma las verificaciones del laboratorio,
+no todas las posibles pruebas funcionales de una aplicacion.
+
+==============================================================
+SALIR DE LOS CONTENEDORES
+==============================================================
+
+TERMINAL 1 - BASH DESARROLLO
+
+exit
+
+Regresamos a PowerShell sin detener PostgreSQL.
+
+TERMINAL 2 - BASH PRODUCCION
+
+exit
+
+Regresamos a PowerShell sin detener PostgreSQL.
+
+Salir de Bash NO elimina los contenedores.
+
+==============================================================
 CONCLUSION
-============================================================
+==============================================================
 
-Realizamos una migracion logica completa utilizando
-las herramientas nativas de PostgreSQL.
+Migramos los objetos globales, dos bases completas,
+sus esquemas, tablas, datos, roles, tablespace,
+indices, restricciones, secuencias, rutinas,
+vistas, extensiones, permisos y configuracion FDW.
 
-El inventario no fue trabajo desechable.
+No generamos un respaldo distinto para cada tipo de objeto.
 
-Los archivos obtenidos durante el inventario
-fueron exactamente los que utilizamos para restaurar.
+Los mismos tres archivos utilizados durante el inventario
+fueron trasladados a produccion y restaurados.
 
-No generamos otro respaldo por cada objeto.
+La migracion se valido comparando los elementos seleccionados
+de ambos ambientes y comprobando la conectividad FDW.
 
-No reconstruimos manualmente todas las tablas.
+IMPORTANTE
 
-Se utilizaron:
+Los pasos de restauracion requieren un destino limpio.
 
-pg_dumpall
-pg_dump
-pg_restore
-psql
+No deben repetirse sobre el ambiente ya migrado.
 
-La migracion se completo y se valido mediante
-consultas de catalogos, datos, permisos, FDW
-y estadisticas operativas.
+La creacion y eliminacion del laboratorio se documentan
+por separado en practice-08-00-preparacion-y-limpieza.txt.
 
 FIN DE LA PRACTICA 08

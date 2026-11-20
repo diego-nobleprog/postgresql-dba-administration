@@ -1,0 +1,50 @@
+PRACTICA 08.00 - PREPARACION Y ELIMINACION DEL LABORATORIO
+Modulo 8: Migracion y Validacion
+PostgreSQL DBA - Administracion, Performance, Backup, Replicacion y Alta Disponibilidad
+
+OBJETIVO
+
+Preparar dos servidores PostgreSQL independientes:
+
+- p8-dev-lab: ambiente de desarrollo (origen).
+- p8-prod-lab: ambiente de produccion (destino).
+
+Ambos utilizan la imagen postgresql-dba:18-p1.
+
+Los comandos se ejecutan desde Windows PowerShell,
+en la raiz del repositorio:
+
+C:\Users\student\Desktop\postgresql-dba-administration
+
+============================================================
+1. INICIAR EL LABORATORIO
+============================================================
+
+COMANDO - POWERSHELL
+
+docker compose -p nobleprog-p8 -f .\practices\p8\docker\compose.yaml up -d --wait
+
+RESULTADO ESPERADO
+
+Los contenedores p8-dev-lab y p8-prod-lab quedan
+creados y disponibles para la practica.
+
+============================================================
+2. ELIMINAR EL LABORATORIO
+============================================================
+
+Ejecutar al finalizar la practica.
+
+ADVERTENCIA: elimina contenedores y volumenes de datos
+del laboratorio P8. La informacion almacenada se pierde.
+
+COMANDO - POWERSHELL
+
+docker compose -p nobleprog-p8 -f .\practices\p8\docker\compose.yaml down -v --remove-orphans
+
+RESULTADO ESPERADO
+
+Los contenedores y volumenes del laboratorio P8
+quedan eliminados.
+
+FIN DE LA PRACTICA 08.00
